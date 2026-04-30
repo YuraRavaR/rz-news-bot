@@ -17,7 +17,7 @@ env/
 
 # uv
 .uv-bin/
-uv.lock
+# uv.lock is intentionally committed for reproducible CI builds
 
 # Environment / secrets
 .env

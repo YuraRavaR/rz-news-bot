@@ -225,15 +225,16 @@ class Pipeline:
             stats.errors += 1
             decision = Decision.ERROR
 
-        # Stage 3c: Always save the result (even errors), so we don't retry
-        try:
-            await self.storage.save_decision(
-                article=article,
-                decision=decision,
-                ai_decision=ai_decision,
-                tg_message_id=tg_message_id,
-            )
-        except Exception as save_exc:
-            log.error("save_failed", error=str(save_exc))
+        # Stage 3c: Save result so we don't retry — skipped in dry_run (no side effects)
+        if not dry_run:
+            try:
+                await self.storage.save_decision(
+                    article=article,
+                    decision=decision,
+                    ai_decision=ai_decision,
+                    tg_message_id=tg_message_id,
+                )
+            except Exception as save_exc:
+                log.error("save_failed", error=str(save_exc))
 
         return quota_exhausted

@@ -99,8 +99,8 @@ class Pipeline:
         try:
             all_articles = await fetch_articles(self.settings, self.flow_config)
         except Exception as exc:
-            log.exception("scrape_failed", error=str(exc))
-            raise  # Fatal — can't continue without articles
+            log.exception("pipeline_fatal_error", error=str(exc))
+            raise
 
         stats.total_scraped = len(all_articles)
 

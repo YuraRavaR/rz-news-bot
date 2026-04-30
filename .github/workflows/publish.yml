@@ -41,7 +41,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --no-dev
+        run: uv sync --no-dev --frozen
 
       - name: Initialize database
         env:
@@ -51,13 +51,14 @@ jobs:
           TELEGRAM_BOT_TOKEN: "dummy"
           TELEGRAM_CHANNEL_ID: "dummy"
           GEMINI_API_KEY: "dummy"
-        run: uv run rz-flow --init-db
+        run: uv run --no-dev rz-flow --init-db
 
       - name: Run pipeline
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
@@ -65,7 +66,7 @@ jobs:
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             DRY_RUN_FLAG="--dry-run"
           fi
-          uv run rz-flow $DRY_RUN_FLAG
+          uv run --no-dev rz-flow $DRY_RUN_FLAG
 
       - name: Save run summary
         if: always()

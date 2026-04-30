@@ -1,5 +1,8 @@
 name: Rz-Flow Publish
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   # Run every 3 hours
   schedule:
@@ -84,7 +87,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --no-dev
 
       - name: Initialize database
         env:

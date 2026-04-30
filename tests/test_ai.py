@@ -217,7 +217,7 @@ class TestGeminiAIFilterEvaluate:
         with pytest.raises(GeminiRateLimitError):
             await ai.evaluate(_make_article())
 
-        assert mock_client.aio.models.generate_content.call_count == 4
+        assert mock_client.aio.models.generate_content.call_count == 3
 
     @patch("rz_flow.ai.genai.Client")
     async def test_reraises_non_rate_limit_client_error(

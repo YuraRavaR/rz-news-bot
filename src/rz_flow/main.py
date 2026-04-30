@@ -14,6 +14,7 @@ import sys
 import structlog
 
 from rz_flow.config import get_settings
+from rz_flow.flow_config import load_flow_config
 from rz_flow.logging_config import configure_logging
 from rz_flow.pipeline import Pipeline
 from rz_flow.storage import create_storage
@@ -22,6 +23,7 @@ from rz_flow.telegram import TelegramPublisher
 
 async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
     settings = get_settings()
+    flow_config = load_flow_config()
     log = structlog.get_logger("main")
 
     storage = create_storage(
@@ -35,7 +37,7 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
             log.info("db_initialized")
             return 0
 
-        pipeline = Pipeline(settings=settings, storage=storage)
+        pipeline = Pipeline(settings=settings, storage=storage, flow_config=flow_config)
 
         try:
             stats = await pipeline.run(dry_run=dry_run)

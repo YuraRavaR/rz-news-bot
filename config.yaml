@@ -1,0 +1,27 @@
+# Rz-Flow source and pipeline configuration.
+#
+# sources:
+#   scraper       - scraper class name (NajnowszeScraper | RzeszowNewsScraper)
+#   base_url      - base URL passed to the scraper constructor
+#   max_articles  - max articles to fetch from this source per run
+#   enabled       - set to false to disable without deleting the entry
+#
+# pipeline:
+#   inter_ai_delay_seconds   - pause between consecutive Gemini API calls
+#                              (free tier: 15 RPM = 4 s minimum; 5 s recommended)
+#   inter_post_delay_seconds - extra pause after each successful Telegram post
+
+sources:
+  - scraper: NajnowszeScraper
+    base_url: https://rzeszow24.info/najnowsze
+    max_articles: 20
+    enabled: true
+
+  - scraper: RzeszowNewsScraper
+    base_url: https://rzeszow-news.pl
+    max_articles: 15
+    enabled: true
+
+pipeline:
+  inter_ai_delay_seconds: 5.0
+  inter_post_delay_seconds: 2.0

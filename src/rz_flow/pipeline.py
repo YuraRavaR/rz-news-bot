@@ -14,25 +14,19 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
 
 import structlog
 
-from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError
+from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError, GeminiServerError
 from rz_flow.config import Settings
+from rz_flow.flow_config import FlowConfig
 from rz_flow.models import AIDecision, Article, Decision
 from rz_flow.scraper import fetch_articles
+from rz_flow.sources import get_active_sources
 from rz_flow.storage import StorageProtocol
 from rz_flow.telegram import TelegramPublisher
 
 logger = structlog.get_logger(__name__)
-
-# Delay between consecutive Telegram messages to avoid hitting rate limits
-_INTER_POST_DELAY_SECONDS = 2.0
-
-# Delay between Gemini API calls — free tier allows 15 RPM = 4 sec minimum.
-# We use 5 sec for safety margin.
-_INTER_AI_DELAY_SECONDS = 5.0
 
 
 @dataclass
@@ -66,6 +60,7 @@ class Pipeline:
 
     settings: Settings
     storage: StorageProtocol
+    flow_config: FlowConfig
     ai_filter: GeminiAIFilter = field(init=False)
     publisher: TelegramPublisher = field(init=False)
 
@@ -88,24 +83,26 @@ class Pipeline:
         stats = PipelineStats(dry_run=dry_run)
         _start = time.monotonic()
 
-        source = urlparse(self.settings.scraper_base_url).hostname or self.settings.scraper_base_url
+        active = self.flow_config.enabled_sources
 
         # ── Stage 1: Scrape ───────────────────────────────────────────────────
         log = logger.bind(dry_run=dry_run)
         log.info(
             "pipeline_started",
-            source=source,
+            sources=[
+                {"name": s.name, "base_url": src.base_url, "max_articles": src.max_articles}
+                for s, src in zip(get_active_sources(self.flow_config), active)
+            ],
             model=self.settings.gemini_model,
             min_score=self.settings.ai_min_score,
         )
         try:
-            all_articles = await fetch_articles(self.settings)
+            all_articles = await fetch_articles(self.settings, self.flow_config)
         except Exception as exc:
             log.exception("scrape_failed", error=str(exc))
             raise  # Fatal — can't continue without articles
 
         stats.total_scraped = len(all_articles)
-        log.info("scrape_complete", total=stats.total_scraped)
 
         if not all_articles:
             log.info("no_articles_found")
@@ -141,9 +138,9 @@ class Pipeline:
             is_last = i == len(new_articles) - 1
             if not is_last:
                 # Respect Gemini free-tier rate limit (15 RPM)
-                await asyncio.sleep(_INTER_AI_DELAY_SECONDS)
+                await asyncio.sleep(self.flow_config.pipeline.inter_ai_delay_seconds)
             if not dry_run and stats.posted > 0:
-                await asyncio.sleep(_INTER_POST_DELAY_SECONDS)
+                await asyncio.sleep(self.flow_config.pipeline.inter_post_delay_seconds)
 
         elapsed_s = round(time.monotonic() - _start)
         log.info(
@@ -176,6 +173,7 @@ class Pipeline:
 
         try:
             # Stage 3a: AI evaluation
+            log.info("ai_processing", title=article.title_pl)
             ai_decision = await self.ai_filter.evaluate(article)
             log.info(
                 "ai_evaluated",
@@ -215,6 +213,12 @@ class Pipeline:
             # (it won't appear in filter_new_ids since it's not persisted)
             quota_exhausted = True
             return quota_exhausted
+
+        except GeminiServerError as exc:
+            # 503 UNAVAILABLE after retries — transient server overload.
+            # Do NOT save to DB so the article is retried on the next pipeline run.
+            log.warning("gemini_unavailable_skipping", error=str(exc))
+            return False
 
         except Exception as exc:
             log.exception("article_error", error=str(exc))

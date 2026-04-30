@@ -14,6 +14,7 @@ import pytest
 
 from rz_flow.ai import GeminiQuotaExhaustedError
 from rz_flow.config import Settings
+from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.pipeline import Pipeline, PipelineStats
 from rz_flow.storage import InMemoryStorage
@@ -62,9 +63,21 @@ def _make_boring_decision(score: float = 3.0) -> AIDecision:
     )
 
 
+def _make_flow_config() -> FlowConfig:
+    return FlowConfig(
+        sources=[
+            SourceConfig(
+                scraper="NajnowszeScraper",
+                base_url="https://rzeszow24.info/najnowsze",
+                max_articles=5,
+            )
+        ],
+        pipeline=PipelineConfig(),
+    )
+
+
 def _build_pipeline(storage: InMemoryStorage) -> Pipeline:
-    pipeline = Pipeline(settings=_make_settings(), storage=storage)
-    return pipeline
+    return Pipeline(settings=_make_settings(), storage=storage, flow_config=_make_flow_config())
 
 
 @pytest.fixture

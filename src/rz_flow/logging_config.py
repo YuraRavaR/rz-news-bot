@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 
@@ -74,18 +75,43 @@ class _PrettyRenderer:
     def _format(self, event: str, ctx: dict[str, Any], level: str) -> str:  # noqa: C901 PLR0911
         match event:
             case "pipeline_started":
-                source = ctx.get("source", "")
+                sources = ctx.get("sources", [])
                 model = ctx.get("model", "")
                 min_score = ctx.get("min_score", "")
-                parts = [f"🚀 {source}" if source else "🚀 Pipeline started"]
+                header_parts = ["🚀 Pipeline"]
                 if model:
-                    parts.append(f"{_DIM}model={_R}{model}")
+                    header_parts.append(f"{_DIM}model={_R}{model}")
                 if min_score != "":
-                    parts.append(f"{_DIM}min_score={_R}{min_score}")
-                return "  ·  ".join(parts)
+                    header_parts.append(f"{_DIM}min_score={_R}{min_score}")
+                header = "  ·  ".join(header_parts)
+                if isinstance(sources, list) and sources:
+                    rows = []
+                    for src in sources:
+                        host = urlparse(src.get("base_url", "")).netloc or src.get("base_url", "")
+                        name = src.get("name", "")
+                        max_a = src.get("max_articles", "?")
+                        rows.append(f"\n           {_DIM}• {name}  {host}  max={max_a}{_R}")
+                    return header + "".join(rows)
+                return header
 
-            case "scrape_complete":
-                return f"📰 Scraped {ctx.get('total', '?')} articles"
+            case "scrape_started":
+                n = ctx.get("count", "?")
+                src_word = "джерело" if n == 1 else "джерела" if n in (2, 3, 4) else "джерел"
+                return f"{_DIM}🔎 Скрапінг почався  ({n} {src_word}){_R}"
+
+            case "scrape_source_start":
+                name = ctx.get("name", "")
+                url = ctx.get("url", "")
+                return f"{_DIM}   ↓ {name}  {url}{_R}"
+
+            case "scrape_source_done":
+                name = ctx.get("name", "")
+                found = ctx.get("found", "?")
+                return f"{_DIM}   ✓ {name}  знайдено {found}{_R}"
+
+            case "scrape_done":
+                total = ctx.get("total", "?")
+                return f"📰 Скрапінг завершено  всього {total} статей"
 
             case "filter_complete":
                 new = ctx.get("new", "?")
@@ -113,6 +139,13 @@ class _PrettyRenderer:
                 t = title[:65] + "…" if len(title) > 65 else title
                 return f'{_CYAN}🔵{_R} [DRY RUN] [{cat}]{score_str}  "{t}"'
 
+            case "ai_processing":
+                title = ctx.get("title", "")
+                cat = ctx.get("category", "")
+                t = title[:70] + "…" if len(title) > 70 else title
+                cat_str = f"[{cat}] " if cat else ""
+                return f"{_DIM}🤖 {cat_str}{t}{_R}"
+
             case "skipped":
                 cat = ctx.get("category", "")
                 score = ctx.get("score", "?")
@@ -136,6 +169,20 @@ class _PrettyRenderer:
                     f"skipped={skipped}  "
                     f"{err_color}errors={errors}{_R}"
                     f"{elapsed_str}"
+                )
+
+            case "gemini_unavailable_skipping":
+                error = ctx.get("error", "")
+                first_line = error.split("\n")[0]
+                rest = "\n".join(
+                    f"           {_DIM}{ln}{_R}"
+                    for ln in error.split("\n")[1:]
+                    if ln.strip()
+                )
+                detail = f"\n{rest}" if rest else ""
+                return (
+                    f"{_YELLOW}⚠️  Gemini 503 — skipping, retry next run{_R}"
+                    f"  {_DIM}{first_line}{_R}{detail}"
                 )
 
             case "quota_exhausted_stopping":

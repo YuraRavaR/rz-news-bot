@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import httpx
 import structlog
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig
@@ -41,19 +42,34 @@ _HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+@retry(
+    retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=5, max=20),
+    reraise=True,
+)
+async def _fetch_one(
+    source: object,
+    client: httpx.AsyncClient,
+    max_articles: int,
+) -> list[Article]:
+    """Thin wrapper around source.fetch that tenacity can decorate."""
+    fetch = getattr(source, "fetch")
+    return await fetch(client, max_articles)  # type: ignore[no-any-return]
+
 
 async def fetch_articles(settings: Settings, config: FlowConfig) -> list[Article]:
     """Fetch and deduplicate articles from all active sources.
 
-    Each source is instantiated from FlowConfig and receives its own
-    per-source article limit.  Results are deduplicated across sources by
-    article ID.
+    Each source is fetched independently — a timeout or network error on one
+    source is logged and skipped so the remaining sources still run.
+    Results are deduplicated across sources by article ID.
 
-    Raises:
-        httpx.HTTPError: propagated from any source on network/HTTP failures.
+    Returns an empty list only when every source fails.
     """
     all_articles: list[Article] = []
     seen_ids: set[str] = set()
+    failed_sources: list[str] = []
 
     enabled = config.enabled_sources
     sources = get_active_sources(config)
@@ -67,12 +83,22 @@ async def fetch_articles(settings: Settings, config: FlowConfig) -> list[Article
         http2=True,  # Chrome uses HTTP/2 — helps bypass some WAFs
     ) as client:
         for source, src_cfg in zip(sources, enabled):
-            logger.info("scrape_source_start", name=source.name, url=source.url)
-            articles = await source.fetch(client, src_cfg.max_articles)
+            log = logger.bind(name=source.name)
+            log.info("scrape_source_start", url=source.url)
+            try:
+                articles = await _fetch_one(source, client, src_cfg.max_articles)
+            except Exception as exc:
+                log.warning("scrape_source_failed", error=str(exc))
+                failed_sources.append(source.name)
+                continue
+
             new = [a for a in articles if a.id not in seen_ids]
             seen_ids.update(a.id for a in new)
             all_articles.extend(new)
-            logger.info("scrape_source_done", name=source.name, found=len(articles))
+            log.info("scrape_source_done", found=len(articles))
+
+    if failed_sources:
+        logger.warning("scrape_partial_failure", failed=failed_sources)
 
     logger.info("scrape_done", total=len(all_articles))
     return all_articles

@@ -12,7 +12,9 @@ Design principles:
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import structlog
 
@@ -84,10 +86,18 @@ class Pipeline:
             dry_run: If True, evaluate articles but do NOT publish to Telegram.
         """
         stats = PipelineStats(dry_run=dry_run)
+        _start = time.monotonic()
+
+        source = urlparse(self.settings.scraper_base_url).hostname or self.settings.scraper_base_url
 
         # ── Stage 1: Scrape ───────────────────────────────────────────────────
         log = logger.bind(dry_run=dry_run)
-        log.info("pipeline_started")
+        log.info(
+            "pipeline_started",
+            source=source,
+            model=self.settings.gemini_model,
+            min_score=self.settings.ai_min_score,
+        )
         try:
             all_articles = await fetch_articles(self.settings)
         except Exception as exc:
@@ -135,11 +145,13 @@ class Pipeline:
             if not dry_run and stats.posted > 0:
                 await asyncio.sleep(_INTER_POST_DELAY_SECONDS)
 
+        elapsed_s = round(time.monotonic() - _start)
         log.info(
             "pipeline_complete",
             posted=stats.posted,
             skipped=stats.skipped,
             errors=stats.errors,
+            elapsed_s=elapsed_s,
         )
         return stats
 
@@ -175,7 +187,11 @@ class Pipeline:
             # Stage 3b: Apply threshold and publish
             if ai_decision.is_interesting and ai_decision.score >= self.settings.ai_min_score:
                 if dry_run:
-                    log.info("dry_run_would_publish", ua_title=ai_decision.ua_title)
+                    log.info(
+                        "dry_run_would_publish",
+                        score=ai_decision.score,
+                        ua_title=ai_decision.ua_title,
+                    )
                     stats.posted += 1
                     decision = Decision.POSTED
                 else:
@@ -183,6 +199,7 @@ class Pipeline:
                     tg_message_id = result.message_id
                     log.info(
                         "published",
+                        score=ai_decision.score,
                         tg_message_id=tg_message_id,
                         ua_title=ai_decision.ua_title,
                     )

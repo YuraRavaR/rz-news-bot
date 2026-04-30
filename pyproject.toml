@@ -1,0 +1,85 @@
+[project]
+name = "rz-flow"
+version = "0.1.0"
+description = "Automated Telegram channel about events in Rzeszów, Poland"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "beautifulsoup4>=4.13",
+    "lxml>=5.3",
+    "google-genai>=1.10",
+    "libsql-client>=0.3",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.8",
+    "structlog>=25.2",
+    "tenacity>=9.1",
+    "h2>=4.3.0",
+    "brotli>=1.2.0",
+]
+
+[project.scripts]
+rz-flow = "rz_flow.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rz_flow"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.26",
+    "pytest-cov>=6.1",
+    "respx>=0.22",
+    "mypy>=1.15",
+    "ruff>=0.11",
+    "pre-commit>=4.2",
+    "types-beautifulsoup4>=4.12",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=src/rz_flow --cov-report=term-missing --cov-report=xml"
+filterwarnings = [
+    # Third-party deprecations we don't control
+    "ignore::DeprecationWarning:google.genai",
+    "ignore::DeprecationWarning:pydantic",
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src/rz_flow"]
+plugins = ["pydantic.mypy"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+extend-select = ["ANN"]
+# ANN101/ANN102 were removed in ruff; B017 in tests catches too many valid patterns
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "B017"]
+
+[tool.coverage.run]
+source = ["src/rz_flow"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 70
+omit = [
+    "src/rz_flow/main.py",   # entry point, tested via integration
+]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

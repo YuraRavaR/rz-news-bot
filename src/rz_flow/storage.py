@@ -10,6 +10,7 @@ is as simple as writing a new class that implements StorageProtocol.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
@@ -28,13 +29,25 @@ CREATE TABLE IF NOT EXISTS posts (
     decision        TEXT NOT NULL,
     ai_score        REAL,
     ai_reason       TEXT,
-    tg_message_id   INTEGER
+    tg_message_id   INTEGER,
+    ua_title        TEXT,
+    ua_summary      TEXT,
+    category_tag    TEXT
 );
 """
 
 _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_posts_seen_at ON posts(seen_at DESC);
 """
+
+# Migrations for existing databases that predate the ua_title/ua_summary/category_tag columns.
+# SQLite does not support "ADD COLUMN IF NOT EXISTS", so we attempt each ALTER and silently
+# ignore errors caused by the column already existing (duplicate column name).
+_MIGRATIONS = [
+    "ALTER TABLE posts ADD COLUMN ua_title TEXT",
+    "ALTER TABLE posts ADD COLUMN ua_summary TEXT",
+    "ALTER TABLE posts ADD COLUMN category_tag TEXT",
+]
 
 
 # ── Protocol (interface) ──────────────────────────────────────────────────────
@@ -98,6 +111,13 @@ class TursoStorage:
         client = self._get_client()
         await client.execute(_CREATE_TABLE)
         await client.execute(_CREATE_INDEX)
+        await self._migrate(client)
+
+    async def _migrate(self, client: libsql_client.Client) -> None:
+        """Apply schema migrations for existing databases."""
+        for sql in _MIGRATIONS:
+            with contextlib.suppress(Exception):  # column already exists — ignore
+                await client.execute(sql)
 
     async def filter_new_ids(self, article_ids: list[str]) -> list[str]:
         if not article_ids:
@@ -123,8 +143,10 @@ class TursoStorage:
         await client.execute(
             """
             INSERT OR REPLACE INTO posts
-              (id, url, category, title_pl, seen_at, decision, ai_score, ai_reason, tg_message_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (id, url, category, title_pl, seen_at, decision,
+               ai_score, ai_reason, tg_message_id,
+               ua_title, ua_summary, category_tag)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 article.id,
@@ -136,6 +158,9 @@ class TursoStorage:
                 ai_decision.score if ai_decision else None,
                 ai_decision.reason if ai_decision else None,
                 tg_message_id,
+                ai_decision.ua_title if ai_decision else None,
+                ai_decision.ua_summary if ai_decision else None,
+                ai_decision.category_tag.value if ai_decision else None,
             ],
         )
 
@@ -174,6 +199,9 @@ class InMemoryStorage:
             ai_score=ai_decision.score if ai_decision else None,
             ai_reason=ai_decision.reason if ai_decision else None,
             tg_message_id=tg_message_id,
+            ua_title=ai_decision.ua_title if ai_decision else None,
+            ua_summary=ai_decision.ua_summary if ai_decision else None,
+            category_tag=ai_decision.category_tag.value if ai_decision else None,
         )
 
     async def close(self) -> None:

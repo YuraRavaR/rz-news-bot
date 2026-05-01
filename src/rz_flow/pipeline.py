@@ -40,12 +40,14 @@ class PipelineStats:
     errors: int = 0
     dry_run: bool = False
     quota_exhausted: bool = False  # True if Gemini daily quota was hit
+    post_cap_reached: bool = False  # True if max_posts_per_run was hit
 
     def __str__(self) -> str:
         mode = " [DRY RUN]" if self.dry_run else ""
         quota = " [QUOTA EXHAUSTED]" if self.quota_exhausted else ""
+        cap = " [POST CAP]" if self.post_cap_reached else ""
         return (
-            f"Pipeline run{mode}{quota}: "
+            f"Pipeline run{mode}{quota}{cap}: "
             f"scraped={self.total_scraped}, "
             f"new={self.new_articles}, "
             f"posted={self.posted}, "
@@ -123,16 +125,24 @@ class Pipeline:
 
         # ── Stage 3: AI evaluate + publish ────────────────────────────────────
         for i, article in enumerate(new_articles):
-            quota_hit = await self._process_article(article, stats, dry_run)
-            if quota_hit:
-                # Daily quota exhausted — no point processing remaining articles.
-                # They will be retried on the next pipeline run (not saved as error).
+            stop_signal = await self._process_article(article, stats, dry_run)
+
+            if stop_signal == "quota_exhausted":
                 log.warning(
                     "quota_exhausted_stopping",
                     processed=i + 1,
                     remaining=len(new_articles) - i - 1,
                 )
                 stats.quota_exhausted = True
+                break
+
+            if stop_signal == "cap_reached":
+                log.info(
+                    "post_cap_reached",
+                    cap=self.flow_config.pipeline.max_posts_per_run,
+                    remaining=len(new_articles) - i - 1,
+                )
+                stats.post_cap_reached = True
                 break
 
             is_last = i == len(new_articles) - 1
@@ -157,17 +167,17 @@ class Pipeline:
         article: Article,
         stats: PipelineStats,
         dry_run: bool,
-    ) -> bool:
+    ) -> str:
         """Process a single article: AI evaluate → maybe publish → save.
 
-        Returns:
-            True if Gemini daily quota was exhausted (caller should stop loop).
-            False in all other cases (success, skip, transient error).
+        Returns a stop-signal string for the caller:
+            "continue"        — normal; keep processing remaining articles
+            "quota_exhausted" — Gemini daily quota hit; stop immediately (article not saved)
+            "cap_reached"     — max_posts_per_run reached after this post; stop the loop
         """
         ai_decision: AIDecision | None = None
         decision = Decision.ERROR
         tg_message_id: int | None = None
-        quota_exhausted = False
 
         log = logger.bind(article_id=article.id, category=article.category.value)
 
@@ -211,14 +221,13 @@ class Pipeline:
         except GeminiQuotaExhaustedError:
             # Do NOT save as error — we'll retry this article on the next run
             # (it won't appear in filter_new_ids since it's not persisted)
-            quota_exhausted = True
-            return quota_exhausted
+            return "quota_exhausted"
 
         except GeminiServerError as exc:
             # 503 UNAVAILABLE after retries — transient server overload.
             # Do NOT save to DB so the article is retried on the next pipeline run.
             log.warning("gemini_unavailable_skipping", error=str(exc))
-            return False
+            return "continue"
 
         except Exception as exc:
             log.exception("article_error", error=str(exc))
@@ -237,4 +246,9 @@ class Pipeline:
             except Exception as save_exc:
                 log.error("save_failed", error=str(save_exc))
 
-        return quota_exhausted
+        # Signal cap after the post is saved so the article is not retried next run
+        cap = self.flow_config.pipeline.max_posts_per_run
+        if decision == Decision.POSTED and stats.posted >= cap:
+            return "cap_reached"
+
+        return "continue"

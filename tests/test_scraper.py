@@ -86,13 +86,34 @@ async def test_fetch_articles_deduplicates() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_fetch_articles_raises_on_http_error() -> None:
-    """Scraper propagates HTTP errors so the pipeline can handle them."""
+async def test_fetch_articles_continues_when_one_source_fails() -> None:
+    """A 503 from one source is logged and skipped; the other source still runs."""
+    rn = (FIXTURES_DIR / "rzeszow_news_sample.html").read_text()
     respx.get("https://rzeszow24.info/najnowsze").mock(return_value=Response(503))
-    respx.get("https://rzeszow-news.pl/").mock(return_value=Response(200, text="<html></html>"))
+    respx.get("https://rzeszow-news.pl/").mock(return_value=Response(200, text=rn))
 
-    with pytest.raises(Exception):
-        await fetch_articles(_make_settings(), _make_flow_config())
+    # Should NOT raise — partial success is acceptable
+    articles = await fetch_articles(_make_settings(), _make_flow_config())
+    # Articles from rzeszow-news.pl are returned even though rzeszow24 failed
+    assert len(articles) > 0
+    # All returned IDs carry the rzn/ prefix from RzeszowNewsScraper
+    assert all(a.id.startswith("rzn/") for a in articles)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_articles_ids_carry_source_prefix() -> None:
+    """Article IDs are prefixed with the source identifier to prevent cross-source collisions."""
+    najnowsze = (FIXTURES_DIR / "najnowsze_sample.html").read_text()
+    rn = (FIXTURES_DIR / "rzeszow_news_sample.html").read_text()
+    _mock_all_sources(najnowsze, rn)
+
+    articles = await fetch_articles(_make_settings(), _make_flow_config())
+
+    rz24_articles = [a for a in articles if a.id.startswith("rz24/")]
+    rzn_articles = [a for a in articles if a.id.startswith("rzn/")]
+    assert len(rz24_articles) > 0, "Expected articles with rz24/ prefix from NajnowszeScraper"
+    assert len(rzn_articles) > 0, "Expected articles with rzn/ prefix from RzeszowNewsScraper"
 
 
 @pytest.mark.asyncio

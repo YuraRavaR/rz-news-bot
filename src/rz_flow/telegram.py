@@ -12,6 +12,7 @@ Handles:
 """
 
 import asyncio
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -32,13 +33,23 @@ _TG_API_BASE = "https://api.telegram.org/bot{token}"
 # Maximum message length Telegram allows (HTML entities count toward it)
 _MAX_MESSAGE_LEN = 4096
 
-# Template for a channel post
+# Template for a channel post — {hashtag} is empty string when category is "inne"
 _POST_TEMPLATE = """\
 <b>{title}</b>
 
 {summary}
 
-<a href="{url}">Деталі на rzeszow24.info</a>"""
+<a href="{url}">Деталі на {domain}</a>{hashtag}"""
+
+# Maps CategoryTag values → Ukrainian hashtags shown at the end of a post.
+# "inne" maps to empty string so no hashtag line is appended for uncategorised content.
+_CATEGORY_HASHTAGS: dict[str, str] = {
+    "koncert": "#концерт",
+    "festyn": "#фестиваль",
+    "sport": "#спорт",
+    "komunikacja": "#транспорт",
+    "inne": "",
+}
 
 
 def _build_message(article: Article, decision: AIDecision) -> str:
@@ -47,8 +58,18 @@ def _build_message(article: Article, decision: AIDecision) -> str:
     title = _html_escape(decision.ua_title)
     summary = _html_escape(decision.ua_summary)
     url = article.url
+    domain = urlparse(url).netloc  # e.g. "rzeszow24.info" or "rzeszow-news.pl"
 
-    text = _POST_TEMPLATE.format(title=title, summary=summary, url=url)
+    raw_hashtag = _CATEGORY_HASHTAGS.get(decision.category_tag.value, "")
+    hashtag = f"\n\n{raw_hashtag}" if raw_hashtag else ""
+
+    text = _POST_TEMPLATE.format(
+        title=title,
+        summary=summary,
+        url=url,
+        domain=domain,
+        hashtag=hashtag,
+    )
 
     # Truncate gracefully if somehow over Telegram limit
     if len(text) > _MAX_MESSAGE_LEN:
@@ -65,9 +86,16 @@ def _html_escape(text: str) -> str:
 class TelegramPublisher:
     """Publishes messages to a Telegram channel via Bot API."""
 
-    def __init__(self, bot_token: str, channel_id: str) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        channel_id: str,
+        admin_chat_id: str | None = None,
+    ) -> None:
         self._base_url = _TG_API_BASE.format(token=bot_token)
         self._channel_id = channel_id
+        # Alerts go to admin_chat_id when set, otherwise fall back to the public channel.
+        self._alert_chat_id = admin_chat_id or channel_id
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPStatusError),
@@ -122,13 +150,13 @@ class TelegramPublisher:
         )
 
     async def send_alert(self, message: str) -> None:
-        """Send a plain-text alert to the channel (used for error notifications)."""
+        """Send a plain-text alert to the admin chat (or channel if no admin chat configured)."""
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.post(
                     f"{self._base_url}/sendMessage",
                     json={
-                        "chat_id": self._channel_id,
+                        "chat_id": self._alert_chat_id,
                         "text": f"⚠️ Rz-Flow alert:\n{message}",
                         "parse_mode": "HTML",
                     },

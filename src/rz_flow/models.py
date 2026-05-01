@@ -17,7 +17,7 @@ class Category(StrEnum):
 
 
 class Article(BaseModel):
-    """Raw article extracted from rzeszow24.info."""
+    """Raw article extracted from a Rzeszów news source."""
 
     id: str = Field(..., description="Unique slug/ID from the URL tail")
     url: str = Field(..., description="Full article URL")
@@ -27,7 +27,7 @@ class Article(BaseModel):
 
 
 class CategoryTag(StrEnum):
-    CONCERT = "konzert"
+    CONCERT = "koncert"
     FESTIVAL = "festyn"
     SPORT = "sport"
     TRANSPORT = "komunikacja"
@@ -63,6 +63,9 @@ class PostRecord(BaseModel):
     ai_score: float | None = None
     ai_reason: str | None = None
     tg_message_id: int | None = None
+    ua_title: str | None = None
+    ua_summary: str | None = None
+    category_tag: str | None = None
 
 
 class PublishResult(BaseModel):

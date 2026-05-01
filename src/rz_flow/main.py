@@ -48,6 +48,7 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
                 alert = TelegramPublisher(
                     bot_token=settings.telegram_bot_token,
                     channel_id=settings.telegram_channel_id,
+                    admin_chat_id=settings.telegram_admin_chat_id,
                 )
                 await alert.send_alert(f"Pipeline crashed: {type(exc).__name__}: {exc}")
             _write_github_summary(
@@ -61,6 +62,7 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
             alert = TelegramPublisher(
                 bot_token=settings.telegram_bot_token,
                 channel_id=settings.telegram_channel_id,
+                admin_chat_id=settings.telegram_admin_chat_id,
             )
             await alert.send_alert(
                 "Gemini daily quota exhausted. "

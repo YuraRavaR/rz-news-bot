@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # ── Telegram ──────────────────────────────────────────────────────────────
     telegram_bot_token: str = Field(..., description="Telegram Bot API token from @BotFather")
     telegram_channel_id: str = Field(..., description="Target channel ID (e.g. -1001234567890)")
+    telegram_admin_chat_id: str | None = Field(
+        default=None,
+        description="Private chat ID for crash/quota alerts (falls back to channel if unset)",
+    )
 
     # ── Gemini AI ─────────────────────────────────────────────────────────────
     gemini_api_key: str = Field(..., description="Google AI Studio API key")

@@ -17,6 +17,7 @@ class RzeszowNewsScraper:
     """Fetches the rzeszow-news.pl homepage and parses td_module_10 cards."""
 
     name = "rzeszow-news.pl/homepage"
+    ID_PREFIX = "rzn"
 
     def __init__(self, base_url: str = "https://rzeszow-news.pl/") -> None:
         self.url = base_url
@@ -28,4 +29,5 @@ class RzeszowNewsScraper:
     ) -> list[Article]:
         response = await client.get(self.url)
         response.raise_for_status()
-        return parse_rzeszow_news_page(response.text)[:max_articles]
+        articles = parse_rzeszow_news_page(response.text)[:max_articles]
+        return [a.model_copy(update={"id": f"{self.ID_PREFIX}/{a.id}"}) for a in articles]

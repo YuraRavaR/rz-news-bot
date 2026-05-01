@@ -82,6 +82,30 @@ class TestSaveDecision:
         assert record.ai_score == 8.5
         assert record.tg_message_id == 42
 
+    async def test_save_stores_ua_fields(self, storage: InMemoryStorage) -> None:
+        """QW-4: Ukrainian AI output (ua_title, ua_summary, category_tag) is persisted."""
+        article = _make_article()
+        ai = _make_ai_decision()
+
+        await storage.save_decision(article, Decision.POSTED, ai)
+
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.ua_title == ai.ua_title
+        assert record.ua_summary == ai.ua_summary
+        assert record.category_tag == ai.category_tag.value
+
+    async def test_save_ua_fields_none_without_ai(self, storage: InMemoryStorage) -> None:
+        """QW-4: ua fields are None when no AI decision is provided (e.g. error case)."""
+        article = _make_article()
+        await storage.save_decision(article, Decision.ERROR)
+
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.ua_title is None
+        assert record.ua_summary is None
+        assert record.category_tag is None
+
     async def test_save_skipped_without_ai(self, storage: InMemoryStorage) -> None:
         article = _make_article()
         await storage.save_decision(article, Decision.SKIPPED)

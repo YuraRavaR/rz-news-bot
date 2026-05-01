@@ -63,7 +63,7 @@ def _make_boring_decision(score: float = 3.0) -> AIDecision:
     )
 
 
-def _make_flow_config() -> FlowConfig:
+def _make_flow_config(max_posts_per_run: int = 10) -> FlowConfig:
     return FlowConfig(
         sources=[
             SourceConfig(
@@ -72,12 +72,16 @@ def _make_flow_config() -> FlowConfig:
                 max_articles=5,
             )
         ],
-        pipeline=PipelineConfig(),
+        pipeline=PipelineConfig(max_posts_per_run=max_posts_per_run),
     )
 
 
-def _build_pipeline(storage: InMemoryStorage) -> Pipeline:
-    return Pipeline(settings=_make_settings(), storage=storage, flow_config=_make_flow_config())
+def _build_pipeline(storage: InMemoryStorage, max_posts_per_run: int = 10) -> Pipeline:
+    return Pipeline(
+        settings=_make_settings(),
+        storage=storage,
+        flow_config=_make_flow_config(max_posts_per_run=max_posts_per_run),
+    )
 
 
 @pytest.fixture
@@ -352,6 +356,73 @@ class TestPipelineRunBasic:
         assert storage.get_record("QUOTA_ART_2") is None
 
 
+class TestPipelinePostCap:
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_stops_at_post_cap(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        """QW-7: pipeline stops after max_posts_per_run posts are made."""
+        articles = [_make_article(f"ART_{i:04d}_XYZABCDE") for i in range(5)]
+        mock_fetch.return_value = articles
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        # All articles are interesting
+        mock_ai.evaluate = AsyncMock(return_value=_make_interesting_decision())
+
+        mock_tg = MagicMock()
+        mock_tg_cls.return_value = mock_tg
+        publish_result = MagicMock()
+        publish_result.message_id = 1
+        mock_tg.publish = AsyncMock(return_value=publish_result)
+
+        # Cap at 2 posts
+        pipeline = _build_pipeline(storage, max_posts_per_run=2)
+        stats = await pipeline.run()
+
+        assert stats.posted == 2
+        assert stats.post_cap_reached is True
+        # Only 2 articles should be published despite 5 being available
+        assert mock_tg.publish.call_count == 2
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_cap_not_triggered_when_below_limit(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        """QW-7: post_cap_reached stays False when posts are within the limit."""
+        articles = [_make_article(f"ART_{i:04d}_XYZABCDE") for i in range(3)]
+        mock_fetch.return_value = articles
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(return_value=_make_interesting_decision())
+
+        mock_tg = MagicMock()
+        mock_tg_cls.return_value = mock_tg
+        publish_result = MagicMock()
+        publish_result.message_id = 1
+        mock_tg.publish = AsyncMock(return_value=publish_result)
+
+        # Cap at 5, but only 3 articles — cap should not be triggered
+        pipeline = _build_pipeline(storage, max_posts_per_run=5)
+        stats = await pipeline.run()
+
+        assert stats.posted == 3
+        assert stats.post_cap_reached is False
+
+
 class TestPipelineStats:
     def test_str_representation_no_dry_run(self) -> None:
         stats = PipelineStats(total_scraped=10, new_articles=5, posted=3, skipped=2)
@@ -365,3 +436,8 @@ class TestPipelineStats:
     def test_str_representation_quota_exhausted(self) -> None:
         stats = PipelineStats(quota_exhausted=True, posted=2, skipped=1)
         assert "QUOTA EXHAUSTED" in str(stats)
+
+    def test_str_representation_post_cap(self) -> None:
+        """QW-7: POST CAP flag appears in string representation."""
+        stats = PipelineStats(post_cap_reached=True, posted=5)
+        assert "POST CAP" in str(stats)

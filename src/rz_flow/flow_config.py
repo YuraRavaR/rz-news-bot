@@ -37,6 +37,7 @@ class PipelineConfig(BaseModel):
 
     inter_ai_delay_seconds: float = 5.0
     inter_post_delay_seconds: float = 2.0
+    max_posts_per_run: int = 5
 
 
 class FlowConfig(BaseModel):

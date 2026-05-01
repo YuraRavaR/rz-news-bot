@@ -23,6 +23,7 @@ class NajnowszeScraper:
     """Fetches the /najnowsze (latest) feed from rzeszow24.info."""
 
     name = "rzeszow24/najnowsze"
+    ID_PREFIX = "rz24"
 
     def __init__(self, base_url: str = "https://rzeszow24.info/najnowsze") -> None:
         self.url = base_url
@@ -34,7 +35,8 @@ class NajnowszeScraper:
     ) -> list[Article]:
         response = await client.get(self.url)
         response.raise_for_status()
-        return parse_najnowsze_page(response.text)[:max_articles]
+        articles = parse_najnowsze_page(response.text)[:max_articles]
+        return [a.model_copy(update={"id": f"{self.ID_PREFIX}/{a.id}"}) for a in articles]
 
 
 # ── Archived ──────────────────────────────────────────────────────────────────

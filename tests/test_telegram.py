@@ -90,6 +90,62 @@ class TestBuildMessage:
         msg = _build_message(article, decision)
         assert len(msg) <= 4096
 
+    def test_link_label_uses_domain_from_article_url(self) -> None:
+        """QW-1: link label should reflect the actual source domain, not a hardcoded string."""
+        article = Article(
+            id="rzn/some-slug",
+            url="https://rzeszow-news.pl/some-slug/",
+            category=Category.IMPREZY,
+            title_pl="Test",
+            summary_pl="",
+        )
+        decision = _make_decision()
+        msg = _build_message(article, decision)
+        assert "rzeszow-news.pl" in msg
+        assert "rzeszow24.info" not in msg
+
+    def test_link_label_rzeszow24_domain(self) -> None:
+        """Articles from rzeszow24.info should show that domain in the link label."""
+        article = _make_article()  # URL is rzeszow24.info
+        decision = _make_decision()
+        msg = _build_message(article, decision)
+        assert "rzeszow24.info" in msg
+
+    def test_includes_hashtag_for_festival(self) -> None:
+        """QW-8: festival category tag should add #фестиваль hashtag."""
+        article = _make_article()
+        decision = _make_decision()  # CategoryTag.FESTIVAL
+        msg = _build_message(article, decision)
+        assert "#фестиваль" in msg
+
+    def test_includes_hashtag_for_concert(self) -> None:
+        """QW-8: concert category tag should add #концерт hashtag."""
+        article = _make_article()
+        decision = AIDecision(
+            is_interesting=True,
+            score=8.0,
+            category_tag=CategoryTag.CONCERT,
+            ua_title="Концерт",
+            ua_summary="Опис.",
+            reason="Concert",
+        )
+        msg = _build_message(article, decision)
+        assert "#концерт" in msg
+
+    def test_no_hashtag_for_inne(self) -> None:
+        """QW-8: 'inne' (other) category should produce no hashtag line."""
+        article = _make_article()
+        decision = AIDecision(
+            is_interesting=True,
+            score=7.5,
+            category_tag=CategoryTag.OTHER,
+            ua_title="Новина",
+            ua_summary="Опис.",
+            reason="General news",
+        )
+        msg = _build_message(article, decision)
+        assert "#" not in msg
+
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────
 class TestTelegramPublisher:
@@ -158,3 +214,37 @@ class TestTelegramPublisher:
         data = json.loads(route.calls[0].request.content)
         assert "⚠️" in data["text"]
         assert "Something went wrong" in data["text"]
+
+    @respx.mock
+    async def test_send_alert_uses_admin_chat_id_when_set(self) -> None:
+        """QW-6: alerts go to admin_chat_id, not the public channel."""
+        import json
+
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 1}})
+        )
+
+        publisher = TelegramPublisher(
+            bot_token="fake-token",
+            channel_id="-100channel",
+            admin_chat_id="99999admin",
+        )
+        await publisher.send_alert("Crash!")
+
+        data = json.loads(route.calls[0].request.content)
+        assert data["chat_id"] == "99999admin"
+
+    @respx.mock
+    async def test_send_alert_falls_back_to_channel_when_no_admin_chat(self) -> None:
+        """QW-6: when admin_chat_id is unset, alert falls back to the public channel."""
+        import json
+
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 1}})
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100channel")
+        await publisher.send_alert("Crash!")
+
+        data = json.loads(route.calls[0].request.content)
+        assert data["chat_id"] == "-100channel"

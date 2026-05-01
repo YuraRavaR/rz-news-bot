@@ -40,13 +40,25 @@ _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_posts_seen_at ON posts(seen_at DESC);
 """
 
-# Migrations for existing databases that predate the ua_title/ua_summary/category_tag columns.
-# SQLite does not support "ADD COLUMN IF NOT EXISTS", so we attempt each ALTER and silently
-# ignore errors caused by the column already existing (duplicate column name).
-_MIGRATIONS = [
+# Schema migrations — ALTER TABLE statements.
+# SQLite does not support "ADD COLUMN IF NOT EXISTS", so errors are silently suppressed:
+# a "duplicate column name" error means the column already exists and we can move on.
+_SCHEMA_MIGRATIONS = [
     "ALTER TABLE posts ADD COLUMN ua_title TEXT",
     "ALTER TABLE posts ADD COLUMN ua_summary TEXT",
     "ALTER TABLE posts ADD COLUMN category_tag TEXT",
+]
+
+# Data migrations — one-time UPDATE statements that backfill existing rows.
+# These are idempotent (WHERE clause ensures they only touch un-migrated rows)
+# and must NOT be suppressed — a failure here means data is inconsistent.
+#
+# QW-2 introduced source-prefixed IDs (rz24/..., rzn/...).
+# Existing DB records were stored without a prefix, so we backfill them here
+# to prevent the bot from re-processing already-seen articles after the upgrade.
+_DATA_MIGRATIONS = [
+    "UPDATE posts SET id = 'rz24/' || id WHERE url LIKE '%rzeszow24.info%' AND id NOT LIKE 'rz24/%'",
+    "UPDATE posts SET id = 'rzn/' || id WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
 ]
 
 
@@ -114,10 +126,12 @@ class TursoStorage:
         await self._migrate(client)
 
     async def _migrate(self, client: libsql_client.Client) -> None:
-        """Apply schema migrations for existing databases."""
-        for sql in _MIGRATIONS:
+        """Apply schema and data migrations for existing databases."""
+        for sql in _SCHEMA_MIGRATIONS:
             with contextlib.suppress(Exception):  # column already exists — ignore
                 await client.execute(sql)
+        for sql in _DATA_MIGRATIONS:
+            await client.execute(sql)  # must succeed — no suppression
 
     async def filter_new_ids(self, article_ids: list[str]) -> list[str]:
         if not article_ids:

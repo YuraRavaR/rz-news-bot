@@ -66,7 +66,7 @@ async def test_fetch_articles_returns_articles() -> None:
     rn = (FIXTURES_DIR / "rzeszow_news_sample.html").read_text()
     _mock_all_sources(najnowsze, rn)
 
-    articles = await fetch_articles(_make_settings(), _make_flow_config())
+    articles, _ = await fetch_articles(_make_settings(), _make_flow_config())
 
     assert len(articles) > 0
 
@@ -79,7 +79,7 @@ async def test_fetch_articles_deduplicates() -> None:
     rn = (FIXTURES_DIR / "rzeszow_news_sample.html").read_text()
     _mock_all_sources(najnowsze, rn)
 
-    articles = await fetch_articles(_make_settings(), _make_flow_config())
+    articles, _ = await fetch_articles(_make_settings(), _make_flow_config())
     ids = [a.id for a in articles]
     assert len(ids) == len(set(ids))
 
@@ -93,7 +93,7 @@ async def test_fetch_articles_continues_when_one_source_fails() -> None:
     respx.get("https://rzeszow-news.pl/").mock(return_value=Response(200, text=rn))
 
     # Should NOT raise — partial success is acceptable
-    articles = await fetch_articles(_make_settings(), _make_flow_config())
+    articles, source_scraped = await fetch_articles(_make_settings(), _make_flow_config())
     # Articles from rzeszow-news.pl are returned even though rzeszow24 failed
     assert len(articles) > 0
     # All returned IDs carry the rzn/ prefix from RzeszowNewsScraper
@@ -108,7 +108,7 @@ async def test_fetch_articles_ids_carry_source_prefix() -> None:
     rn = (FIXTURES_DIR / "rzeszow_news_sample.html").read_text()
     _mock_all_sources(najnowsze, rn)
 
-    articles = await fetch_articles(_make_settings(), _make_flow_config())
+    articles, _ = await fetch_articles(_make_settings(), _make_flow_config())
 
     rz24_articles = [a for a in articles if a.id.startswith("rz24/")]
     rzn_articles = [a for a in articles if a.id.startswith("rzn/")]
@@ -124,7 +124,7 @@ async def test_fetch_articles_respects_max_articles_limit() -> None:
     rn = (FIXTURES_DIR / "rzeszow_news_sample.html").read_text()
     _mock_all_sources(najnowsze, rn)
 
-    articles = await fetch_articles(_make_settings(), _make_flow_config(max_articles=3))
+    articles, _ = await fetch_articles(_make_settings(), _make_flow_config(max_articles=3))
 
     # 3 per source × 2 sources = 6 max (assuming no cross-source deduplication)
     assert len(articles) <= 6

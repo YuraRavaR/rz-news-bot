@@ -77,6 +77,7 @@ cp .env.example .env
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | [@BotFather](https://t.me/BotFather) → `/newbot` |
 | `TELEGRAM_CHANNEL_ID` | [@userinfobot](https://t.me/userinfobot) or `/getUpdates` |
+| `TELEGRAM_ADMIN_CHAT_ID` | Your personal chat ID (optional — enables per-run admin reports) |
 | `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `GEMINI_MODEL` | e.g. `gemini-2.0-flash` or `gemini-2.0-flash-lite` |
 | `TURSO_DATABASE_URL` | `turso db show rz-flow --url` |
@@ -162,6 +163,7 @@ The workflow (`.github/workflows/publish.yml`) runs automatically on the schedul
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Bot token |
 | `TELEGRAM_CHANNEL_ID` | Target channel ID |
+| `TELEGRAM_ADMIN_CHAT_ID` | Admin chat ID for run reports (optional) |
 | `GEMINI_API_KEY` | Google AI Studio key |
 | `GEMINI_MODEL` | Model name (optional, falls back to `gemini-2.0-flash`) |
 | `TURSO_DATABASE_URL` | Turso database URL |

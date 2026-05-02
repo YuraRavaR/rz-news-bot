@@ -15,6 +15,7 @@ def _make_settings(**overrides: object) -> Settings:
         # Required fields
         "telegram_bot_token": "fake:token",
         "telegram_channel_id": "-100123",
+        "telegram_admin_chat_id": None,
         "gemini_api_key": "fake-key",
         "turso_database_url": "libsql://fake.turso.io",
         "turso_auth_token": "fake-token",

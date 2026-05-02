@@ -38,6 +38,11 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
             return 0
 
         pipeline = Pipeline(settings=settings, storage=storage, flow_config=flow_config)
+        admin = TelegramPublisher(
+            bot_token=settings.telegram_bot_token,
+            channel_id=settings.telegram_channel_id,
+            admin_chat_id=settings.telegram_admin_chat_id,
+        )
 
         try:
             stats = await pipeline.run(dry_run=dry_run)
@@ -45,12 +50,7 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
             log.exception("pipeline_fatal_error", error=str(exc))
             # Send alert to Telegram if this is a real run (not dry run)
             if not dry_run and settings.is_production:
-                alert = TelegramPublisher(
-                    bot_token=settings.telegram_bot_token,
-                    channel_id=settings.telegram_channel_id,
-                    admin_chat_id=settings.telegram_admin_chat_id,
-                )
-                await alert.send_alert(f"Pipeline crashed: {type(exc).__name__}: {exc}")
+                await admin.send_alert(f"Pipeline crashed: {type(exc).__name__}: {exc}")
             _write_github_summary(
                 f"❌ Pipeline crashed: {type(exc).__name__}: {exc}",
                 dry_run=dry_run,
@@ -59,16 +59,15 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
 
         # Send Telegram alert if quota was exhausted (informational, not a crash)
         if stats.quota_exhausted and not dry_run and settings.is_production:
-            alert = TelegramPublisher(
-                bot_token=settings.telegram_bot_token,
-                channel_id=settings.telegram_channel_id,
-                admin_chat_id=settings.telegram_admin_chat_id,
-            )
-            await alert.send_alert(
+            await admin.send_alert(
                 "Gemini daily quota exhausted. "
                 f"Processed {stats.posted + stats.skipped} articles before stopping. "
                 "Quota resets at midnight UTC."
             )
+
+        # Send run report to admin chat after every run (only if admin chat is configured)
+        if settings.telegram_admin_chat_id:
+            await admin.send_run_report(stats, dry_run=dry_run)
 
         # Write summary to GitHub Actions step summary (no-op locally)
         quota_flag = " [QUOTA EXHAUSTED]" if stats.quota_exhausted else ""

@@ -11,6 +11,7 @@ unittest.mock.AsyncMock so we test the orchestration logic in isolation:
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from google.genai import errors as genai_errors
 
 from rz_flow.ai import GeminiQuotaExhaustedError
 from rz_flow.config import Settings
@@ -72,7 +73,12 @@ def _make_flow_config(max_posts_per_run: int = 10) -> FlowConfig:
                 max_articles=5,
             )
         ],
-        pipeline=PipelineConfig(max_posts_per_run=max_posts_per_run),
+        pipeline=PipelineConfig(
+            max_posts_per_run=max_posts_per_run,
+            # Zero delays so tests run at full speed (production uses 5s/2s for rate limiting)
+            inter_ai_delay_seconds=0.0,
+            inter_post_delay_seconds=0.0,
+        ),
     )
 
 
@@ -101,7 +107,7 @@ class TestPipelineRunBasic:
         storage: InMemoryStorage,
     ) -> None:
         article = _make_article("NEW_ARTICLE_12345")
-        mock_fetch.return_value = [article]
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -131,7 +137,7 @@ class TestPipelineRunBasic:
         storage: InMemoryStorage,
     ) -> None:
         article = _make_article("BORING_ARTICLE_123")
-        mock_fetch.return_value = [article]
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -159,7 +165,7 @@ class TestPipelineRunBasic:
     ) -> None:
         """is_interesting=True but score < threshold → skip."""
         article = _make_article("LOWSCORE_ARTICLE_1")
-        mock_fetch.return_value = [article]
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -184,7 +190,7 @@ class TestPipelineRunBasic:
     ) -> None:
         """One article failing AI should not stop processing of the next."""
         articles = [_make_article("FAIL_ARTICLE_12345"), _make_article("GOOD_ARTICLE_12345")]
-        mock_fetch.return_value = articles
+        mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 2})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -218,7 +224,7 @@ class TestPipelineRunBasic:
         storage: InMemoryStorage,
     ) -> None:
         article = _make_article("DRY_RUN_ARTICLE_1")
-        mock_fetch.return_value = [article]
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -234,6 +240,8 @@ class TestPipelineRunBasic:
         assert stats.dry_run is True
         assert stats.posted == 1
         mock_tg.publish.assert_not_called()
+        # Dry-run must NOT persist anything — article should be retryable next run
+        assert storage.get_record("DRY_RUN_ARTICLE_1") is None
 
     @patch("rz_flow.pipeline.fetch_articles")
     async def test_returns_zero_stats_when_no_articles(
@@ -241,7 +249,7 @@ class TestPipelineRunBasic:
         mock_fetch: MagicMock,
         storage: InMemoryStorage,
     ) -> None:
-        mock_fetch.return_value = []
+        mock_fetch.return_value = ([], {})
 
         pipeline = _build_pipeline(storage)
         stats = await pipeline.run()
@@ -263,7 +271,7 @@ class TestPipelineRunBasic:
         # Pre-populate storage so article is "seen"
         await storage.save_decision(article, Decision.POSTED)
 
-        mock_fetch.return_value = [article]
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -296,7 +304,7 @@ class TestPipelineRunBasic:
             _make_article("QUOTA_ART_2"),
             _make_article("QUOTA_ART_3"),
         ]
-        mock_fetch.return_value = articles
+        mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 3})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -312,6 +320,10 @@ class TestPipelineRunBasic:
         assert storage.get_record("QUOTA_ART_2") is None
         # AI was only called once (stopped immediately after first quota error)
         assert mock_ai.evaluate.call_count == 1
+        # Admin run report: quota row appears in article_log without DB save
+        assert len(stats.article_log) == 1
+        assert stats.article_log[0].article_id == "QUOTA_ART_1"
+        assert stats.article_log[0].report_icon == "⏸"
 
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")
@@ -328,7 +340,7 @@ class TestPipelineRunBasic:
             _make_article("GOOD_ART_1"),
             _make_article("QUOTA_ART_2"),
         ]
-        mock_fetch.return_value = articles
+        mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 2})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -354,6 +366,10 @@ class TestPipelineRunBasic:
         # First article was saved, second was NOT
         assert storage.get_record("GOOD_ART_1") is not None
         assert storage.get_record("QUOTA_ART_2") is None
+        assert len(stats.article_log) == 2
+        assert stats.article_log[0].decision == Decision.POSTED
+        assert stats.article_log[1].article_id == "QUOTA_ART_2"
+        assert stats.article_log[1].report_icon == "⏸"
 
 
 class TestPipelinePostCap:
@@ -369,7 +385,7 @@ class TestPipelinePostCap:
     ) -> None:
         """QW-7: pipeline stops after max_posts_per_run posts are made."""
         articles = [_make_article(f"ART_{i:04d}_XYZABCDE") for i in range(5)]
-        mock_fetch.return_value = articles
+        mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 5})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -403,7 +419,7 @@ class TestPipelinePostCap:
     ) -> None:
         """QW-7: post_cap_reached stays False when posts are within the limit."""
         articles = [_make_article(f"ART_{i:04d}_XYZABCDE") for i in range(3)]
-        mock_fetch.return_value = articles
+        mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 3})
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -421,6 +437,102 @@ class TestPipelinePostCap:
 
         assert stats.posted == 3
         assert stats.post_cap_reached is False
+
+
+class TestPipelineBranchCoverage:
+    """Covers branches missed by the happy-path tests above."""
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_fetch_articles_fatal_error_propagates(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        """When fetch_articles itself raises, the exception propagates out of run()."""
+        mock_fetch.side_effect = RuntimeError("DNS lookup failed")
+
+        pipeline = _build_pipeline(storage)
+        with pytest.raises(RuntimeError, match="DNS lookup failed"):
+            await pipeline.run()
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_gemini_server_error_skips_without_saving_continues(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        """GeminiServerError (503) is transient: article NOT saved, pipeline continues."""
+        articles = [_make_article("SERVER_ERR_ART_01X"), _make_article("GOOD_ART_X123456")]
+        mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 2})
+
+        server_err = genai_errors.ServerError(
+            503, {"error": {"code": 503, "message": "Service Unavailable"}}
+        )
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(
+            side_effect=[server_err, _make_interesting_decision()]
+        )
+
+        mock_tg = MagicMock()
+        mock_tg_cls.return_value = mock_tg
+        publish_result = MagicMock()
+        publish_result.message_id = 5
+        mock_tg.publish = AsyncMock(return_value=publish_result)
+
+        pipeline = _build_pipeline(storage)
+        stats = await pipeline.run()
+
+        # GeminiServerError → "continue" (not counted as error)
+        assert stats.errors == 0
+        assert stats.posted == 1
+        # Article that hit ServerError is NOT saved — will be retried next run
+        assert storage.get_record("SERVER_ERR_ART_01X") is None
+        # Second article WAS processed and saved
+        assert storage.get_record("GOOD_ART_X123456") is not None
+        assert len(stats.article_log) == 2
+        assert stats.article_log[0].report_icon == "🔄"
+        assert stats.article_log[1].decision == Decision.POSTED
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_save_decision_failure_logs_but_does_not_crash(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        """If save_decision throws, the pipeline logs the error and keeps running."""
+        article = _make_article("SAVE_FAIL_ART_01XX")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(return_value=_make_boring_decision())
+
+        broken_storage = MagicMock()
+        broken_storage.filter_new_ids = AsyncMock(return_value=[article.id])
+        broken_storage.save_decision = AsyncMock(side_effect=RuntimeError("DB connection lost"))
+
+        pipeline = Pipeline(
+            settings=_make_settings(),
+            storage=broken_storage,
+            flow_config=_make_flow_config(),
+        )
+
+        # Must not raise despite storage failure
+        stats = await pipeline.run()
+        assert stats.skipped == 1
 
 
 class TestPipelineStats:

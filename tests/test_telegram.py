@@ -5,11 +5,14 @@ This tests our message formatting, API call structure, retry logic,
 and rate-limit handling.
 """
 
+from unittest.mock import AsyncMock, patch
+
+import httpx
 import pytest
 import respx
 from httpx import Response
 
-from rz_flow.models import AIDecision, Article, Category, CategoryTag
+from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.telegram import TelegramPublisher, _build_message, _html_escape
 
 
@@ -146,6 +149,74 @@ class TestBuildMessage:
         msg = _build_message(article, decision)
         assert "#" not in msg
 
+    def test_message_truncated_when_over_4096_chars(self) -> None:
+        """Very long summaries must be truncated to fit Telegram's 4096-char limit."""
+        article = _make_article()
+        decision = _make_decision(ua_title="Т" * 200)
+        # Override summary to push message well over the limit
+        long_decision = AIDecision(
+            is_interesting=True,
+            score=8.0,
+            category_tag=CategoryTag.FESTIVAL,
+            ua_title="Т" * 200,
+            ua_summary="С" * 4000,
+            reason="test",
+        )
+        msg = _build_message(article, long_decision)
+        assert len(msg) <= 4096
+        assert msg.endswith("…")
+
+
+class TestBuildRunReport:
+    def test_source_lines_use_clickable_links_when_url_known(self) -> None:
+        """Admin report: each source name links to its configured base_url."""
+        from rz_flow.pipeline import ArticleRunEntry, PipelineStats
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            dry_run=True,
+            source_scraped={"rzeszow-news.pl": 15, "rzeszow24/najnowsze": 17},
+            source_new={"rzeszow-news.pl": 1, "rzeszow24/najnowsze": 0},
+            source_urls={
+                "rzeszow-news.pl": "https://rzeszow-news.pl",
+                "rzeszow24/najnowsze": "https://rzeszow24.info/najnowsze",
+            },
+            article_log=[
+                ArticleRunEntry(
+                    article_id="rzn/x",
+                    title_pl="T",
+                    ua_title="Ukr",
+                    score=8.0,
+                    decision=Decision.POSTED,
+                )
+            ],
+            posted=1,
+        )
+        text = _build_run_report(stats, dry_run=True)
+        assert 'href="https://rzeszow-news.pl"' in text
+        assert 'href="https://rzeszow24.info/najnowsze"' in text
+
+    def test_run_report_uses_report_icon_when_set(self) -> None:
+        from rz_flow.pipeline import ArticleRunEntry, PipelineStats
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            article_log=[
+                ArticleRunEntry(
+                    article_id="x",
+                    title_pl="T",
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg="quota message",
+                    report_icon="⏸",
+                )
+            ],
+        )
+        text = _build_run_report(stats, dry_run=False)
+        assert "⏸" in text
+        assert "quota message" in text
+
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────
 class TestTelegramPublisher:
@@ -181,15 +252,67 @@ class TestTelegramPublisher:
         assert data["parse_mode"] == "HTML"
         assert data["chat_id"] == "-100123"
 
+    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
     @respx.mock
-    async def test_raises_on_persistent_http_error(self) -> None:
+    async def test_raises_on_persistent_http_error(self, _mock_sleep: AsyncMock) -> None:
         respx.post(_tg_url("sendMessage")).mock(
-            return_value=Response(500, text="Internal Server Error")
+            return_value=Response(500, json={"ok": False, "description": "Internal Server Error"})
         )
 
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.HTTPStatusError):
             await publisher.publish(_make_article(), _make_decision())
+
+    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
+    @respx.mock
+    async def test_publish_respects_retry_after_header_on_429(
+        self, mock_sleep: AsyncMock
+    ) -> None:
+        """429 response: asyncio.sleep is called with the Retry-After value, then retried."""
+        call_count = 0
+
+        def side_effect(request: httpx.Request) -> Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return Response(429, headers={"Retry-After": "3"})
+            return Response(200, json={"ok": True, "result": {"message_id": 77}})
+
+        respx.post(_tg_url("sendMessage")).mock(side_effect=side_effect)
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        result = await publisher.publish(_make_article(), _make_decision())
+
+        assert result.message_id == 77
+        mock_sleep.assert_any_call(3)
+
+    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
+    @respx.mock
+    async def test_publish_logs_and_raises_on_json_error_response(
+        self, _mock_sleep: AsyncMock
+    ) -> None:
+        """Non-success response with JSON body: error is logged and HTTPStatusError raised."""
+        respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(
+                400,
+                json={"ok": False, "description": "Bad Request: chat not found"},
+            )
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(httpx.HTTPStatusError):
+            await publisher.publish(_make_article(), _make_decision())
+
+    @respx.mock
+    async def test_send_alert_swallows_network_exception(self) -> None:
+        """A network-level error in send_alert must never propagate."""
+        respx.post(_tg_url("sendMessage")).mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        # Must not raise
+        await publisher.send_alert("Test alert")
 
     @respx.mock
     async def test_send_alert_does_not_raise_on_failure(self) -> None:

@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 import structlog
+from google.genai.errors import ServerError as GeminiServerError
 
-from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError, GeminiServerError
+from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig
 from rz_flow.models import AIDecision, Article, Decision
@@ -27,6 +29,21 @@ from rz_flow.storage import StorageProtocol
 from rz_flow.telegram import TelegramPublisher
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class ArticleRunEntry:
+    """Per-article result collected during the run for admin reporting."""
+
+    article_id: str
+    title_pl: str
+    ua_title: str | None
+    score: float | None
+    decision: Decision
+    error_msg: str | None = None
+    # When set, admin run report uses this icon instead of mapping from decision
+    # (e.g. quota / 503 — not persisted, retry next run).
+    report_icon: str | None = None
 
 
 @dataclass
@@ -41,6 +58,13 @@ class PipelineStats:
     dry_run: bool = False
     quota_exhausted: bool = False  # True if Gemini daily quota was hit
     post_cap_reached: bool = False  # True if max_posts_per_run was hit
+    # Per-source counts for admin reporting
+    source_scraped: dict[str, int] = field(default_factory=dict)
+    source_new: dict[str, int] = field(default_factory=dict)
+    # source name → scrape URL (for clickable admin run report)
+    source_urls: dict[str, str] = field(default_factory=dict)
+    # Per-article log for admin run report
+    article_log: list[ArticleRunEntry] = field(default_factory=list)
 
     def __str__(self) -> str:
         mode = " [DRY RUN]" if self.dry_run else ""
@@ -86,6 +110,10 @@ class Pipeline:
         _start = time.monotonic()
 
         active = self.flow_config.enabled_sources
+        stats.source_urls = {
+            s.name: src.base_url
+            for s, src in zip(get_active_sources(self.flow_config), active)
+        }
 
         # ── Stage 1: Scrape ───────────────────────────────────────────────────
         log = logger.bind(dry_run=dry_run)
@@ -99,12 +127,13 @@ class Pipeline:
             min_score=self.settings.ai_min_score,
         )
         try:
-            all_articles = await fetch_articles(self.settings, self.flow_config)
+            all_articles, source_scraped = await fetch_articles(self.settings, self.flow_config)
         except Exception as exc:
             log.exception("pipeline_fatal_error", error=str(exc))
             raise
 
         stats.total_scraped = len(all_articles)
+        stats.source_scraped = source_scraped
 
         if not all_articles:
             log.info("no_articles_found")
@@ -117,6 +146,8 @@ class Pipeline:
 
         stats.new_articles = len(new_articles)
         seen_count = stats.total_scraped - stats.new_articles
+        # Per-source new-article counts for the admin run report
+        stats.source_new = dict(Counter(a.source_name for a in new_articles))
         log.info("filter_complete", new=stats.new_articles, seen=seen_count)
 
         if not new_articles:
@@ -178,6 +209,7 @@ class Pipeline:
         ai_decision: AIDecision | None = None
         decision = Decision.ERROR
         tg_message_id: int | None = None
+        error_msg: str | None = None
 
         log = logger.bind(article_id=article.id, category=article.category.value)
 
@@ -221,18 +253,53 @@ class Pipeline:
         except GeminiQuotaExhaustedError:
             # Do NOT save as error — we'll retry this article on the next run
             # (it won't appear in filter_new_ids since it's not persisted)
+            stats.article_log.append(
+                ArticleRunEntry(
+                    article_id=article.id,
+                    title_pl=article.title_pl,
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg="Денна квота Gemini вичерпана — не збережено, повтор наступного рану",
+                    report_icon="⏸",
+                )
+            )
             return "quota_exhausted"
 
         except GeminiServerError as exc:
             # 503 UNAVAILABLE after retries — transient server overload.
             # Do NOT save to DB so the article is retried on the next pipeline run.
             log.warning("gemini_unavailable_skipping", error=str(exc))
+            stats.article_log.append(
+                ArticleRunEntry(
+                    article_id=article.id,
+                    title_pl=article.title_pl,
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg=f"Gemini тимчасово недоступний (503): {exc}",
+                    report_icon="🔄",
+                )
+            )
             return "continue"
 
         except Exception as exc:
             log.exception("article_error", error=str(exc))
             stats.errors += 1
             decision = Decision.ERROR
+            error_msg = f"{type(exc).__name__}: {exc}"
+
+        # Append to the per-run article log for the admin run report
+        stats.article_log.append(
+            ArticleRunEntry(
+                article_id=article.id,
+                title_pl=article.title_pl,
+                ua_title=ai_decision.ua_title if ai_decision else None,
+                score=ai_decision.score if ai_decision else None,
+                decision=decision,
+                error_msg=error_msg,
+            )
+        )
 
         # Stage 3c: Save result so we don't retry — skipped in dry_run (no side effects)
         if not dry_run:

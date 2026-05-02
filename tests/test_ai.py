@@ -14,7 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.genai import errors as genai_errors
 
-from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError, GeminiRateLimitError
+from rz_flow.ai import (
+    GeminiAIFilter,
+    GeminiQuotaExhaustedError,
+    GeminiRateLimitError,
+    _classify_gemini_error,
+    _is_daily_quota_exhausted,
+    _parse_retry_after,
+)
 from rz_flow.models import Article, Category, CategoryTag
 
 
@@ -104,7 +111,7 @@ class TestGeminiAIFilterEvaluate:
 
         ai = GeminiAIFilter(api_key="fake-key")
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="Empty Gemini response"):
             await ai.evaluate(_make_article())
 
     @patch("rz_flow.ai.genai.Client")
@@ -116,7 +123,7 @@ class TestGeminiAIFilterEvaluate:
         mock_client.aio.models.generate_content = AsyncMock(return_value=bad_response)
 
         ai = GeminiAIFilter(api_key="fake-key")
-        with pytest.raises(Exception):
+        with pytest.raises(json.JSONDecodeError):
             await ai.evaluate(_make_article())
 
     @patch("rz_flow.ai.genai.Client")
@@ -203,7 +210,7 @@ class TestGeminiAIFilterEvaluate:
     async def test_raises_after_max_retries_on_rate_limit(
         self, mock_client_cls: MagicMock, _mock_sleep: AsyncMock
     ) -> None:
-        """After 4 per-minute rate limit attempts, GeminiRateLimitError is re-raised."""
+        """After 3 per-minute rate limit attempts, GeminiRateLimitError is re-raised."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
 
@@ -237,3 +244,104 @@ class TestGeminiAIFilterEvaluate:
             await ai.evaluate(_make_article())
 
         assert mock_client.aio.models.generate_content.call_count == 1
+
+
+class TestGeminiHelpers:
+    """Unit tests for module-level helper functions (no AI calls needed)."""
+
+    # ── _parse_retry_after ────────────────────────────────────────────────────
+
+    def test_parse_retry_after_extracts_integer_seconds(self) -> None:
+        err = genai_errors.ClientError(
+            429, {"error": {"code": 429, "details": [{"retryDelay": "27s"}]}}
+        )
+        assert _parse_retry_after(err) == 27.0
+
+    def test_parse_retry_after_handles_decimal_seconds(self) -> None:
+        err = genai_errors.ClientError(
+            429, {"error": {"code": 429, "details": [{"retryDelay": "10.5s"}]}}
+        )
+        assert _parse_retry_after(err) == 10.5
+
+    def test_parse_retry_after_returns_default_when_no_retry_delay(self) -> None:
+        """When retryDelay is absent in the details, default 30s is used."""
+        err = genai_errors.ClientError(
+            429, {"error": {"code": 429, "details": [{"quotaId": "some-quota"}]}}
+        )
+        assert _parse_retry_after(err) == 30.0
+
+    def test_parse_retry_after_returns_default_on_empty_details(self) -> None:
+        err = genai_errors.ClientError(429, {"error": {"code": 429, "details": []}})
+        assert _parse_retry_after(err) == 30.0
+
+    # ── _is_daily_quota_exhausted ─────────────────────────────────────────────
+
+    def test_is_daily_quota_exhausted_true_for_per_day_violation(self) -> None:
+        err = genai_errors.ClientError(
+            429,
+            {
+                "error": {
+                    "code": 429,
+                    "details": [
+                        {
+                            "violations": [
+                                {
+                                    "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+                                }
+                            ]
+                        }
+                    ],
+                }
+            },
+        )
+        assert _is_daily_quota_exhausted(err) is True
+
+    def test_is_daily_quota_exhausted_false_for_per_minute_limit(self) -> None:
+        err = genai_errors.ClientError(
+            429,
+            {"error": {"code": 429, "details": [{"retryDelay": "10s"}]}},
+        )
+        assert _is_daily_quota_exhausted(err) is False
+
+    def test_is_daily_quota_exhausted_false_for_empty_violations(self) -> None:
+        err = genai_errors.ClientError(
+            429,
+            {"error": {"code": 429, "details": [{"violations": []}]}},
+        )
+        assert _is_daily_quota_exhausted(err) is False
+
+    # ── _classify_gemini_error ────────────────────────────────────────────────
+
+    def test_classify_non_client_error_returned_unchanged(self) -> None:
+        """Non-ClientError exceptions are returned as-is without classification."""
+        original = RuntimeError("network timeout")
+        result = _classify_gemini_error(original)
+        assert result is original
+
+    def test_classify_429_with_per_day_quota_returns_quota_exhausted(self) -> None:
+        err = genai_errors.ClientError(
+            429,
+            {
+                "error": {
+                    "code": 429,
+                    "details": [
+                        {"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}
+                    ],
+                }
+            },
+        )
+        result = _classify_gemini_error(err)
+        assert isinstance(result, GeminiQuotaExhaustedError)
+
+    def test_classify_429_with_retry_delay_returns_rate_limit(self) -> None:
+        err = genai_errors.ClientError(
+            429, {"error": {"code": 429, "details": [{"retryDelay": "15s"}]}}
+        )
+        result = _classify_gemini_error(err)
+        assert isinstance(result, GeminiRateLimitError)
+        assert result.retry_after == 15.0
+
+    def test_classify_non_429_client_error_returned_unchanged(self) -> None:
+        err = genai_errors.ClientError(400, {"error": {"code": 400, "message": "bad request"}})
+        result = _classify_gemini_error(err)
+        assert result is err

@@ -375,3 +375,182 @@ class TestParseRzeszowNewsPage:
 
     def test_empty_html_returns_empty_list(self) -> None:
         assert parse_rzeszow_news_page("<html><body></body></html>") == []
+
+
+class TestParserEdgeCases:
+    """Guard-clause and deduplication edge cases without fixture dependency."""
+
+    # ── parse_najnowsze_page deduplication ────────────────────────────────────
+
+    def test_najnowsze_deduplicates_same_id_appearing_as_tile_and_listing(self) -> None:
+        """If the same article ID appears in both tile and listing sections, it's returned once."""
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/imprezy/event/DUPLICATE12345678">
+          <div class="image-tile-overlay">
+            <h3 class="image-tile-overlay__title">Festival Tile</h3>
+          </div>
+        </a>
+        <a href="https://rzeszow24.info/imprezy/event/DUPLICATE12345678">
+          <div class="news-listing-item__wrapper">
+            <p class="news-listing-item__text">
+              <strong>Festival Listing</strong> Some lead text here.
+            </p>
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_najnowsze_page(html)
+        assert len(articles) == 1
+        assert articles[0].id == "DUPLICATE12345678"
+
+    def test_najnowsze_skips_tile_with_no_title_element(self) -> None:
+        """Tile card without h3 and without mobile fallback is skipped."""
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/imprezy/event/NOTITLEID123456789">
+          <div class="image-tile-overlay">
+            <div class="image-tile-overlay__wrapper">
+              <!-- No h3 here, no mobile fallback -->
+            </div>
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_najnowsze_page(html)
+        assert len(articles) == 0
+
+    def test_najnowsze_uses_mobile_title_fallback(self) -> None:
+        """When h3.image-tile-overlay__title is absent, falls back to .image-tile-overlay-mobile p."""
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/imprezy/event/MOBILEID1234567890">
+          <div class="image-tile-overlay">
+            <!-- No h3 -->
+          </div>
+          <div class="image-tile-overlay-mobile">
+            <p>Mobile Title Text</p>
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_najnowsze_page(html)
+        assert len(articles) == 1
+        assert articles[0].title_pl == "Mobile Title Text"
+
+    def test_najnowsze_listing_skips_item_with_no_strong_tag(self) -> None:
+        """Listing item without <strong> (no title) is skipped."""
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/wiadomosci/news/NOSTRONGID1234567">
+          <div class="news-listing-item__wrapper">
+            <p class="news-listing-item__text">
+              Just plain text without strong tag.
+            </p>
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_najnowsze_page(html)
+        assert len(articles) == 0
+
+    # ── parse_category_page deduplication ─────────────────────────────────────
+
+    def test_category_page_deduplicates_same_id_across_tile_and_listing(self) -> None:
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/imprezy/event/CATDUPID12345678AB" target="_self">
+          <div class="image-tile-overlay">
+            <h3 class="image-tile-overlay__title">Festival Tile</h3>
+          </div>
+        </a>
+        <a href="https://rzeszow24.info/imprezy/event/CATDUPID12345678AB" target="_self">
+          <div class="news-listing-item__wrapper">
+            <p class="news-listing-item__text">
+              <strong>Festival Listing</strong> Lead text.
+            </p>
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_category_page(html, Category.IMPREZY)
+        assert len(articles) == 1
+        assert articles[0].id == "CATDUPID12345678AB"
+
+    def test_category_page_uses_mobile_title_fallback(self) -> None:
+        """parse_category_page also falls back to mobile title when h3 is absent."""
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/imprezy/event/CATMOBILEID12345678" target="_self">
+          <div class="image-tile-overlay">
+            <!-- No h3 title -->
+          </div>
+          <div class="image-tile-overlay-mobile">
+            <p>Mobile Category Title</p>
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_category_page(html, Category.IMPREZY)
+        assert len(articles) == 1
+        assert articles[0].title_pl == "Mobile Category Title"
+
+    def test_category_page_skips_tile_with_no_title_at_all(self) -> None:
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/imprezy/event/EMPTYTILEID12345678" target="_self">
+          <div class="image-tile-overlay">
+            <!-- No h3, no mobile -->
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_category_page(html, Category.IMPREZY)
+        assert len(articles) == 0
+
+    # ── parse_rzeszow_news_page deduplication ──────────────────────────────────
+
+    def test_rzeszow_news_deduplicates_same_slug(self) -> None:
+        """If two cards share the same slug, only one article is returned."""
+        html = """
+        <html><body>
+        <div class="td_module_10 td_module_wrap">
+          <h3 class="entry-title td-module-title">
+            <a href="https://rzeszow-news.pl/duplicate-slug-article/">First</a>
+          </h3>
+        </div>
+        <div class="td_module_10 td_module_wrap">
+          <h3 class="entry-title td-module-title">
+            <a href="https://rzeszow-news.pl/duplicate-slug-article/">Second</a>
+          </h3>
+        </div>
+        </body></html>
+        """
+        articles = parse_rzeszow_news_page(html)
+        assert len(articles) == 1
+
+    def test_rzeszow_news_skips_card_without_h3(self) -> None:
+        html = """
+        <html><body>
+        <div class="td_module_10 td_module_wrap">
+          <!-- No h3.entry-title -->
+          <div class="td-excerpt">Some text</div>
+        </div>
+        </body></html>
+        """
+        articles = parse_rzeszow_news_page(html)
+        assert len(articles) == 0
+
+    def test_rzeszow_news_skips_card_with_non_matching_url(self) -> None:
+        """Cards with URLs not matching the rzeszow-news.pl slug pattern are skipped."""
+        html = """
+        <html><body>
+        <div class="td_module_10 td_module_wrap">
+          <h3 class="entry-title td-module-title">
+            <a href="https://other-site.com/article/">External link</a>
+          </h3>
+        </div>
+        </body></html>
+        """
+        articles = parse_rzeszow_news_page(html)
+        assert len(articles) == 0

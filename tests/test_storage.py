@@ -8,7 +8,7 @@ any I/O or credentials.
 import pytest
 
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
-from rz_flow.storage import InMemoryStorage
+from rz_flow.storage import InMemoryStorage, TursoStorage, create_storage
 
 
 def _make_article(article_id: str = "TESTID123456789") -> Article:
@@ -159,3 +159,41 @@ class TestStorageProtocolCompliance:
         from rz_flow.storage import StorageProtocol
 
         assert isinstance(storage, StorageProtocol)
+
+
+class TestTursoStorageNormalizeUrl:
+    """_normalize_url is a pure static method — no DB connection needed."""
+
+    def test_converts_libsql_scheme_to_https(self) -> None:
+        url = TursoStorage._normalize_url("libsql://my-db.turso.io")
+        assert url == "https://my-db.turso.io"
+
+    def test_leaves_https_url_unchanged(self) -> None:
+        url = TursoStorage._normalize_url("https://my-db.turso.io")
+        assert url == "https://my-db.turso.io"
+
+    def test_leaves_other_schemes_unchanged(self) -> None:
+        url = TursoStorage._normalize_url("wss://my-db.turso.io")
+        assert url == "wss://my-db.turso.io"
+
+    def test_conversion_preserves_path_and_query(self) -> None:
+        url = TursoStorage._normalize_url("libsql://my-db.turso.io/some/path?key=val")
+        assert url == "https://my-db.turso.io/some/path?key=val"
+
+
+class TestCreateStorage:
+    def test_create_storage_returns_turso_storage(self) -> None:
+        storage = create_storage(
+            database_url="libsql://fake.turso.io",
+            auth_token="fake-token",
+        )
+        assert isinstance(storage, TursoStorage)
+
+    def test_create_storage_normalizes_url(self) -> None:
+        """create_storage should apply URL normalization internally."""
+        storage = create_storage(
+            database_url="libsql://fake.turso.io",
+            auth_token="fake-token",
+        )
+        # Internal URL should be https:// after normalization
+        assert storage._url.startswith("https://")

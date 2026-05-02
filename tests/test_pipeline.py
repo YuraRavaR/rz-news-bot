@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.genai import errors as genai_errors
 
-from rz_flow.ai import GeminiQuotaExhaustedError, GeminiServerError
+from rz_flow.ai import GeminiQuotaExhaustedError
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
@@ -320,6 +320,10 @@ class TestPipelineRunBasic:
         assert storage.get_record("QUOTA_ART_2") is None
         # AI was only called once (stopped immediately after first quota error)
         assert mock_ai.evaluate.call_count == 1
+        # Admin run report: quota row appears in article_log without DB save
+        assert len(stats.article_log) == 1
+        assert stats.article_log[0].article_id == "QUOTA_ART_1"
+        assert stats.article_log[0].report_icon == "⏸"
 
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")
@@ -362,6 +366,10 @@ class TestPipelineRunBasic:
         # First article was saved, second was NOT
         assert storage.get_record("GOOD_ART_1") is not None
         assert storage.get_record("QUOTA_ART_2") is None
+        assert len(stats.article_log) == 2
+        assert stats.article_log[0].decision == Decision.POSTED
+        assert stats.article_log[1].article_id == "QUOTA_ART_2"
+        assert stats.article_log[1].report_icon == "⏸"
 
 
 class TestPipelinePostCap:
@@ -491,6 +499,9 @@ class TestPipelineBranchCoverage:
         assert storage.get_record("SERVER_ERR_ART_01X") is None
         # Second article WAS processed and saved
         assert storage.get_record("GOOD_ART_X123456") is not None
+        assert len(stats.article_log) == 2
+        assert stats.article_log[0].report_icon == "🔄"
+        assert stats.article_log[1].decision == Decision.POSTED
 
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")

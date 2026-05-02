@@ -196,6 +196,27 @@ class TestBuildRunReport:
         assert 'href="https://rzeszow-news.pl"' in text
         assert 'href="https://rzeszow24.info/najnowsze"' in text
 
+    def test_run_report_uses_report_icon_when_set(self) -> None:
+        from rz_flow.pipeline import ArticleRunEntry, PipelineStats
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            article_log=[
+                ArticleRunEntry(
+                    article_id="x",
+                    title_pl="T",
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg="quota message",
+                    report_icon="⏸",
+                )
+            ],
+        )
+        text = _build_run_report(stats, dry_run=False)
+        assert "⏸" in text
+        assert "quota message" in text
+
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────
 class TestTelegramPublisher:

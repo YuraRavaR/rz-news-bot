@@ -25,7 +25,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from rz_flow.models import AIDecision, Article, Decision, PublishResult
+from rz_flow.models import AIDecision, Article, PublishResult
 
 if TYPE_CHECKING:
     from rz_flow.pipeline import PipelineStats
@@ -130,11 +130,16 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
         lines.append("<b>Статті:</b>")
         shown = log[:_MAX_REPORT_ARTICLES]
         for entry in shown:
-            icon = {"posted": "✅", "skipped": "⏭", "error": "❌"}.get(entry.decision.value, "❓")
+            if entry.report_icon:
+                icon = entry.report_icon
+            else:
+                decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
+                icon = decision_icons.get(entry.decision.value, "❓")
             score_str = f"{entry.score:.1f}" if entry.score is not None else "—"
             title = _html_escape(entry.ua_title or entry.title_pl)
             if entry.error_msg:
-                lines.append(f"{icon} {score_str} — {title} (<i>{_html_escape(entry.error_msg)}</i>)")
+                err = _html_escape(entry.error_msg)
+                lines.append(f"{icon} {score_str} — {title} (<i>{err}</i>)")
             else:
                 lines.append(f"{icon} {score_str} — {title}")
         if len(log) > _MAX_REPORT_ARTICLES:

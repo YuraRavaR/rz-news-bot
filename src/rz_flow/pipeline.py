@@ -17,8 +17,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 import structlog
+from google.genai.errors import ServerError as GeminiServerError
 
-from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError, GeminiServerError
+from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig
 from rz_flow.models import AIDecision, Article, Decision
@@ -40,6 +41,9 @@ class ArticleRunEntry:
     score: float | None
     decision: Decision
     error_msg: str | None = None
+    # When set, admin run report uses this icon instead of mapping from decision
+    # (e.g. quota / 503 — not persisted, retry next run).
+    report_icon: str | None = None
 
 
 @dataclass
@@ -249,12 +253,34 @@ class Pipeline:
         except GeminiQuotaExhaustedError:
             # Do NOT save as error — we'll retry this article on the next run
             # (it won't appear in filter_new_ids since it's not persisted)
+            stats.article_log.append(
+                ArticleRunEntry(
+                    article_id=article.id,
+                    title_pl=article.title_pl,
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg="Денна квота Gemini вичерпана — не збережено, повтор наступного рану",
+                    report_icon="⏸",
+                )
+            )
             return "quota_exhausted"
 
         except GeminiServerError as exc:
             # 503 UNAVAILABLE after retries — transient server overload.
             # Do NOT save to DB so the article is retried on the next pipeline run.
             log.warning("gemini_unavailable_skipping", error=str(exc))
+            stats.article_log.append(
+                ArticleRunEntry(
+                    article_id=article.id,
+                    title_pl=article.title_pl,
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg=f"Gemini тимчасово недоступний (503): {exc}",
+                    report_icon="🔄",
+                )
+            )
             return "continue"
 
         except Exception as exc:

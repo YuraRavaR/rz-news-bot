@@ -12,7 +12,7 @@ import pytest
 import respx
 from httpx import Response
 
-from rz_flow.models import AIDecision, Article, Category, CategoryTag
+from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.telegram import TelegramPublisher, _build_message, _html_escape
 
 
@@ -165,6 +165,57 @@ class TestBuildMessage:
         msg = _build_message(article, long_decision)
         assert len(msg) <= 4096
         assert msg.endswith("…")
+
+
+class TestBuildRunReport:
+    def test_source_lines_use_clickable_links_when_url_known(self) -> None:
+        """Admin report: each source name links to its configured base_url."""
+        from rz_flow.pipeline import ArticleRunEntry, PipelineStats
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            dry_run=True,
+            source_scraped={"rzeszow-news.pl": 15, "rzeszow24/najnowsze": 17},
+            source_new={"rzeszow-news.pl": 1, "rzeszow24/najnowsze": 0},
+            source_urls={
+                "rzeszow-news.pl": "https://rzeszow-news.pl",
+                "rzeszow24/najnowsze": "https://rzeszow24.info/najnowsze",
+            },
+            article_log=[
+                ArticleRunEntry(
+                    article_id="rzn/x",
+                    title_pl="T",
+                    ua_title="Ukr",
+                    score=8.0,
+                    decision=Decision.POSTED,
+                )
+            ],
+            posted=1,
+        )
+        text = _build_run_report(stats, dry_run=True)
+        assert 'href="https://rzeszow-news.pl"' in text
+        assert 'href="https://rzeszow24.info/najnowsze"' in text
+
+    def test_run_report_uses_report_icon_when_set(self) -> None:
+        from rz_flow.pipeline import ArticleRunEntry, PipelineStats
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            article_log=[
+                ArticleRunEntry(
+                    article_id="x",
+                    title_pl="T",
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg="quota message",
+                    report_icon="⏸",
+                )
+            ],
+        )
+        text = _build_run_report(stats, dry_run=False)
+        assert "⏸" in text
+        assert "quota message" in text
 
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────

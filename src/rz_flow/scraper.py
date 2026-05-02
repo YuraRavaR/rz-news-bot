@@ -58,18 +58,25 @@ async def _fetch_one(
     return await fetch(client, max_articles)  # type: ignore[no-any-return]
 
 
-async def fetch_articles(settings: Settings, config: FlowConfig) -> list[Article]:
+async def fetch_articles(
+    settings: Settings, config: FlowConfig
+) -> tuple[list[Article], dict[str, int]]:
     """Fetch and deduplicate articles from all active sources.
 
     Each source is fetched independently — a timeout or network error on one
     source is logged and skipped so the remaining sources still run.
     Results are deduplicated across sources by article ID.
+    Each article is tagged with its source name for downstream reporting.
 
-    Returns an empty list only when every source fails.
+    Returns:
+        A tuple of (articles, source_scraped) where source_scraped maps each
+        source name to the total number of articles fetched from it (before
+        cross-source dedup).  Returns an empty list only when every source fails.
     """
     all_articles: list[Article] = []
     seen_ids: set[str] = set()
     failed_sources: list[str] = []
+    source_scraped: dict[str, int] = {}
 
     enabled = config.enabled_sources
     sources = get_active_sources(config)
@@ -90,9 +97,13 @@ async def fetch_articles(settings: Settings, config: FlowConfig) -> list[Article
             except Exception as exc:
                 log.warning("scrape_source_failed", error=str(exc))
                 failed_sources.append(source.name)
+                source_scraped[source.name] = 0
                 continue
 
-            new = [a for a in articles if a.id not in seen_ids]
+            source_scraped[source.name] = len(articles)
+            # Tag each article with its source for downstream per-source reporting
+            tagged = [a.model_copy(update={"source_name": source.name}) for a in articles]
+            new = [a for a in tagged if a.id not in seen_ids]
             seen_ids.update(a.id for a in new)
             all_articles.extend(new)
             log.info("scrape_source_done", found=len(articles))
@@ -101,4 +112,4 @@ async def fetch_articles(settings: Settings, config: FlowConfig) -> list[Article
         logger.warning("scrape_partial_failure", failed=failed_sources)
 
     logger.info("scrape_done", total=len(all_articles))
-    return all_articles
+    return all_articles, source_scraped

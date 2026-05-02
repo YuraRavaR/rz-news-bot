@@ -113,7 +113,7 @@ def test_get_active_sources_returns_correct_instances() -> None:
     sources = get_active_sources(config)
     assert len(sources) == 2
     assert sources[0].name == "rzeszow24/najnowsze"
-    assert sources[1].name == "rzeszow-news.pl/homepage"
+    assert sources[1].name == "rzeszow-news.pl"
 
 
 def test_get_active_sources_uses_base_url() -> None:

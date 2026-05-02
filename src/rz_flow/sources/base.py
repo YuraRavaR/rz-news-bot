@@ -23,7 +23,7 @@ class ScraperSource(Protocol):
     """Contract every scraper source must satisfy."""
 
     name: str
-    """Human-readable identifier used in logs, e.g. 'rzeszow24/najnowsze'."""
+    """Human-readable identifier used in logs, e.g. 'rzeszow24/najnowsze' or 'rzeszow-news.pl'."""
 
     url: str
     """Actual URL the scraper fetches."""

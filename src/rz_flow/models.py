@@ -24,6 +24,10 @@ class Article(BaseModel):
     category: Category
     title_pl: str = Field(..., description="Original Polish title")
     summary_pl: str = Field(default="", description="Lead paragraph or excerpt in Polish")
+    source_name: str = Field(
+        default="",
+        description="Source label for logs/reports (e.g. 'rzeszow24/najnowsze', 'rzeszow-news.pl')",
+    )
 
 
 class CategoryTag(StrEnum):

@@ -16,7 +16,7 @@ from rz_flow.parser import parse_rzeszow_news_page
 class RzeszowNewsScraper:
     """Fetches the rzeszow-news.pl homepage and parses td_module_10 cards."""
 
-    name = "rzeszow-news.pl/homepage"
+    name = "rzeszow-news.pl"
     ID_PREFIX = "rzn"
 
     def __init__(self, base_url: str = "https://rzeszow-news.pl/") -> None:

@@ -12,6 +12,7 @@ Handles:
 """
 
 import asyncio
+from collections import defaultdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -108,11 +109,11 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
         set(stats.source_scraped) | set(stats.source_new)
     )
     if all_source_names:
-        lines.append("<b>Джерела:</b>")
+        lines.append("<b>Sources:</b>")
         for name in all_source_names:
             scraped = stats.source_scraped.get(name, 0)
             new = stats.source_new.get(name, 0)
-            tail = f": {new} нових з {scraped}"
+            tail = f": {new} new of {scraped}"
             url = stats.source_urls.get(name, "").strip()
             if url:
                 safe_href = _html_escape(url)
@@ -122,14 +123,29 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
                 lines.append(f"  {_html_escape(name)}{tail}")
         lines.append("")
 
-    # Articles section
+    # Articles section — grouped by source (same order as Sources when possible)
     log = stats.article_log
     if not log:
-        lines.append(f"Нових статей не знайдено (scraped={stats.total_scraped})")
+        lines.append(f"No new articles (scraped={stats.total_scraped})")
     else:
-        lines.append("<b>Статті:</b>")
+        from rz_flow.pipeline import ArticleRunEntry
+
+        lines.append("<b>Articles:</b>")
         shown = log[:_MAX_REPORT_ARTICLES]
+        by_source: dict[str, list[ArticleRunEntry]] = defaultdict(list)
         for entry in shown:
+            src_key = entry.source_name.strip() if entry.source_name.strip() else "—"
+            by_source[src_key].append(entry)
+
+        ordered_sources: list[str] = []
+        for n in all_source_names:
+            if n in by_source and n not in ordered_sources:
+                ordered_sources.append(n)
+        for n in sorted(by_source.keys()):
+            if n not in ordered_sources:
+                ordered_sources.append(n)
+
+        def _article_line(entry: ArticleRunEntry) -> str:
             if entry.report_icon:
                 icon = entry.report_icon
             else:
@@ -139,16 +155,23 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
             title = _html_escape(entry.ua_title or entry.title_pl)
             if entry.error_msg:
                 err = _html_escape(entry.error_msg)
-                lines.append(f"{icon} {score_str} — {title} (<i>{err}</i>)")
-            else:
-                lines.append(f"{icon} {score_str} — {title}")
+                return f"  {icon} {score_str} — {title} (<i>{err}</i>)"
+            return f"  {icon} {score_str} — {title}"
+
+        for src in ordered_sources:
+            entries = by_source.get(src, [])
+            if not entries:
+                continue
+            lines.append(f"<b>{_html_escape(src)}</b>")
+            for entry in entries:
+                lines.append(_article_line(entry))
         if len(log) > _MAX_REPORT_ARTICLES:
-            lines.append(f"<i>… ще {len(log) - _MAX_REPORT_ARTICLES} статей</i>")
+            lines.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
         lines.append("")
 
     # Summary line
     lines.append(
-        f"<b>Підсумок:</b> posted={stats.posted}  skipped={stats.skipped}  errors={stats.errors}"
+        f"<b>Summary:</b> posted={stats.posted}  skipped={stats.skipped}  errors={stats.errors}"
     )
 
     text = "\n".join(lines)

@@ -44,6 +44,8 @@ class ArticleRunEntry:
     # When set, admin run report uses this icon instead of mapping from decision
     # (e.g. quota / 503 — not persisted, retry next run).
     report_icon: str | None = None
+    # Scraper source label (e.g. rzeszow24/najnowsze) for grouped admin report
+    source_name: str = ""
 
 
 @dataclass
@@ -260,8 +262,9 @@ class Pipeline:
                     ua_title=None,
                     score=None,
                     decision=Decision.SKIPPED,
-                    error_msg="Денна квота Gemini вичерпана — не збережено, повтор наступного рану",
+                    error_msg="Gemini daily quota exhausted — not saved, will retry on next run",
                     report_icon="⏸",
+                    source_name=article.source_name,
                 )
             )
             return "quota_exhausted"
@@ -277,8 +280,9 @@ class Pipeline:
                     ua_title=None,
                     score=None,
                     decision=Decision.SKIPPED,
-                    error_msg=f"Gemini тимчасово недоступний (503): {exc}",
+                    error_msg=f"Gemini temporarily unavailable (503): {exc}",
                     report_icon="🔄",
+                    source_name=article.source_name,
                 )
             )
             return "continue"
@@ -298,6 +302,7 @@ class Pipeline:
                 score=ai_decision.score if ai_decision else None,
                 decision=decision,
                 error_msg=error_msg,
+                source_name=article.source_name,
             )
         )
 

@@ -188,6 +188,7 @@ class TestBuildRunReport:
                     ua_title="Ukr",
                     score=8.0,
                     decision=Decision.POSTED,
+                    source_name="rzeszow-news.pl",
                 )
             ],
             posted=1,
@@ -195,6 +196,7 @@ class TestBuildRunReport:
         text = _build_run_report(stats, dry_run=True)
         assert 'href="https://rzeszow-news.pl"' in text
         assert 'href="https://rzeszow24.info/najnowsze"' in text
+        assert "<b>rzeszow-news.pl</b>" in text
 
     def test_run_report_uses_report_icon_when_set(self) -> None:
         from rz_flow.pipeline import ArticleRunEntry, PipelineStats
@@ -216,6 +218,7 @@ class TestBuildRunReport:
         text = _build_run_report(stats, dry_run=False)
         assert "⏸" in text
         assert "quota message" in text
+        assert "<b>—</b>" in text  # grouped under unknown source when source_name empty
 
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────

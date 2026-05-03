@@ -2,16 +2,18 @@
 
 Loads config.yaml (or the path in FLOW_CONFIG_PATH env var) and validates it
 with Pydantic.  Contains source definitions (which scrapers run, with which
-URLs and per-source article limits) and pipeline timing settings.
+URLs and per-source article limits), pipeline timing, and optional report clock
+timezone.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 _DEFAULT_CONFIG_PATH = "config.yaml"
 
@@ -33,11 +35,32 @@ class SourceConfig(BaseModel):
 
 
 class PipelineConfig(BaseModel):
-    """Timing settings for the processing pipeline."""
+    """Timing and admin-report display settings for the processing pipeline."""
 
     inter_ai_delay_seconds: float = 5.0
     inter_post_delay_seconds: float = 2.0
     max_posts_per_run: int = 5
+    report_display_timezone: str | None = Field(
+        default=None,
+        description=(
+            "IANA timezone for the admin Telegram run-report header (e.g. Europe/Warsaw). "
+            "Omit or null for UTC."
+        ),
+    )
+
+    @field_validator("report_display_timezone")
+    @classmethod
+    def _validate_report_display_timezone(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        name = v.strip()
+        if not name:
+            return None
+        try:
+            ZoneInfo(name)
+        except Exception as exc:
+            raise ValueError(f"Invalid IANA timezone: {name!r}") from exc
+        return name
 
 
 class FlowConfig(BaseModel):

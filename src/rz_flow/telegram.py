@@ -16,6 +16,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -103,9 +104,24 @@ def _html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
+def format_run_report_clock(now_utc: datetime, display_timezone: str | None) -> str:
+    """Wall clock for the admin run-report header (UTC or a configured IANA zone)."""
+    if not display_timezone:
+        return f'{now_utc.strftime("%d.%m %H:%M")} UTC'
+    local = now_utc.astimezone(ZoneInfo(display_timezone))
+    abbr = local.tzname()
+    if not abbr:
+        abbr = local.strftime("%z")
+    return f"{local.strftime('%d.%m %H:%M')} {abbr}"
+
+
+def _build_run_report(
+    stats: "PipelineStats",
+    dry_run: bool,
+    report_display_timezone: str | None = None,
+) -> str:
     """Format a concise HTML run-report message for the admin chat."""
-    now = datetime.now(UTC).strftime("%d.%m %H:%M")
+    now_line = format_run_report_clock(datetime.now(UTC), report_display_timezone)
     mode = " [DRY RUN]" if dry_run else ""
     flags = ""
     if stats.quota_exhausted:
@@ -113,7 +129,7 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
     if stats.post_cap_reached:
         flags += " 🔒 CAP"
 
-    lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> — {now} UTC\n"]
+    lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> — {now_line}\n"]
 
     # Sources section
     all_source_names = sorted(
@@ -220,11 +236,13 @@ class TelegramPublisher:
         bot_token: str,
         channel_id: str,
         admin_chat_id: str | None = None,
+        report_display_timezone: str | None = None,
     ) -> None:
         self._base_url = _TG_API_BASE.format(token=bot_token)
         self._channel_id = channel_id
         # Alerts go to admin_chat_id when set, otherwise fall back to the public channel.
         self._alert_chat_id = admin_chat_id or channel_id
+        self._report_display_timezone = report_display_timezone
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPStatusError),
@@ -301,7 +319,7 @@ class TelegramPublisher:
         Silently swallows errors so a reporting failure never affects the main run.
         """
         try:
-            text = _build_run_report(stats, dry_run)
+            text = _build_run_report(stats, dry_run, self._report_display_timezone)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.post(
                     f"{self._base_url}/sendMessage",

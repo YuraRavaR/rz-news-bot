@@ -105,6 +105,7 @@ class Pipeline:
         self.publisher = TelegramPublisher(
             bot_token=self.settings.telegram_bot_token,
             channel_id=self.settings.telegram_channel_id,
+            report_display_timezone=self.flow_config.pipeline.report_display_timezone,
         )
 
     async def run(self, dry_run: bool = False) -> PipelineStats:

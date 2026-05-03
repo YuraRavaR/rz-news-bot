@@ -115,6 +115,18 @@ def format_run_report_clock(now_utc: datetime, display_timezone: str | None) -> 
     return f"{local.strftime('%d.%m %H:%M')} {abbr}"
 
 
+def _format_run_report_elapsed(seconds: int) -> str:
+    """Human-readable duration for the admin run report (e.g. 2m 18s, 45s)."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {sec}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {sec}s"
+
+
 def _build_run_report(
     stats: "PipelineStats",
     dry_run: bool,
@@ -129,14 +141,28 @@ def _build_run_report(
     if stats.post_cap_reached:
         flags += " 🔒 CAP"
 
-    lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> — {now_line}\n"]
+    lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> - {now_line}"]
+
+    elapsed_fmt = _format_run_report_elapsed(stats.elapsed_s)
+    model_raw = (stats.report_gemini_model or "").strip()
+    meta_inner: list[str] = [f"⏱\ufe0f {elapsed_fmt}"]
+    if model_raw:
+        model_esc = _html_escape(model_raw)
+        min_esc = _html_escape(f"{stats.report_ai_min_score:.1f}")
+        meta_inner.append(model_esc)
+        meta_inner.append(f"min score {min_esc}")
+    meta_inner.append(
+        f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
+        f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
+    )
+    lines.append("<blockquote>" + "\n".join(meta_inner) + "</blockquote>")
 
     # Sources section
     all_source_names = sorted(
         set(stats.source_scraped) | set(stats.source_new)
     )
     if all_source_names:
-        lines.append("<b>Sources:</b>")
+        lines.append("<b>Sources</b>")
         for name in all_source_names:
             scraped = stats.source_scraped.get(name, 0)
             new = stats.source_new.get(name, 0)
@@ -148,20 +174,19 @@ def _build_run_report(
                 lines.append(f'  <a href="{safe_href}">{safe_label}</a>{tail}')
             else:
                 lines.append(f"  {_html_escape(name)}{tail}")
-        lines.append("")
 
     # Articles section — grouped by source (same order as Sources when possible)
     log = stats.article_log
     if not log:
-        lines.append(f"No new articles (scraped={stats.total_scraped})")
+        lines.append(f"<i>No new articles</i> (scraped={stats.total_scraped})")
     else:
         from rz_flow.pipeline import ArticleRunEntry
 
-        lines.append("<b>Articles:</b>")
+        lines.append("<b>Articles</b>")
         shown = log[:_MAX_REPORT_ARTICLES]
         by_source: dict[str, list[ArticleRunEntry]] = defaultdict(list)
         for entry in shown:
-            src_key = entry.source_name.strip() if entry.source_name.strip() else "—"
+            src_key = entry.source_name.strip() if entry.source_name.strip() else "-"
             by_source[src_key].append(entry)
 
         ordered_sources: list[str] = []
@@ -178,15 +203,15 @@ def _build_run_report(
             else:
                 decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
                 icon = decision_icons.get(entry.decision.value, "❓")
-            score_str = f"{entry.score:.1f}" if entry.score is not None else "—"
+            score_str = f"{entry.score:.1f}" if entry.score is not None else "-"
             title_plain = entry.ua_title or entry.title_pl
             title_esc = _html_escape(title_plain)
             url = (entry.article_url or "").strip()
             if url:
                 href = _html_escape(url)
-                head = f'  {icon} {score_str} — <a href="{href}">{title_esc}</a>'
+                head = f"  {icon} {score_str} · <a href=\"{href}\">{title_esc}</a>"
             else:
-                head = f"  {icon} {score_str} — {title_esc}"
+                head = f"  {icon} {score_str} · {title_esc}"
             if entry.error_msg:
                 err = _html_escape(entry.error_msg)
                 head += f" (<i>{err}</i>)"
@@ -198,7 +223,7 @@ def _build_run_report(
                 )
             if entry.ai_ua_summary:
                 detail_lines.append(
-                    f"<b>Зміст (UA)</b>: {_html_escape(_admin_snippet(entry.ai_ua_summary))}"
+                    f"<b>UA summary</b>: {_html_escape(_admin_snippet(entry.ai_ua_summary))}"
                 )
             if detail_lines:
                 # Collapsed by default; user taps to expand (Bot API 7.3+ HTML).
@@ -215,11 +240,11 @@ def _build_run_report(
                 lines.extend(_article_report_lines(entry))
         if len(log) > _MAX_REPORT_ARTICLES:
             lines.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
-        lines.append("")
 
-    # Summary line
+    # Summary (same numbers as funnel; kept for quick scan at end of message)
     lines.append(
-        f"<b>Summary:</b> posted={stats.posted}  skipped={stats.skipped}  errors={stats.errors}"
+        f"<b>Summary</b> · posted={stats.posted} · skipped={stats.skipped} · "
+        f"errors={stats.errors}"
     )
 
     text = "\n".join(lines)

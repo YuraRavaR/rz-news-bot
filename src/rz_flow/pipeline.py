@@ -72,6 +72,10 @@ class PipelineStats:
     source_urls: dict[str, str] = field(default_factory=dict)
     # Per-article log for admin run report
     article_log: list[ArticleRunEntry] = field(default_factory=list)
+    # Admin run-report extras (set in Pipeline.run)
+    elapsed_s: int = 0
+    report_gemini_model: str = ""
+    report_ai_min_score: float = 0.0
 
     def __str__(self) -> str:
         mode = " [DRY RUN]" if self.dry_run else ""
@@ -115,7 +119,12 @@ class Pipeline:
             dry_run: If True, evaluate articles but do NOT publish to Telegram.
         """
         stats = PipelineStats(dry_run=dry_run)
+        stats.report_gemini_model = self.settings.gemini_model
+        stats.report_ai_min_score = self.settings.ai_min_score
         _start = time.monotonic()
+
+        def _stamp_elapsed() -> None:
+            stats.elapsed_s = max(0, round(time.monotonic() - _start))
 
         active = self.flow_config.enabled_sources
         stats.source_urls = {
@@ -145,6 +154,7 @@ class Pipeline:
 
         if not all_articles:
             log.info("no_articles_found")
+            _stamp_elapsed()
             return stats
 
         # ── Stage 2: Filter already-seen articles ─────────────────────────────
@@ -160,6 +170,7 @@ class Pipeline:
 
         if not new_articles:
             log.info("no_new_articles")
+            _stamp_elapsed()
             return stats
 
         # ── Stage 3: AI evaluate + publish ────────────────────────────────────
@@ -191,13 +202,13 @@ class Pipeline:
             if not dry_run and stats.posted > 0:
                 await asyncio.sleep(self.flow_config.pipeline.inter_post_delay_seconds)
 
-        elapsed_s = round(time.monotonic() - _start)
+        _stamp_elapsed()
         log.info(
             "pipeline_complete",
             posted=stats.posted,
             skipped=stats.skipped,
             errors=stats.errors,
-            elapsed_s=elapsed_s,
+            elapsed_s=stats.elapsed_s,
         )
         return stats
 

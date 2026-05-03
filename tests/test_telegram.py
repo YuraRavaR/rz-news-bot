@@ -186,6 +186,24 @@ class TestFormatRunReportClock:
         assert format_run_report_clock(now, "Europe/Warsaw") == "03.05 13:05 CEST"
 
 
+class TestFormatRunReportElapsed:
+    def test_seconds_only(self) -> None:
+        from rz_flow.telegram import _format_run_report_elapsed
+
+        assert _format_run_report_elapsed(0) == "0s"
+        assert _format_run_report_elapsed(45) == "45s"
+
+    def test_minutes(self) -> None:
+        from rz_flow.telegram import _format_run_report_elapsed
+
+        assert _format_run_report_elapsed(138) == "2m 18s"
+
+    def test_hours(self) -> None:
+        from rz_flow.telegram import _format_run_report_elapsed
+
+        assert _format_run_report_elapsed(3725) == "1h 2m 5s"
+
+
 class TestBuildRunReport:
     def test_source_lines_use_clickable_links_when_url_known(self) -> None:
         """Admin report: each source name links to its configured base_url."""
@@ -194,6 +212,11 @@ class TestBuildRunReport:
 
         stats = PipelineStats(
             dry_run=True,
+            total_scraped=34,
+            new_articles=1,
+            elapsed_s=138,
+            report_gemini_model="gemini-2.0-flash",
+            report_ai_min_score=7.0,
             source_scraped={"rzeszow-news.pl": 15, "rzeszow24/najnowsze": 17},
             source_new={"rzeszow-news.pl": 1, "rzeszow24/najnowsze": 0},
             source_urls={
@@ -216,6 +239,15 @@ class TestBuildRunReport:
             posted=1,
         )
         text = _build_run_report(stats, dry_run=True)
+        assert "2m 18s" in text
+        assert "gemini-2.0-flash" in text
+        assert "min score" in text and "7.0" in text
+        assert "<code>gemini" not in text  # model/score plain text, not code links
+        assert "34 scraped -> 1 new -> posted 1 · skipped 0 · errors 0" in text
+        assert "<blockquote>" in text
+        assert "<b>Sources</b>" in text
+        assert "<b>Articles</b>" in text
+        assert "<b>Summary</b>" in text
         assert 'href="https://rzeszow-news.pl"' in text
         assert " UTC\n" in text
         assert 'href="https://rzeszow24.info/najnowsze"' in text
@@ -255,7 +287,7 @@ class TestBuildRunReport:
         text = _build_run_report(stats, dry_run=False)
         assert "⏸" in text
         assert "quota message" in text
-        assert "<b>—</b>" in text  # grouped under unknown source when source_name empty
+        assert "<b>-</b>" in text  # grouped under unknown source when source_name empty
         assert 'href="https://example.com/news/1"' in text
 
 

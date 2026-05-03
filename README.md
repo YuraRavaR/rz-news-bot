@@ -36,7 +36,7 @@ If a source times out, the pipeline continues with the remaining sources. Gemini
 ```
 src/rz_flow/
 ├── config.py          — environment-based settings (pydantic-settings)
-├── flow_config.py     — source list loaded from config.yaml
+├── flow_config.py     — sources + pipeline options loaded from config.yaml
 ├── models.py          — typed data models: Article, AIDecision, PostRecord
 ├── sources/           — pluggable scrapers (NajnowszeScraper, RzeszowNewsScraper)
 ├── scraper.py         — async HTTP orchestrator with per-source error isolation
@@ -106,7 +106,7 @@ uv run rz-flow
 
 ## Configuration
 
-Edit `config.yaml` to control sources and pipeline timing:
+Edit `config.yaml` to control sources, pipeline pacing, caps, and (optionally) how the admin Telegram run report shows the clock:
 
 ```yaml
 sources:
@@ -123,7 +123,11 @@ sources:
 pipeline:
   inter_ai_delay_seconds: 5.0     # pause between Gemini calls (free tier: 15 RPM)
   inter_post_delay_seconds: 2.0   # pause after each Telegram post
+  max_posts_per_run: 5            # cap successful posts per run
+  report_display_timezone: Europe/Warsaw   # optional IANA name; omit or null → UTC in report header
 ```
+
+`report_display_timezone` must be a valid IANA zone if set (same validation as at startup). GitHub Actions uses the same committed file, so CI and local runs stay aligned without extra env vars.
 
 Environment variables:
 

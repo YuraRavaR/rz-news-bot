@@ -7,14 +7,28 @@ import pytest
 import respx
 from httpx import Response
 
-from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig, load_flow_config
+from rz_flow.flow_config import (
+    FlowConfig,
+    PipelineConfig,
+    SourceConfig,
+    load_flow_config,
+)
 from rz_flow.sources import get_active_sources
 from rz_flow.sources.rzeszow24 import CategoryPageScraper
 
 FIXTURES_DIR = pathlib.Path(__file__).parent / "fixtures"
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 # ── load_flow_config ──────────────────────────────────────────────────────────
+
+
+def test_repo_root_config_yaml_loads() -> None:
+    """Committed config.yaml must parse (catches schema drift in CI and locally)."""
+    cfg_path = REPO_ROOT / "config.yaml"
+    config = load_flow_config(str(cfg_path))
+    assert len(config.sources) >= 1
+    assert config.pipeline.max_posts_per_run >= 1
 
 
 def test_load_flow_config_reads_yaml(tmp_path) -> None:
@@ -76,6 +90,37 @@ def test_load_flow_config_pipeline_defaults(tmp_path) -> None:
     config = load_flow_config(str(cfg_file))
     assert config.pipeline.inter_ai_delay_seconds == 5.0
     assert config.pipeline.inter_post_delay_seconds == 2.0
+    assert config.pipeline.report_display_timezone is None
+
+
+def test_pipeline_report_display_timezone_accepts_valid_iana(tmp_path) -> None:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        textwrap.dedent("""\
+        sources:
+          - scraper: NajnowszeScraper
+            base_url: https://rzeszow24.info/najnowsze
+        pipeline:
+          report_display_timezone: Europe/Warsaw
+        """)
+    )
+    config = load_flow_config(str(cfg_file))
+    assert config.pipeline.report_display_timezone == "Europe/Warsaw"
+
+
+def test_pipeline_report_display_timezone_rejects_invalid(tmp_path) -> None:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        textwrap.dedent("""\
+        sources:
+          - scraper: NajnowszeScraper
+            base_url: https://rzeszow24.info/najnowsze
+        pipeline:
+          report_display_timezone: Not/AZone
+        """)
+    )
+    with pytest.raises(ValueError, match="Invalid IANA"):
+        load_flow_config(str(cfg_file))
 
 
 # ── SourceConfig validation ───────────────────────────────────────────────────

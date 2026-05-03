@@ -16,6 +16,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -41,6 +42,17 @@ _MAX_MESSAGE_LEN = 4096
 
 # Maximum articles shown in the run report before truncation
 _MAX_REPORT_ARTICLES = 20
+
+# Per-field cap for AI snippets in the admin HTML report (many articles × long text)
+_MAX_ADMIN_AI_SNIPPET = 420
+
+
+def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
+    """Single-line-ish snippet for Telegram HTML (avoids huge admin messages)."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 1] + "…"
 
 # Template for a channel post — {hashtag} is empty string when category is "inne"
 _POST_TEMPLATE = """\
@@ -92,9 +104,36 @@ def _html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
+def format_run_report_clock(now_utc: datetime, display_timezone: str | None) -> str:
+    """Wall clock for the admin run-report header (UTC or a configured IANA zone)."""
+    if not display_timezone:
+        return f'{now_utc.strftime("%d.%m %H:%M")} UTC'
+    local = now_utc.astimezone(ZoneInfo(display_timezone))
+    abbr = local.tzname()
+    if not abbr:
+        abbr = local.strftime("%z")
+    return f"{local.strftime('%d.%m %H:%M')} {abbr}"
+
+
+def _format_run_report_elapsed(seconds: int) -> str:
+    """Human-readable duration for the admin run report (e.g. 2m 18s, 45s)."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {sec}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {sec}s"
+
+
+def _build_run_report(
+    stats: "PipelineStats",
+    dry_run: bool,
+    report_display_timezone: str | None = None,
+) -> str:
     """Format a concise HTML run-report message for the admin chat."""
-    now = datetime.now(UTC).strftime("%d.%m %H:%M")
+    now_line = format_run_report_clock(datetime.now(UTC), report_display_timezone)
     mode = " [DRY RUN]" if dry_run else ""
     flags = ""
     if stats.quota_exhausted:
@@ -102,14 +141,28 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
     if stats.post_cap_reached:
         flags += " 🔒 CAP"
 
-    lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> — {now} UTC\n"]
+    lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> - {now_line}"]
+
+    elapsed_fmt = _format_run_report_elapsed(stats.elapsed_s)
+    model_raw = (stats.report_gemini_model or "").strip()
+    meta_inner: list[str] = [f"⏱\ufe0f {elapsed_fmt}"]
+    if model_raw:
+        model_esc = _html_escape(model_raw)
+        min_esc = _html_escape(f"{stats.report_ai_min_score:.1f}")
+        meta_inner.append(model_esc)
+        meta_inner.append(f"min score {min_esc}")
+    meta_inner.append(
+        f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
+        f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
+    )
+    lines.append("<blockquote>" + "\n".join(meta_inner) + "</blockquote>")
 
     # Sources section
     all_source_names = sorted(
         set(stats.source_scraped) | set(stats.source_new)
     )
     if all_source_names:
-        lines.append("<b>Sources:</b>")
+        lines.append("<b>Sources</b>")
         for name in all_source_names:
             scraped = stats.source_scraped.get(name, 0)
             new = stats.source_new.get(name, 0)
@@ -121,20 +174,19 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
                 lines.append(f'  <a href="{safe_href}">{safe_label}</a>{tail}')
             else:
                 lines.append(f"  {_html_escape(name)}{tail}")
-        lines.append("")
 
     # Articles section — grouped by source (same order as Sources when possible)
     log = stats.article_log
     if not log:
-        lines.append(f"No new articles (scraped={stats.total_scraped})")
+        lines.append(f"<i>No new articles</i> (scraped={stats.total_scraped})")
     else:
         from rz_flow.pipeline import ArticleRunEntry
 
-        lines.append("<b>Articles:</b>")
+        lines.append("<b>Articles</b>")
         shown = log[:_MAX_REPORT_ARTICLES]
         by_source: dict[str, list[ArticleRunEntry]] = defaultdict(list)
         for entry in shown:
-            src_key = entry.source_name.strip() if entry.source_name.strip() else "—"
+            src_key = entry.source_name.strip() if entry.source_name.strip() else "-"
             by_source[src_key].append(entry)
 
         ordered_sources: list[str] = []
@@ -145,18 +197,39 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
             if n not in ordered_sources:
                 ordered_sources.append(n)
 
-        def _article_line(entry: ArticleRunEntry) -> str:
+        def _article_report_lines(entry: ArticleRunEntry) -> list[str]:
             if entry.report_icon:
                 icon = entry.report_icon
             else:
                 decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
                 icon = decision_icons.get(entry.decision.value, "❓")
-            score_str = f"{entry.score:.1f}" if entry.score is not None else "—"
-            title = _html_escape(entry.ua_title or entry.title_pl)
+            score_str = f"{entry.score:.1f}" if entry.score is not None else "-"
+            title_plain = entry.ua_title or entry.title_pl
+            title_esc = _html_escape(title_plain)
+            url = (entry.article_url or "").strip()
+            if url:
+                href = _html_escape(url)
+                head = f"  {icon} {score_str} · <a href=\"{href}\">{title_esc}</a>"
+            else:
+                head = f"  {icon} {score_str} · {title_esc}"
             if entry.error_msg:
                 err = _html_escape(entry.error_msg)
-                return f"  {icon} {score_str} — {title} (<i>{err}</i>)"
-            return f"  {icon} {score_str} — {title}"
+                head += f" (<i>{err}</i>)"
+            out: list[str] = [head]
+            detail_lines: list[str] = []
+            if entry.ai_reason:
+                detail_lines.append(
+                    f"<b>AI</b>: {_html_escape(_admin_snippet(entry.ai_reason))}"
+                )
+            if entry.ai_ua_summary:
+                detail_lines.append(
+                    f"<b>UA summary</b>: {_html_escape(_admin_snippet(entry.ai_ua_summary))}"
+                )
+            if detail_lines:
+                # Collapsed by default; user taps to expand (Bot API 7.3+ HTML).
+                inner = "\n".join(detail_lines)
+                out.append(f"<blockquote expandable>\n{inner}\n</blockquote>")
+            return out
 
         for src in ordered_sources:
             entries = by_source.get(src, [])
@@ -164,14 +237,14 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
                 continue
             lines.append(f"<b>{_html_escape(src)}</b>")
             for entry in entries:
-                lines.append(_article_line(entry))
+                lines.extend(_article_report_lines(entry))
         if len(log) > _MAX_REPORT_ARTICLES:
             lines.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
-        lines.append("")
 
-    # Summary line
+    # Summary (same numbers as funnel; kept for quick scan at end of message)
     lines.append(
-        f"<b>Summary:</b> posted={stats.posted}  skipped={stats.skipped}  errors={stats.errors}"
+        f"<b>Summary</b> · posted={stats.posted} · skipped={stats.skipped} · "
+        f"errors={stats.errors}"
     )
 
     text = "\n".join(lines)
@@ -188,11 +261,13 @@ class TelegramPublisher:
         bot_token: str,
         channel_id: str,
         admin_chat_id: str | None = None,
+        report_display_timezone: str | None = None,
     ) -> None:
         self._base_url = _TG_API_BASE.format(token=bot_token)
         self._channel_id = channel_id
         # Alerts go to admin_chat_id when set, otherwise fall back to the public channel.
         self._alert_chat_id = admin_chat_id or channel_id
+        self._report_display_timezone = report_display_timezone
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPStatusError),
@@ -269,7 +344,7 @@ class TelegramPublisher:
         Silently swallows errors so a reporting failure never affects the main run.
         """
         try:
-            text = _build_run_report(stats, dry_run)
+            text = _build_run_report(stats, dry_run, self._report_display_timezone)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.post(
                     f"{self._base_url}/sendMessage",

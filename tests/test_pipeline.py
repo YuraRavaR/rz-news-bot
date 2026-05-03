@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.genai import errors as genai_errors
 
-from rz_flow.ai import GeminiQuotaExhaustedError, GeminiServerError
+from rz_flow.ai import GeminiQuotaExhaustedError
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision

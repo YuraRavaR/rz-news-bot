@@ -189,6 +189,9 @@ class TestBuildRunReport:
                     score=8.0,
                     decision=Decision.POSTED,
                     source_name="rzeszow-news.pl",
+                    article_url="https://rzeszow-news.pl/wiadomosci/slug/",
+                    ai_reason="Local relevance high",
+                    ai_ua_summary="Короткий опис для каналу.",
                 )
             ],
             posted=1,
@@ -197,6 +200,10 @@ class TestBuildRunReport:
         assert 'href="https://rzeszow-news.pl"' in text
         assert 'href="https://rzeszow24.info/najnowsze"' in text
         assert "<b>rzeszow-news.pl</b>" in text
+        assert 'href="https://rzeszow-news.pl/wiadomosci/slug/"' in text
+        assert "Local relevance high" in text
+        assert "Короткий опис для каналу." in text
+        assert "<blockquote expandable>" in text
 
     def test_run_report_uses_report_icon_when_set(self) -> None:
         from rz_flow.pipeline import ArticleRunEntry, PipelineStats
@@ -212,6 +219,7 @@ class TestBuildRunReport:
                     decision=Decision.SKIPPED,
                     error_msg="quota message",
                     report_icon="⏸",
+                    article_url="https://example.com/news/1",
                 )
             ],
         )
@@ -219,6 +227,7 @@ class TestBuildRunReport:
         assert "⏸" in text
         assert "quota message" in text
         assert "<b>—</b>" in text  # grouped under unknown source when source_name empty
+        assert 'href="https://example.com/news/1"' in text
 
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────

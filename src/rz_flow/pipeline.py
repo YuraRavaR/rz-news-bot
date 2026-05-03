@@ -46,6 +46,11 @@ class ArticleRunEntry:
     report_icon: str | None = None
     # Scraper source label (e.g. rzeszow24/najnowsze) for grouped admin report
     source_name: str = ""
+    # Original article URL (admin report link, including skipped)
+    article_url: str = ""
+    # Gemini rationale / Ukrainian summary when evaluation ran
+    ai_reason: str | None = None
+    ai_ua_summary: str | None = None
 
 
 @dataclass
@@ -265,6 +270,7 @@ class Pipeline:
                     error_msg="Gemini daily quota exhausted — not saved, will retry on next run",
                     report_icon="⏸",
                     source_name=article.source_name,
+                    article_url=article.url,
                 )
             )
             return "quota_exhausted"
@@ -283,6 +289,7 @@ class Pipeline:
                     error_msg=f"Gemini temporarily unavailable (503): {exc}",
                     report_icon="🔄",
                     source_name=article.source_name,
+                    article_url=article.url,
                 )
             )
             return "continue"
@@ -303,6 +310,9 @@ class Pipeline:
                 decision=decision,
                 error_msg=error_msg,
                 source_name=article.source_name,
+                article_url=article.url,
+                ai_reason=ai_decision.reason if ai_decision else None,
+                ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
             )
         )
 

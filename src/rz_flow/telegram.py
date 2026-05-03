@@ -42,6 +42,17 @@ _MAX_MESSAGE_LEN = 4096
 # Maximum articles shown in the run report before truncation
 _MAX_REPORT_ARTICLES = 20
 
+# Per-field cap for AI snippets in the admin HTML report (many articles × long text)
+_MAX_ADMIN_AI_SNIPPET = 420
+
+
+def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
+    """Single-line-ish snippet for Telegram HTML (avoids huge admin messages)."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 1] + "…"
+
 # Template for a channel post — {hashtag} is empty string when category is "inne"
 _POST_TEMPLATE = """\
 <b>{title}</b>
@@ -145,18 +156,39 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
             if n not in ordered_sources:
                 ordered_sources.append(n)
 
-        def _article_line(entry: ArticleRunEntry) -> str:
+        def _article_report_lines(entry: ArticleRunEntry) -> list[str]:
             if entry.report_icon:
                 icon = entry.report_icon
             else:
                 decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
                 icon = decision_icons.get(entry.decision.value, "❓")
             score_str = f"{entry.score:.1f}" if entry.score is not None else "—"
-            title = _html_escape(entry.ua_title or entry.title_pl)
+            title_plain = entry.ua_title or entry.title_pl
+            title_esc = _html_escape(title_plain)
+            url = (entry.article_url or "").strip()
+            if url:
+                href = _html_escape(url)
+                head = f'  {icon} {score_str} — <a href="{href}">{title_esc}</a>'
+            else:
+                head = f"  {icon} {score_str} — {title_esc}"
             if entry.error_msg:
                 err = _html_escape(entry.error_msg)
-                return f"  {icon} {score_str} — {title} (<i>{err}</i>)"
-            return f"  {icon} {score_str} — {title}"
+                head += f" (<i>{err}</i>)"
+            out: list[str] = [head]
+            detail_lines: list[str] = []
+            if entry.ai_reason:
+                detail_lines.append(
+                    f"<b>AI</b>: {_html_escape(_admin_snippet(entry.ai_reason))}"
+                )
+            if entry.ai_ua_summary:
+                detail_lines.append(
+                    f"<b>Зміст (UA)</b>: {_html_escape(_admin_snippet(entry.ai_ua_summary))}"
+                )
+            if detail_lines:
+                # Collapsed by default; user taps to expand (Bot API 7.3+ HTML).
+                inner = "\n".join(detail_lines)
+                out.append(f"<blockquote expandable>\n{inner}\n</blockquote>")
+            return out
 
         for src in ordered_sources:
             entries = by_source.get(src, [])
@@ -164,7 +196,7 @@ def _build_run_report(stats: "PipelineStats", dry_run: bool) -> str:
                 continue
             lines.append(f"<b>{_html_escape(src)}</b>")
             for entry in entries:
-                lines.append(_article_line(entry))
+                lines.extend(_article_report_lines(entry))
         if len(log) > _MAX_REPORT_ARTICLES:
             lines.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
         lines.append("")

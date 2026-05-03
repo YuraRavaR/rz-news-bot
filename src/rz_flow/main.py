@@ -42,6 +42,7 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
             bot_token=settings.telegram_bot_token,
             channel_id=settings.telegram_channel_id,
             admin_chat_id=settings.telegram_admin_chat_id,
+            report_display_timezone=flow_config.pipeline.report_display_timezone,
         )
 
         try:

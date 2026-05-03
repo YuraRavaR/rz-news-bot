@@ -46,6 +46,11 @@ class ArticleRunEntry:
     report_icon: str | None = None
     # Scraper source label (e.g. rzeszow24/najnowsze) for grouped admin report
     source_name: str = ""
+    # Original article URL (admin report link, including skipped)
+    article_url: str = ""
+    # Gemini rationale / Ukrainian summary when evaluation ran
+    ai_reason: str | None = None
+    ai_ua_summary: str | None = None
 
 
 @dataclass
@@ -67,6 +72,10 @@ class PipelineStats:
     source_urls: dict[str, str] = field(default_factory=dict)
     # Per-article log for admin run report
     article_log: list[ArticleRunEntry] = field(default_factory=list)
+    # Admin run-report extras (set in Pipeline.run)
+    elapsed_s: int = 0
+    report_gemini_model: str = ""
+    report_ai_min_score: float = 0.0
 
     def __str__(self) -> str:
         mode = " [DRY RUN]" if self.dry_run else ""
@@ -100,6 +109,7 @@ class Pipeline:
         self.publisher = TelegramPublisher(
             bot_token=self.settings.telegram_bot_token,
             channel_id=self.settings.telegram_channel_id,
+            report_display_timezone=self.flow_config.pipeline.report_display_timezone,
         )
 
     async def run(self, dry_run: bool = False) -> PipelineStats:
@@ -109,7 +119,12 @@ class Pipeline:
             dry_run: If True, evaluate articles but do NOT publish to Telegram.
         """
         stats = PipelineStats(dry_run=dry_run)
+        stats.report_gemini_model = self.settings.gemini_model
+        stats.report_ai_min_score = self.settings.ai_min_score
         _start = time.monotonic()
+
+        def _stamp_elapsed() -> None:
+            stats.elapsed_s = max(0, round(time.monotonic() - _start))
 
         active = self.flow_config.enabled_sources
         stats.source_urls = {
@@ -139,6 +154,7 @@ class Pipeline:
 
         if not all_articles:
             log.info("no_articles_found")
+            _stamp_elapsed()
             return stats
 
         # ── Stage 2: Filter already-seen articles ─────────────────────────────
@@ -154,6 +170,7 @@ class Pipeline:
 
         if not new_articles:
             log.info("no_new_articles")
+            _stamp_elapsed()
             return stats
 
         # ── Stage 3: AI evaluate + publish ────────────────────────────────────
@@ -185,13 +202,13 @@ class Pipeline:
             if not dry_run and stats.posted > 0:
                 await asyncio.sleep(self.flow_config.pipeline.inter_post_delay_seconds)
 
-        elapsed_s = round(time.monotonic() - _start)
+        _stamp_elapsed()
         log.info(
             "pipeline_complete",
             posted=stats.posted,
             skipped=stats.skipped,
             errors=stats.errors,
-            elapsed_s=elapsed_s,
+            elapsed_s=stats.elapsed_s,
         )
         return stats
 
@@ -265,6 +282,7 @@ class Pipeline:
                     error_msg="Gemini daily quota exhausted — not saved, will retry on next run",
                     report_icon="⏸",
                     source_name=article.source_name,
+                    article_url=article.url,
                 )
             )
             return "quota_exhausted"
@@ -283,6 +301,7 @@ class Pipeline:
                     error_msg=f"Gemini temporarily unavailable (503): {exc}",
                     report_icon="🔄",
                     source_name=article.source_name,
+                    article_url=article.url,
                 )
             )
             return "continue"
@@ -303,6 +322,9 @@ class Pipeline:
                 decision=decision,
                 error_msg=error_msg,
                 source_name=article.source_name,
+                article_url=article.url,
+                ai_reason=ai_decision.reason if ai_decision else None,
+                ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
             )
         )
 

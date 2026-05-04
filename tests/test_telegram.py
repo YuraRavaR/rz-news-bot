@@ -266,6 +266,13 @@ class TestBuildRunReport:
         assert " UTC" not in first
         assert "Rz-Flow" in first
 
+    def test_run_report_shows_staging_in_header(self) -> None:
+        from rz_flow.pipeline import PipelineStats
+        from rz_flow.telegram import _build_run_report
+
+        text = _build_run_report(PipelineStats(), dry_run=False, staging=True)
+        assert "[STAGING]" in text.split("\n", 1)[0]
+
     def test_run_report_uses_report_icon_when_set(self) -> None:
         from rz_flow.pipeline import ArticleRunEntry, PipelineStats
         from rz_flow.telegram import _build_run_report

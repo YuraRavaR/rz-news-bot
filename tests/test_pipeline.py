@@ -547,6 +547,41 @@ class TestPipelineBranchCoverage:
         assert stats.skipped == 1
 
 
+class TestPipelineStagingChannel:
+    def test_use_staging_sets_publisher_channel_id(self) -> None:
+        s = Settings(
+            telegram_bot_token="t",
+            telegram_channel_id="-100111",
+            telegram_staging_channel_id="-100222",
+            gemini_api_key="k",
+            turso_database_url="libsql://x.turso.io",
+            turso_auth_token="tok",
+        )
+        p = Pipeline(
+            settings=s,
+            storage=InMemoryStorage(),
+            flow_config=_make_flow_config(),
+            use_staging_channel=True,
+        )
+        assert p.publisher._channel_id == "-100222"
+
+    def test_default_uses_production_channel_even_if_staging_id_set(self) -> None:
+        s = Settings(
+            telegram_bot_token="t",
+            telegram_channel_id="-100111",
+            telegram_staging_channel_id="-100222",
+            gemini_api_key="k",
+            turso_database_url="libsql://x.turso.io",
+            turso_auth_token="tok",
+        )
+        p = Pipeline(
+            settings=s,
+            storage=InMemoryStorage(),
+            flow_config=_make_flow_config(),
+        )
+        assert p.publisher._channel_id == "-100111"
+
+
 class TestPipelineStats:
     def test_str_representation_no_dry_run(self) -> None:
         stats = PipelineStats(total_scraped=10, new_articles=5, posted=3, skipped=2)

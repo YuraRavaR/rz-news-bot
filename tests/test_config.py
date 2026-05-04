@@ -78,6 +78,61 @@ class TestSettingsDefaults:
         assert s.telegram_admin_chat_id is None
 
 
+class TestPublishTelegramChatId:
+    def test_production_uses_main_channel(self) -> None:
+        s = _make_settings(telegram_channel_id="-100111")
+        assert s.publish_telegram_chat_id(staging=False) == "-100111"
+
+    def test_staging_uses_staging_channel_when_set(self) -> None:
+        s = _make_settings(
+            telegram_channel_id="-100111",
+            telegram_staging_channel_id="-100222",
+        )
+        assert s.publish_telegram_chat_id(staging=True) == "-100222"
+
+    def test_staging_raises_when_channel_missing(self) -> None:
+        s = _make_settings(telegram_staging_channel_id=None)
+        with pytest.raises(ValueError, match="TELEGRAM_STAGING_CHANNEL_ID"):
+            s.publish_telegram_chat_id(staging=True)
+
+    def test_staging_raises_when_channel_blank(self) -> None:
+        s = _make_settings(telegram_staging_channel_id="   ")
+        with pytest.raises(ValueError, match="TELEGRAM_STAGING_CHANNEL_ID"):
+            s.publish_telegram_chat_id(staging=True)
+
+
+class TestStagingTursoCredentials:
+    def test_returns_pair_when_set(self) -> None:
+        s = _make_settings(
+            turso_staging_database_url="libsql://staging.turso.io",
+            turso_staging_auth_token="staging-token",
+        )
+        assert s.staging_turso_credentials() == ("libsql://staging.turso.io", "staging-token")
+
+    def test_raises_when_url_missing(self) -> None:
+        s = _make_settings(
+            turso_staging_database_url=None,
+            turso_staging_auth_token="t",
+        )
+        with pytest.raises(ValueError, match="TURSO_STAGING"):
+            s.staging_turso_credentials()
+
+    def test_staging_config_errors_lists_missing(self) -> None:
+        s = _make_settings()
+        err = s.staging_config_errors()
+        assert "TELEGRAM_STAGING_CHANNEL_ID" in err
+        assert "TURSO_STAGING_DATABASE_URL" in err
+        assert "TURSO_STAGING_AUTH_TOKEN" in err
+
+    def test_staging_config_errors_empty_when_complete(self) -> None:
+        s = _make_settings(
+            telegram_staging_channel_id="-1001",
+            turso_staging_database_url="libsql://s",
+            turso_staging_auth_token="tok",
+        )
+        assert s.staging_config_errors() == []
+
+
 class TestGetSettings:
     def test_get_settings_returns_singleton(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """get_settings() returns the same instance on repeated calls."""

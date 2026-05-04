@@ -112,6 +112,7 @@ class Pipeline:
     settings: Settings
     storage: StorageProtocol
     flow_config: FlowConfig
+    use_staging_channel: bool = False
     ai_filter: GeminiAIFilter = field(init=False)
     publisher: TelegramPublisher = field(init=False)
 
@@ -120,9 +121,10 @@ class Pipeline:
             api_key=self.settings.gemini_api_key,
             model=self.settings.gemini_model,
         )
+        publish_id = self.settings.publish_telegram_chat_id(staging=self.use_staging_channel)
         self.publisher = TelegramPublisher(
             bot_token=self.settings.telegram_bot_token,
-            channel_id=self.settings.telegram_channel_id,
+            channel_id=publish_id,
             report_display_timezone=self.flow_config.pipeline.report_display_timezone,
         )
 

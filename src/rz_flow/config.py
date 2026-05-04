@@ -20,6 +20,10 @@ class Settings(BaseSettings):
         default=None,
         description="Private chat ID for crash/quota alerts (falls back to channel if unset)",
     )
+    telegram_staging_channel_id: str | None = Field(
+        default=None,
+        description="Optional staging channel ID (used with CLI --staging)",
+    )
 
     # ── Gemini AI ─────────────────────────────────────────────────────────────
     gemini_api_key: str = Field(..., description="Google AI Studio API key")
@@ -28,6 +32,14 @@ class Settings(BaseSettings):
     # ── Turso (libsql) ────────────────────────────────────────────────────────
     turso_database_url: str = Field(..., description="libsql:// URL from turso db show")
     turso_auth_token: str = Field(..., description="Auth token from turso db tokens create")
+    turso_staging_database_url: str | None = Field(
+        default=None,
+        description="Separate Turso DB for --staging runs (dedup isolated from production)",
+    )
+    turso_staging_auth_token: str | None = Field(
+        default=None,
+        description="Auth token for turso_staging_database_url",
+    )
 
     # ── Scraper ───────────────────────────────────────────────────────────────
     scraper_base_url: str = Field(
@@ -54,6 +66,39 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    def publish_telegram_chat_id(self, *, staging: bool) -> str:
+        """Chat ID for pipeline publishes: production channel or staging channel."""
+        if not staging:
+            return self.telegram_channel_id.strip()
+        sid = (self.telegram_staging_channel_id or "").strip()
+        if not sid:
+            msg = "TELEGRAM_STAGING_CHANNEL_ID is required for staging runs"
+            raise ValueError(msg)
+        return sid
+
+    def staging_turso_credentials(self) -> tuple[str, str]:
+        """Return (database_url, auth_token) for staging Turso; raises if incomplete."""
+        url = (self.turso_staging_database_url or "").strip()
+        token = (self.turso_staging_auth_token or "").strip()
+        if not url or not token:
+            msg = (
+                "TURSO_STAGING_DATABASE_URL and TURSO_STAGING_AUTH_TOKEN are required "
+                "for staging runs (use a separate DB from production)"
+            )
+            raise ValueError(msg)
+        return url, token
+
+    def staging_config_errors(self) -> list[str]:
+        """Human-readable list of missing staging env vars (empty if staging is runnable)."""
+        missing: list[str] = []
+        if not (self.telegram_staging_channel_id or "").strip():
+            missing.append("TELEGRAM_STAGING_CHANNEL_ID")
+        if not (self.turso_staging_database_url or "").strip():
+            missing.append("TURSO_STAGING_DATABASE_URL")
+        if not (self.turso_staging_auth_token or "").strip():
+            missing.append("TURSO_STAGING_AUTH_TOKEN")
+        return missing
 
 
 _settings: Settings | None = None

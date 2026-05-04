@@ -134,10 +134,16 @@ def _build_run_report(
     stats: "PipelineStats",
     dry_run: bool,
     report_display_timezone: str | None = None,
+    staging: bool = False,
 ) -> str:
     """Format a concise HTML run-report message for the admin chat."""
     now_line = format_run_report_clock(datetime.now(UTC), report_display_timezone)
-    mode = " [DRY RUN]" if dry_run else ""
+    mode_parts: list[str] = []
+    if dry_run:
+        mode_parts.append("DRY RUN")
+    if staging:
+        mode_parts.append("STAGING")
+    mode = f" [{' '.join(mode_parts)}]" if mode_parts else ""
     flags = ""
     if stats.quota_exhausted:
         flags += " ⚠️ QUOTA"
@@ -232,8 +238,8 @@ def _build_run_report(
                     f"<b>UA summary</b>: {_html_escape(_admin_snippet(entry.ai_ua_summary))}"
                 )
             if detail_lines:
-                # Collapsed by default; user taps to expand (Bot API 7.3+ HTML).
-                inner = "\n".join(detail_lines)
+                # Collapsed preview shows only "Details"; full AI + UA after expand.
+                inner = "Details\n" + "\n".join(detail_lines)
                 out.append(f"<blockquote expandable>\n{inner}\n</blockquote>")
             return out
 
@@ -402,7 +408,12 @@ class TelegramPublisher:
             # Alert failures should never crash the pipeline
             logger.error("alert_send_failed", target=target, error=str(exc))
 
-    async def send_run_report(self, stats: "PipelineStats", dry_run: bool = False) -> None:
+    async def send_run_report(
+        self,
+        stats: "PipelineStats",
+        dry_run: bool = False,
+        staging: bool = False,
+    ) -> None:
         """Send a structured run summary to the admin chat.
 
         Sent after every pipeline run (success, quota, or partial failure).

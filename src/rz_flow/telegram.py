@@ -266,6 +266,7 @@ class TelegramPublisher:
         self._base_url = _TG_API_BASE.format(token=bot_token)
         self._channel_id = channel_id
         # Alerts go to admin_chat_id when set, otherwise fall back to the public channel.
+        self._admin_chat_configured = bool((admin_chat_id or "").strip())
         self._alert_chat_id = admin_chat_id or channel_id
         self._report_display_timezone = report_display_timezone
 
@@ -321,11 +322,17 @@ class TelegramPublisher:
             chat_id=self._channel_id,
         )
 
+    def _admin_send_target(self) -> str:
+        """Log label for where alerts/reports go (no chat IDs)."""
+        return "admin_chat" if self._admin_chat_configured else "channel"
+
     async def send_alert(self, message: str) -> None:
         """Send a plain-text alert to the admin chat (or channel if no admin chat configured)."""
+        target = self._admin_send_target()
         try:
+            logger.info("admin_alert_sending", target=target)
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
+                response = await client.post(
                     f"{self._base_url}/sendMessage",
                     json={
                         "chat_id": self._alert_chat_id,
@@ -333,9 +340,31 @@ class TelegramPublisher:
                         "parse_mode": "HTML",
                     },
                 )
+            try:
+                data: dict = response.json()
+            except ValueError:
+                data = {}
+            if not response.is_success:
+                desc = data.get("description", response.text) if isinstance(data, dict) else response.text
+                logger.error(
+                    "alert_send_failed",
+                    target=target,
+                    http_status=response.status_code,
+                    tg_description=str(desc),
+                )
+                return
+            if not isinstance(data, dict) or not data.get("ok"):
+                logger.error(
+                    "alert_send_failed",
+                    target=target,
+                    tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
+                )
+                return
+            msg_id = data.get("result", {}).get("message_id") if isinstance(data.get("result"), dict) else None
+            logger.info("admin_alert_sent", target=target, message_id=msg_id)
         except Exception as exc:
             # Alert failures should never crash the pipeline
-            logger.error("alert_send_failed", error=str(exc))
+            logger.error("alert_send_failed", target=target, error=str(exc))
 
     async def send_run_report(self, stats: "PipelineStats", dry_run: bool = False) -> None:
         """Send a structured run summary to the admin chat.
@@ -343,10 +372,12 @@ class TelegramPublisher:
         Sent after every pipeline run (success, quota, or partial failure).
         Silently swallows errors so a reporting failure never affects the main run.
         """
+        target = self._admin_send_target()
         try:
             text = _build_run_report(stats, dry_run, self._report_display_timezone)
+            logger.info("run_report_sending", dry_run=dry_run, target=target)
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
+                response = await client.post(
                     f"{self._base_url}/sendMessage",
                     json={
                         "chat_id": self._alert_chat_id,
@@ -355,5 +386,29 @@ class TelegramPublisher:
                         "disable_web_page_preview": True,
                     },
                 )
+            try:
+                data: dict = response.json()
+            except ValueError:
+                data = {}
+            if not response.is_success:
+                desc = data.get("description", response.text) if isinstance(data, dict) else response.text
+                logger.error(
+                    "run_report_send_failed",
+                    target=target,
+                    dry_run=dry_run,
+                    http_status=response.status_code,
+                    tg_description=str(desc),
+                )
+                return
+            if not isinstance(data, dict) or not data.get("ok"):
+                logger.error(
+                    "run_report_send_failed",
+                    target=target,
+                    dry_run=dry_run,
+                    tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
+                )
+                return
+            msg_id = data.get("result", {}).get("message_id") if isinstance(data.get("result"), dict) else None
+            logger.info("run_report_sent", dry_run=dry_run, target=target, message_id=msg_id)
         except Exception as exc:
-            logger.error("run_report_send_failed", error=str(exc))
+            logger.error("run_report_send_failed", target=target, dry_run=dry_run, error=str(exc))

@@ -290,6 +290,42 @@ class TestBuildRunReport:
         assert "<b>-</b>" in text  # grouped under unknown source when source_name empty
         assert 'href="https://example.com/news/1"' in text
 
+    def test_run_report_includes_remaining_queue(self) -> None:
+        """Admin report lists articles not started (post cap / quota tail)."""
+        from rz_flow.pipeline import PipelineStats, RemainingArticleBrief
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            total_scraped=10,
+            new_articles=5,
+            posted=2,
+            skipped=0,
+            errors=0,
+            post_cap_reached=True,
+            remaining_stop_reason="post_cap",
+            remaining_queued=[
+                RemainingArticleBrief(
+                    article_id="a1",
+                    title_pl="Tytuł A",
+                    url="https://example.com/a1",
+                    source_name="rzeszow24/najnowsze",
+                ),
+                RemainingArticleBrief(
+                    article_id="a2",
+                    title_pl="Tytuł B",
+                    url="",
+                    source_name="",
+                ),
+            ],
+        )
+        text = _build_run_report(stats, dry_run=False)
+        assert "<b>У черзі</b>" in text
+        assert "queued (not started this run): 2" in text
+        assert "Ліміт постів за прогоном" in text
+        assert 'href="https://example.com/a1"' in text
+        assert "rzeszow24/najnowsze" in text
+        assert "Tytuł B" in text
+
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────
 class TestTelegramPublisher:

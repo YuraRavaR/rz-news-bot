@@ -43,6 +43,9 @@ _MAX_MESSAGE_LEN = 4096
 # Maximum articles shown in the run report before truncation
 _MAX_REPORT_ARTICLES = 20
 
+# Maximum rows in the "remaining queue" section (post cap / quota tail)
+_MAX_REMAINING_IN_REPORT = 15
+
 # Per-field cap for AI snippets in the admin HTML report (many articles × long text)
 _MAX_ADMIN_AI_SNIPPET = 420
 
@@ -155,6 +158,9 @@ def _build_run_report(
         f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
         f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
     )
+    rq_n = len(stats.remaining_queued)
+    if rq_n:
+        meta_inner.append(f"queued (not started this run): {rq_n}")
     lines.append("<blockquote>" + "\n".join(meta_inner) + "</blockquote>")
 
     # Sources section
@@ -240,6 +246,36 @@ def _build_run_report(
                 lines.extend(_article_report_lines(entry))
         if len(log) > _MAX_REPORT_ARTICLES:
             lines.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
+
+    # New articles never started (stopped by post cap or Gemini quota)
+    if stats.remaining_queued:
+        reason = (stats.remaining_stop_reason or "").strip()
+        if reason == "post_cap":
+            intro = (
+                "Ліміт постів за прогоном; нижче — новини з черги, які Gemini ще не оцінював у цьому прогоні."
+            )
+        elif reason == "quota":
+            intro = (
+                "Квота Gemini; нижче — наступні у списку новин, які не стартували в цьому прогоні "
+                "(будуть знову в черзі на наступному)."
+            )
+        else:
+            intro = "Не оброблені в цьому прогоні (черга):"
+        lines.append("<b>У черзі</b>")
+        lines.append(f"<i>{_html_escape(intro)}</i>")
+        shown_rq = stats.remaining_queued[:_MAX_REMAINING_IN_REPORT]
+        for b in shown_rq:
+            title_esc = _html_escape(b.title_pl)
+            url = (b.url or "").strip()
+            src_bit = f"{_html_escape(b.source_name.strip())} · " if b.source_name.strip() else ""
+            if url:
+                href = _html_escape(url)
+                lines.append(f"  ⏳ {src_bit}<a href=\"{href}\">{title_esc}</a>")
+            else:
+                lines.append(f"  ⏳ {src_bit}{title_esc}")
+        if len(stats.remaining_queued) > _MAX_REMAINING_IN_REPORT:
+            more = len(stats.remaining_queued) - _MAX_REMAINING_IN_REPORT
+            lines.append(f"<i>… ще {more}</i>")
 
     # Summary (same numbers as funnel; kept for quick scan at end of message)
     lines.append(

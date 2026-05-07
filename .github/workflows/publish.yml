@@ -4,9 +4,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 on:
-  # Run every 3 hours
+  # Every ~3h at :23 UTC (not :00 — less queue contention per GitHub schedule docs)
   schedule:
-    - cron: "0 4,7,10,13,16,19 * * *"
+    - cron: "23 4,7,10,13,16,19 * * *"
 
   # Allow manual trigger from GitHub UI (great for first run + debugging)
   workflow_dispatch:

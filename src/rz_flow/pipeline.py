@@ -126,13 +126,16 @@ class Pipeline:
             bot_token=self.settings.telegram_bot_token,
             channel_id=publish_id,
             report_display_timezone=self.flow_config.pipeline.report_display_timezone,
+            mark_channel_posts_staging=self.use_staging_channel,
         )
 
     async def run(self, dry_run: bool = False) -> PipelineStats:
         """Execute the full pipeline and return statistics.
 
         Args:
-            dry_run: If True, evaluate articles but do NOT publish to Telegram.
+            dry_run: If True, evaluate articles but do NOT publish to Telegram and do NOT
+                persist decisions to Turso. With ``use_staging_channel=True``, still uses
+                staging Turso for ``filter_new_ids`` reads only.
         """
         stats = PipelineStats(dry_run=dry_run)
         stats.report_gemini_model = self.settings.gemini_model

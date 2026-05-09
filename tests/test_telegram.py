@@ -154,6 +154,20 @@ class TestBuildMessage:
         msg = _build_message(article, decision)
         assert "#" not in msg
 
+    def test_staging_prepends_visible_banner(self) -> None:
+        article = _make_article()
+        decision = _make_decision()
+        msg = _build_message(article, decision, staging=True)
+        assert msg.startswith("<b>🧪 STAGING</b>")
+        assert "Чернетковий канал" in msg
+        assert "Фестиваль" in msg  # title still present after banner
+
+    def test_non_staging_has_no_staging_banner(self) -> None:
+        article = _make_article()
+        decision = _make_decision()
+        msg = _build_message(article, decision, staging=False)
+        assert "🧪 STAGING" not in msg
+
     def test_message_truncated_when_over_4096_chars(self) -> None:
         """Very long summaries must be truncated to fit Telegram's 4096-char limit."""
         article = _make_article()
@@ -169,7 +183,7 @@ class TestBuildMessage:
         )
         msg = _build_message(article, long_decision)
         assert len(msg) <= 4096
-        assert msg.endswith("…")
+        assert "trimmed" in msg or msg.endswith("…")
 
 
 class TestFormatRunReportClock:
@@ -272,6 +286,35 @@ class TestBuildRunReport:
 
         text = _build_run_report(PipelineStats(), dry_run=False, staging=True)
         assert "[STAGING]" in text.split("\n", 1)[0]
+
+    def test_run_report_shows_dry_run_and_staging_together(self) -> None:
+        from rz_flow.pipeline import PipelineStats
+        from rz_flow.telegram import _build_run_report
+
+        text = _build_run_report(PipelineStats(), dry_run=True, staging=True)
+        first = text.split("\n", 1)[0]
+        assert "[DRY RUN STAGING]" in first
+
+    def test_truncate_telegram_html_avoids_unclosed_tags(self) -> None:
+        """Long run reports used to slice mid-tag and break sendMessage HTML parse."""
+        from rz_flow.telegram import _MAX_MESSAGE_LEN, _truncate_telegram_html
+
+        filler = "w" * 6000
+        text = (
+            "<b>📊 Rz-Flow</b>\n"
+            "<blockquote>meta</blockquote>\n"
+            "<b>Articles</b>\n"
+            "<b>src</b>\n"
+            f'  ✅ 8.0 · <a href="https://example.com/a">Title</a>\n'
+            "<blockquote expandable>\nDetails\n"
+            f"<b>AI</b>: {filler}\n</blockquote>"
+        )
+        out = _truncate_telegram_html(text, max_len=_MAX_MESSAGE_LEN)
+        assert len(out) <= _MAX_MESSAGE_LEN
+        assert "… trimmed" in out
+        assert out.count("<blockquote") == out.count("</blockquote>")
+        assert out.count("<b>") == out.count("</b>")
+        assert out.count("<a ") == out.count("</a>")
 
     def test_run_report_uses_report_icon_when_set(self) -> None:
         from rz_flow.pipeline import ArticleRunEntry, PipelineStats
@@ -423,6 +466,23 @@ class TestTelegramPublisher:
         data = json.loads(sent_body)
         assert data["parse_mode"] == "HTML"
         assert data["chat_id"] == "-100123"
+
+    @respx.mock
+    async def test_publish_staging_includes_banner_in_text(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 1}})
+        )
+        publisher = TelegramPublisher(
+            bot_token="fake-token",
+            channel_id="-100123",
+            mark_channel_posts_staging=True,
+        )
+        await publisher.publish(_make_article(), _make_decision())
+        import json
+
+        data = json.loads(route.calls[0].request.content)
+        assert "🧪 STAGING" in data["text"]
+        assert "Чернетковий канал" in data["text"]
 
     @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
     @respx.mock

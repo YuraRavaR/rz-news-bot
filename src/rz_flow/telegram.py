@@ -12,6 +12,7 @@ Handles:
 """
 
 import asyncio
+import re
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -76,7 +77,14 @@ _CATEGORY_HASHTAGS: dict[str, str] = {
 }
 
 
-def _build_message(article: Article, decision: AIDecision) -> str:
+# Prepended to every channel post when running with --staging (HTML, Telegram-safe)
+_STAGING_POST_BANNER = (
+    "<b>🧪 STAGING</b>\n"
+    "<i>Чернетковий канал — це не продакшен-публікація.</i>\n\n"
+)
+
+
+def _build_message(article: Article, decision: AIDecision, *, staging: bool = False) -> str:
     """Render the Telegram HTML message from article + AI decision."""
     # HTML-escape any stray < > & in user content (titles from the site)
     title = _html_escape(decision.ua_title)
@@ -95,9 +103,12 @@ def _build_message(article: Article, decision: AIDecision) -> str:
         hashtag=hashtag,
     )
 
-    # Truncate gracefully if somehow over Telegram limit
+    if staging:
+        text = _STAGING_POST_BANNER + text
+
+    # Fit Telegram limit without breaking HTML (body can be long)
     if len(text) > _MAX_MESSAGE_LEN:
-        text = text[: _MAX_MESSAGE_LEN - 3] + "…"
+        text = _truncate_telegram_html(text)
 
     return text
 
@@ -105,6 +116,50 @@ def _build_message(article: Article, decision: AIDecision) -> str:
 def _html_escape(text: str) -> str:
     """Minimal HTML escaping for Telegram HTML parse mode."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _truncate_telegram_html(text: str, max_len: int = _MAX_MESSAGE_LEN - 8) -> str:
+    """Fit HTML into Telegram's length limit without splitting tags mid-string.
+
+    A naive slice after ``join()`` can break inside ``<blockquote>``, ``<a>``,
+    etc., which yields ``400 Bad Request: can't parse entities: Unclosed end tag``.
+    """
+    if len(text) <= max_len:
+        return text
+
+    notice = "\n\n<i>… trimmed (Telegram length limit).</i>"
+
+    def _build(cut: int) -> str:
+        chunk = text[: max(0, min(cut, len(text)))]
+        chunk = re.sub(r"<[^>\n]*$", "", chunk)
+
+        def _missing_closes(open_re: str, close_lit: str) -> int:
+            o = len(re.findall(open_re, chunk, flags=re.I))
+            cl = len(re.findall(re.escape(close_lit), chunk, flags=re.I))
+            return max(0, o - cl)
+
+        tail = ""
+        for _ in range(_missing_closes(r"<blockquote\b", "</blockquote>")):
+            tail += "</blockquote>"
+        for _ in range(_missing_closes(r"<b\b", "</b>")):
+            tail += "</b>"
+        for _ in range(_missing_closes(r"<i\b", "</i>")):
+            tail += "</i>"
+        for _ in range(_missing_closes(r"<a\s", "</a>")):
+            tail += "</a>"
+        return chunk + tail + notice
+
+    lo, hi = 1, len(text)
+    best = _build(1)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = _build(mid)
+        if len(candidate) <= max_len:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def format_run_report_clock(now_utc: datetime, display_timezone: str | None) -> str:
@@ -290,9 +345,7 @@ def _build_run_report(
     )
 
     text = "\n".join(lines)
-    if len(text) > _MAX_MESSAGE_LEN:
-        text = text[: _MAX_MESSAGE_LEN - 3] + "…"
-    return text
+    return _truncate_telegram_html(text)
 
 
 class TelegramPublisher:
@@ -304,6 +357,7 @@ class TelegramPublisher:
         channel_id: str,
         admin_chat_id: str | None = None,
         report_display_timezone: str | None = None,
+        mark_channel_posts_staging: bool = False,
     ) -> None:
         self._base_url = _TG_API_BASE.format(token=bot_token)
         self._channel_id = channel_id
@@ -311,6 +365,7 @@ class TelegramPublisher:
         self._admin_chat_configured = bool((admin_chat_id or "").strip())
         self._alert_chat_id = admin_chat_id or channel_id
         self._report_display_timezone = report_display_timezone
+        self._mark_channel_posts_staging = mark_channel_posts_staging
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPStatusError),
@@ -324,7 +379,11 @@ class TelegramPublisher:
         Returns PublishResult with the message_id assigned by Telegram.
         Raises httpx.HTTPStatusError on persistent failures.
         """
-        text = _build_message(article, decision)
+        text = _build_message(
+            article,
+            decision,
+            staging=self._mark_channel_posts_staging,
+        )
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
@@ -421,8 +480,13 @@ class TelegramPublisher:
         """
         target = self._admin_send_target()
         try:
-            text = _build_run_report(stats, dry_run, self._report_display_timezone)
-            logger.info("run_report_sending", dry_run=dry_run, target=target)
+            text = _build_run_report(
+                stats,
+                dry_run,
+                self._report_display_timezone,
+                staging=staging,
+            )
+            logger.info("run_report_sending", dry_run=dry_run, staging=staging, target=target)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(
                     f"{self._base_url}/sendMessage",

@@ -108,10 +108,16 @@ uv run rz-flow --dry-run
 
 ### 5. Staging channel (preview posts without touching production dedup)
 
-Requires `TELEGRAM_STAGING_CHANNEL_ID`, `TURSO_STAGING_DATABASE_URL`, and `TURSO_STAGING_AUTH_TOKEN` in `.env`. Mutually exclusive with `--dry-run`.
+Requires `TELEGRAM_STAGING_CHANNEL_ID`, `TURSO_STAGING_DATABASE_URL`, and `TURSO_STAGING_AUTH_TOKEN` in `.env`.
 
 ```bash
 uv run rz-flow --staging
+```
+
+**Staging + dry run:** same staging Turso for reads (which articles are “new”), but nothing is written to the DB and nothing is posted to Telegram — good for a safe rehearsal:
+
+```bash
+uv run rz-flow --staging --dry-run
 ```
 
 ### 6. Production run

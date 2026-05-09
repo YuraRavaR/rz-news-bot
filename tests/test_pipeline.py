@@ -564,6 +564,7 @@ class TestPipelineStagingChannel:
             use_staging_channel=True,
         )
         assert p.publisher._channel_id == "-100222"
+        assert p.publisher._mark_channel_posts_staging is True
 
     def test_default_uses_production_channel_even_if_staging_id_set(self) -> None:
         s = Settings(
@@ -580,6 +581,7 @@ class TestPipelineStagingChannel:
             flow_config=_make_flow_config(),
         )
         assert p.publisher._channel_id == "-100111"
+        assert p.publisher._mark_channel_posts_staging is False
 
 
 class TestPipelineStats:

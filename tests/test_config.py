@@ -19,6 +19,9 @@ def _make_settings(**overrides: object) -> Settings:
         "gemini_api_key": "fake-key",
         "turso_database_url": "libsql://fake.turso.io",
         "turso_auth_token": "fake-token",
+        "telegram_staging_channel_id": None,
+        "turso_staging_database_url": None,
+        "turso_staging_auth_token": None,
         # Optional fields — set explicitly to avoid .env overriding them
         "gemini_model": "gemini-2.0-flash",
         "ai_min_score": 7.0,

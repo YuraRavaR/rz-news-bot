@@ -2,8 +2,9 @@
 
 Usage:
     uv run rz-flow               # normal production run
-    uv run rz-flow --dry-run     # evaluate but don't publish
+    uv run rz-flow --dry-run     # evaluate but don't publish (prod Turso)
     uv run rz-flow --staging     # publish to staging channel + staging Turso DB
+    uv run rz-flow --staging --dry-run   # full run against staging DB, no writes / no Telegram posts
     uv run rz-flow --init-db     # create DB tables and exit
     uv run rz-flow --init-db --staging   # init staging DB only
 """
@@ -31,13 +32,6 @@ async def _async_main(
     settings = get_settings()
     flow_config = load_flow_config()
     log = structlog.get_logger("main")
-
-    if staging and dry_run:
-        log.error(
-            "invalid_cli",
-            reason="--staging and --dry-run cannot be used together",
-        )
-        return 2
 
     if staging:
         missing = settings.staging_config_errors()
@@ -95,7 +89,7 @@ async def _async_main(
 
         # Send run report to admin chat after every run (only if admin chat is configured)
         if settings.telegram_admin_chat_id:
-            await admin.send_run_report(stats, dry_run=dry_run)
+            await admin.send_run_report(stats, dry_run=dry_run, staging=staging)
         else:
             log.info("run_report_skipped", reason="telegram_admin_chat_id_unset")
 
@@ -138,18 +132,17 @@ def _write_github_summary(
 def main() -> None:
     """CLI entry point registered in pyproject.toml [project.scripts]."""
     parser = argparse.ArgumentParser(description="Rz-Flow Telegram channel bot")
-    mx = parser.add_mutually_exclusive_group()
-    mx.add_argument(
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Evaluate articles but do NOT publish to Telegram",
+        help="Do not publish channel posts and do not persist decisions to Turso",
     )
-    mx.add_argument(
+    parser.add_argument(
         "--staging",
         action="store_true",
         help=(
-            "Publish to TELEGRAM_STAGING_CHANNEL_ID using TURSO_STAGING_* "
-            "(separate DB from production; mutually exclusive with --dry-run)"
+            "Use TELEGRAM_STAGING_CHANNEL_ID and TURSO_STAGING_* (separate from production). "
+            "Combine with --dry-run to exercise staging DB reads only (no writes, no posts)."
         ),
     )
     parser.add_argument(

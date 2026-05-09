@@ -64,6 +64,9 @@ def _category_from_url(href: str) -> Category | None:
         return Category.IMPREZY
     if "/wiadomosci/" in href:
         return Category.WIADOMOSCI
+    # /najnowsze mixes in sport articles; same grouping as _BADGE_MAP["sport"]
+    if "/sport/" in href:
+        return Category.WIADOMOSCI
     return None
 
 
@@ -71,7 +74,7 @@ def parse_najnowsze_page(html: str) -> list[Article]:
     """Parse the /najnowsze (latest news) feed and return unique Article objects.
 
     Handles both image-tile and news-listing card types.
-    Category is inferred from each article's URL.
+    Category is inferred from each article's URL (imprezy, wiadomosci, sport).
     Articles whose URL does not match a known category are skipped.
     Ignores sponsored content.
     """

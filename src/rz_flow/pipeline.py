@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 
 import structlog
@@ -29,6 +29,39 @@ from rz_flow.storage import StorageProtocol
 from rz_flow.telegram import TelegramPublisher
 
 logger = structlog.get_logger(__name__)
+
+
+def _order_new_articles_round_robin_oldest_first(articles: list[Article]) -> list[Article]:
+    """Reorder new articles: round-robin across sources, oldest DOM row first per source.
+
+    ``fetch_articles`` concatenates each source in config order (newest-first DOM per
+    source). We reverse each source's slice for oldest-first, then interleave sources
+    so one article from source 1, one from source 2, … until all queues are empty.
+    """
+    if not articles:
+        return []
+    order_keys: list[str] = []
+    by_key: dict[str, list[Article]] = {}
+    for a in articles:
+        key = a.source_name.strip()
+        if key not in by_key:
+            by_key[key] = []
+            order_keys.append(key)
+        by_key[key].append(a)
+    queues: dict[str, deque[Article]] = {
+        k: deque(reversed(v)) for k, v in by_key.items()
+    }
+    out: list[Article] = []
+    while True:
+        took_any = False
+        for key in order_keys:
+            q = queues[key]
+            if q:
+                out.append(q.popleft())
+                took_any = True
+        if not took_any:
+            break
+    return out
 
 
 @dataclass(frozen=True)
@@ -180,6 +213,7 @@ class Pipeline:
         all_ids = [a.id for a in all_articles]
         new_ids_set = set(await self.storage.filter_new_ids(all_ids))
         new_articles = [a for a in all_articles if a.id in new_ids_set]
+        new_articles = _order_new_articles_round_robin_oldest_first(new_articles)
 
         stats.new_articles = len(new_articles)
         seen_count = stats.total_scraped - stats.new_articles

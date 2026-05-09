@@ -95,6 +95,53 @@ def storage() -> InMemoryStorage:
     return InMemoryStorage()
 
 
+class TestNewArticleOrdering:
+    def test_round_robin_interleaves_sources_oldest_first_each(self) -> None:
+        from rz_flow.pipeline import _order_new_articles_round_robin_oldest_first
+
+        newest = Article(
+            id="new",
+            url="https://example.com/n",
+            category=Category.IMPREZY,
+            title_pl="t",
+            source_name="src-a",
+        )
+        older = Article(
+            id="old",
+            url="https://example.com/o",
+            category=Category.IMPREZY,
+            title_pl="t",
+            source_name="src-a",
+        )
+        other = Article(
+            id="only",
+            url="https://example.com/x",
+            category=Category.IMPREZY,
+            title_pl="t",
+            source_name="src-b",
+        )
+        # Scrape order: all src-a rows then src-b (newest-first within each).
+        ordered = _order_new_articles_round_robin_oldest_first([newest, older, other])
+        assert [a.id for a in ordered] == ["old", "only", "new"]
+
+    def test_two_sources_equal_length_alternates(self) -> None:
+        from rz_flow.pipeline import _order_new_articles_round_robin_oldest_first
+
+        def art(i: str, src: str) -> Article:
+            return Article(
+                id=i,
+                url=f"https://example.com/{i}",
+                category=Category.IMPREZY,
+                title_pl="t",
+                source_name=src,
+            )
+
+        # src-a first in scrape: newest a1, oldest a0; then src-b: newest b1, oldest b0
+        scrape = [art("a1", "a"), art("a0", "a"), art("b1", "b"), art("b0", "b")]
+        ordered = _order_new_articles_round_robin_oldest_first(scrape)
+        assert [a.id for a in ordered] == ["a0", "b0", "a1", "b1"]
+
+
 class TestPipelineRunBasic:
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")
@@ -189,7 +236,7 @@ class TestPipelineRunBasic:
         storage: InMemoryStorage,
     ) -> None:
         """One article failing AI should not stop processing of the next."""
-        articles = [_make_article("FAIL_ARTICLE_12345"), _make_article("GOOD_ARTICLE_12345")]
+        articles = [_make_article("GOOD_ARTICLE_12345"), _make_article("FAIL_ARTICLE_12345")]
         mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 2})
 
         mock_ai = MagicMock()
@@ -300,9 +347,9 @@ class TestPipelineRunBasic:
         (they'll pass filter_new_ids again since they're not in storage).
         """
         articles = [
-            _make_article("QUOTA_ART_1"),
             _make_article("QUOTA_ART_2"),
             _make_article("QUOTA_ART_3"),
+            _make_article("QUOTA_ART_1"),
         ]
         mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 3})
 
@@ -340,8 +387,8 @@ class TestPipelineRunBasic:
     ) -> None:
         """Articles processed before quota exhaustion are saved normally."""
         articles = [
-            _make_article("GOOD_ART_1"),
             _make_article("QUOTA_ART_2"),
+            _make_article("GOOD_ART_1"),
         ]
         mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 2})
 
@@ -413,8 +460,8 @@ class TestPipelinePostCap:
         assert stats.remaining_stop_reason == "post_cap"
         assert [x.article_id for x in stats.remaining_queued] == [
             "ART_0002_XYZABCDE",
-            "ART_0003_XYZABCDE",
-            "ART_0004_XYZABCDE",
+            "ART_0001_XYZABCDE",
+            "ART_0000_XYZABCDE",
         ]
         # Only 2 articles should be published despite 5 being available
         assert mock_tg.publish.call_count == 2
@@ -482,7 +529,7 @@ class TestPipelineBranchCoverage:
         storage: InMemoryStorage,
     ) -> None:
         """GeminiServerError (503) is transient: article NOT saved, pipeline continues."""
-        articles = [_make_article("SERVER_ERR_ART_01X"), _make_article("GOOD_ART_X123456")]
+        articles = [_make_article("GOOD_ART_X123456"), _make_article("SERVER_ERR_ART_01X")]
         mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 2})
 
         server_err = genai_errors.ServerError(

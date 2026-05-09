@@ -279,6 +279,7 @@ class TestBuildRunReport:
         first = text.split("\n", 1)[0]
         assert " UTC" not in first
         assert "Rz-Flow" in first
+        assert "not_evaluated_this_run" not in text
 
     def test_run_report_shows_staging_in_header(self) -> None:
         from rz_flow.pipeline import PipelineStats
@@ -369,15 +370,16 @@ class TestBuildRunReport:
             ],
         )
         text = _build_run_report(stats, dry_run=False)
-        assert "<b>У черзі</b>" in text
-        assert "queued (not started this run): 2" in text
-        assert "Ліміт постів за прогоном" in text
+        assert "<b>Pending evaluation</b>" in text
+        assert "not evaluated this run: 2" in text
+        assert "Post limit reached for this run" in text
         assert 'href="https://example.com/a1"' in text
         assert "rzeszow24/najnowsze" in text
         assert "Tytuł B" in text
+        assert "not_evaluated_this_run=2" in text
 
     def test_run_report_remaining_queue_quota_intro(self) -> None:
-        """Admin 'У черзі' block uses quota wording when remaining_stop_reason is quota."""
+        """Admin pending-evaluation block uses quota wording when remaining_stop_reason is quota."""
         from rz_flow.pipeline import PipelineStats, RemainingArticleBrief
         from rz_flow.telegram import _build_run_report
 
@@ -393,8 +395,8 @@ class TestBuildRunReport:
             ],
         )
         text = _build_run_report(stats, dry_run=False)
-        assert "<b>У черзі</b>" in text
-        assert "Квота Gemini" in text
+        assert "<b>Pending evaluation</b>" in text
+        assert "Gemini quota exhausted" in text
 
     def test_run_report_remaining_queue_unknown_reason_fallback(self) -> None:
         """Non-empty queue with unknown reason uses generic intro."""
@@ -412,7 +414,7 @@ class TestBuildRunReport:
             ],
         )
         text = _build_run_report(stats, dry_run=False)
-        assert "Не оброблені в цьому прогоні (черга)" in text
+        assert "Not processed in this run:" in text
 
     def test_run_report_remaining_queue_truncates_after_15(self) -> None:
         """More than 15 queued rows: ellipsis line with remaining count."""
@@ -429,8 +431,9 @@ class TestBuildRunReport:
         ]
         stats = PipelineStats(remaining_stop_reason="post_cap", remaining_queued=queued)
         text = _build_run_report(stats, dry_run=False)
-        assert "queued (not started this run): 17" in text
-        assert "… ще 2" in text
+        assert "not evaluated this run: 17" in text
+        assert "… 2 more" in text
+        assert "not_evaluated_this_run=17" in text
 
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────
@@ -631,7 +634,44 @@ class TestSendRunReportRespx:
         assert data["disable_web_page_preview"] is True
 
     @respx.mock
-    async def test_send_run_report_swallows_http_500(self) -> None:
+    async def test_send_run_report_splits_long_html_into_multiple_messages(self) -> None:
+        """Telegram 4096 limit: long admin reports are sent as several sendMessage calls."""
+        import json
+
+        from rz_flow.models import Decision
+        from rz_flow.pipeline import ArticleRunEntry, PipelineStats
+
+        long_reason = "R" * 500
+        long_summary = "S" * 500
+        entries = [
+            ArticleRunEntry(
+                article_id=f"id{i}",
+                title_pl="T" * 80,
+                ua_title="U" * 80,
+                score=5.0,
+                decision=Decision.SKIPPED,
+                source_name="src",
+                article_url="https://example.com/" + "p" * 120,
+                ai_reason=long_reason,
+                ai_ua_summary=long_summary,
+            )
+            for i in range(20)
+        ]
+        stats = PipelineStats(article_log=entries, posted=0, skipped=4, new_articles=4)
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 42}})
+        )
+        publisher = TelegramPublisher(
+            bot_token="fake-token",
+            channel_id="-100channel",
+            admin_chat_id="777admin",
+        )
+        await publisher.send_run_report(stats, dry_run=False)
+
+        assert len(route.calls) >= 2
+        for call in route.calls:
+            payload = json.loads(call.request.content)
+            assert len(payload["text"]) <= 4096
         from rz_flow.pipeline import PipelineStats
 
         respx.post(_tg_url("sendMessage")).mock(return_value=Response(500, text="Error"))

@@ -31,7 +31,7 @@ from tenacity import (
 from rz_flow.models import AIDecision, Article, PublishResult
 
 if TYPE_CHECKING:
-    from rz_flow.pipeline import PipelineStats
+    from rz_flow.pipeline import ArticleRunEntry, PipelineStats
 
 logger = structlog.get_logger(__name__)
 
@@ -185,13 +185,48 @@ def _format_run_report_elapsed(seconds: int) -> str:
     return f"{h}h {m}m {sec}s"
 
 
-def _build_run_report(
+def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
+    """HTML lines for one article row in the admin run report (Telegram HTML)."""
+    if entry.report_icon:
+        icon = entry.report_icon
+    else:
+        decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
+        icon = decision_icons.get(entry.decision.value, "❓")
+    score_str = f"{entry.score:.1f}" if entry.score is not None else "-"
+    title_plain = entry.ua_title or entry.title_pl
+    title_esc = _html_escape(title_plain)
+    url = (entry.article_url or "").strip()
+    if url:
+        href = _html_escape(url)
+        head = f"  {icon} {score_str} · <a href=\"{href}\">{title_esc}</a>"
+    else:
+        head = f"  {icon} {score_str} · {title_esc}"
+    if entry.error_msg:
+        err = _html_escape(entry.error_msg)
+        head += f" (<i>{err}</i>)"
+    out: list[str] = [head]
+    detail_lines: list[str] = []
+    if entry.ai_reason:
+        detail_lines.append(f"<b>AI</b>: {_html_escape(_admin_snippet(entry.ai_reason))}")
+    if entry.ai_ua_summary:
+        detail_lines.append(
+            f"<b>UA summary</b>: {_html_escape(_admin_snippet(entry.ai_ua_summary))}"
+        )
+    if detail_lines:
+        inner = "Details\n" + "\n".join(detail_lines)
+        out.append(f"<blockquote expandable>\n{inner}\n</blockquote>")
+    return out
+
+
+def _collect_run_report_segments(
     stats: "PipelineStats",
     dry_run: bool,
-    report_display_timezone: str | None = None,
-    staging: bool = False,
-) -> str:
-    """Format a concise HTML run-report message for the admin chat."""
+    report_display_timezone: str | None,
+    staging: bool,
+) -> list[str]:
+    """Return report body as segments (join with ``\\n`` = full report; pack for Telegram separately)."""
+    from rz_flow.pipeline import ArticleRunEntry
+
     now_line = format_run_report_clock(datetime.now(UTC), report_display_timezone)
     mode_parts: list[str] = []
     if dry_run:
@@ -205,7 +240,7 @@ def _build_run_report(
     if stats.post_cap_reached:
         flags += " 🔒 CAP"
 
-    lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> - {now_line}"]
+    head_lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> - {now_line}"]
 
     elapsed_fmt = _format_run_report_elapsed(stats.elapsed_s)
     model_raw = (stats.report_gemini_model or "").strip()
@@ -221,15 +256,12 @@ def _build_run_report(
     )
     rq_n = len(stats.remaining_queued)
     if rq_n:
-        meta_inner.append(f"queued (not started this run): {rq_n}")
-    lines.append("<blockquote>" + "\n".join(meta_inner) + "</blockquote>")
+        meta_inner.append(f"not evaluated this run: {rq_n}")
+    head_lines.append("<blockquote>" + "\n".join(meta_inner) + "</blockquote>")
 
-    # Sources section
-    all_source_names = sorted(
-        set(stats.source_scraped) | set(stats.source_new)
-    )
+    all_source_names = sorted(set(stats.source_scraped) | set(stats.source_new))
     if all_source_names:
-        lines.append("<b>Sources</b>")
+        head_lines.append("<b>Sources</b>")
         for name in all_source_names:
             scraped = stats.source_scraped.get(name, 0)
             new = stats.source_new.get(name, 0)
@@ -238,18 +270,16 @@ def _build_run_report(
             if url:
                 safe_href = _html_escape(url)
                 safe_label = _html_escape(name)
-                lines.append(f'  <a href="{safe_href}">{safe_label}</a>{tail}')
+                head_lines.append(f'  <a href="{safe_href}">{safe_label}</a>{tail}')
             else:
-                lines.append(f"  {_html_escape(name)}{tail}")
+                head_lines.append(f"  {_html_escape(name)}{tail}")
 
-    # Articles section — grouped by source (same order as Sources when possible)
+    segments: list[str] = ["\n".join(head_lines)]
+
     log = stats.article_log
     if not log:
-        lines.append(f"<i>No new articles</i> (scraped={stats.total_scraped})")
+        segments.append(f"<i>No new articles</i> (scraped={stats.total_scraped})")
     else:
-        from rz_flow.pipeline import ArticleRunEntry
-
-        lines.append("<b>Articles</b>")
         shown = log[:_MAX_REPORT_ARTICLES]
         by_source: dict[str, list[ArticleRunEntry]] = defaultdict(list)
         for entry in shown:
@@ -264,66 +294,34 @@ def _build_run_report(
             if n not in ordered_sources:
                 ordered_sources.append(n)
 
-        def _article_report_lines(entry: ArticleRunEntry) -> list[str]:
-            if entry.report_icon:
-                icon = entry.report_icon
-            else:
-                decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
-                icon = decision_icons.get(entry.decision.value, "❓")
-            score_str = f"{entry.score:.1f}" if entry.score is not None else "-"
-            title_plain = entry.ua_title or entry.title_pl
-            title_esc = _html_escape(title_plain)
-            url = (entry.article_url or "").strip()
-            if url:
-                href = _html_escape(url)
-                head = f"  {icon} {score_str} · <a href=\"{href}\">{title_esc}</a>"
-            else:
-                head = f"  {icon} {score_str} · {title_esc}"
-            if entry.error_msg:
-                err = _html_escape(entry.error_msg)
-                head += f" (<i>{err}</i>)"
-            out: list[str] = [head]
-            detail_lines: list[str] = []
-            if entry.ai_reason:
-                detail_lines.append(
-                    f"<b>AI</b>: {_html_escape(_admin_snippet(entry.ai_reason))}"
-                )
-            if entry.ai_ua_summary:
-                detail_lines.append(
-                    f"<b>UA summary</b>: {_html_escape(_admin_snippet(entry.ai_ua_summary))}"
-                )
-            if detail_lines:
-                # Collapsed preview shows only "Details"; full AI + UA after expand.
-                inner = "Details\n" + "\n".join(detail_lines)
-                out.append(f"<blockquote expandable>\n{inner}\n</blockquote>")
-            return out
-
+        segments.append("<b>Articles</b>")
         for src in ordered_sources:
             entries = by_source.get(src, [])
             if not entries:
                 continue
-            lines.append(f"<b>{_html_escape(src)}</b>")
+            # One Telegram segment per article so packing never splits mid-<blockquote>.
             for entry in entries:
-                lines.extend(_article_report_lines(entry))
+                body = "\n".join(_article_run_report_lines(entry))
+                segments.append(f"<b>{_html_escape(src)}</b>\n{body}")
         if len(log) > _MAX_REPORT_ARTICLES:
-            lines.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
+            segments.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
 
-    # New articles never started (stopped by post cap or Gemini quota)
     if stats.remaining_queued:
         reason = (stats.remaining_stop_reason or "").strip()
         if reason == "post_cap":
             intro = (
-                "Ліміт постів за прогоном; нижче — новини з черги, які Gemini ще не оцінював у цьому прогоні."
+                "Post limit reached for this run; below are articles Gemini has not "
+                "evaluated in this run."
             )
         elif reason == "quota":
             intro = (
-                "Квота Gemini; нижче — наступні у списку новин, які не стартували в цьому прогоні "
-                "(будуть знову в черзі на наступному)."
+                "Gemini quota exhausted; below are the next articles in the list that did not "
+                "start in this run (they will be retried on the next run)."
             )
         else:
-            intro = "Не оброблені в цьому прогоні (черга):"
-        lines.append("<b>У черзі</b>")
-        lines.append(f"<i>{_html_escape(intro)}</i>")
+            intro = "Not processed in this run:"
+        segments.append("<b>Pending evaluation</b>")
+        segments.append(f"<i>{_html_escape(intro)}</i>")
         shown_rq = stats.remaining_queued[:_MAX_REMAINING_IN_REPORT]
         for b in shown_rq:
             title_esc = _html_escape(b.title_pl)
@@ -331,21 +329,77 @@ def _build_run_report(
             src_bit = f"{_html_escape(b.source_name.strip())} · " if b.source_name.strip() else ""
             if url:
                 href = _html_escape(url)
-                lines.append(f"  ⏳ {src_bit}<a href=\"{href}\">{title_esc}</a>")
+                segments.append(f"  ⏳ {src_bit}<a href=\"{href}\">{title_esc}</a>")
             else:
-                lines.append(f"  ⏳ {src_bit}{title_esc}")
+                segments.append(f"  ⏳ {src_bit}{title_esc}")
         if len(stats.remaining_queued) > _MAX_REMAINING_IN_REPORT:
             more = len(stats.remaining_queued) - _MAX_REMAINING_IN_REPORT
-            lines.append(f"<i>… ще {more}</i>")
+            segments.append(f"<i>… {more} more</i>")
 
-    # Summary (same numbers as funnel; kept for quick scan at end of message)
-    lines.append(
-        f"<b>Summary</b> · posted={stats.posted} · skipped={stats.skipped} · "
-        f"errors={stats.errors}"
-    )
+    summary_bits = [
+        f"posted={stats.posted}",
+        f"skipped={stats.skipped}",
+        f"errors={stats.errors}",
+    ]
+    n_queued = len(stats.remaining_queued)
+    if n_queued:
+        summary_bits.append(f"not_evaluated_this_run={n_queued}")
+    segments.append("<b>Summary</b> · " + " · ".join(summary_bits))
+    return segments
 
-    text = "\n".join(lines)
-    return _truncate_telegram_html(text)
+
+def _pack_run_report_segments_for_telegram(
+    segments: list[str],
+    max_len: int = 4000,
+) -> list[str]:
+    """Split segments into 1+ HTML messages under Telegram's length limit (atomic segments)."""
+    safe = [
+        s if len(s) <= max_len else _truncate_telegram_html(s, max_len=max_len) for s in segments
+    ]
+    chunks: list[str] = []
+    buf: list[str] = []
+    bl = 0
+    part = 1
+
+    def _emit_buf() -> None:
+        nonlocal buf, bl
+        if not buf:
+            return
+        raw = "\n".join(buf)
+        if len(raw) > max_len:
+            raw = _truncate_telegram_html(raw, max_len=max_len)
+        chunks.append(raw)
+        buf = []
+        bl = 0
+
+    for seg in safe:
+        sep = 1 if buf else 0
+        if buf and bl + sep + len(seg) > max_len:
+            _emit_buf()
+            part += 1
+            hdr = f"<b>Rz-Flow</b> <i>(Part {part})</i>\n"
+            room = max(120, max_len - len(hdr))
+            body = seg if len(seg) <= room else _truncate_telegram_html(seg, max_len=room)
+            buf = [hdr + body]
+            bl = len(buf[0])
+        else:
+            if buf:
+                bl += sep
+            buf.append(seg)
+            bl += len(seg)
+    _emit_buf()
+    return chunks
+
+
+def _build_run_report(
+    stats: "PipelineStats",
+    dry_run: bool,
+    report_display_timezone: str | None = None,
+    staging: bool = False,
+) -> str:
+    """Format the full admin run report (single string; tests / previews)."""
+    segments = _collect_run_report_segments(stats, dry_run, report_display_timezone, staging)
+    return "\n".join(segments)
 
 
 class TelegramPublisher:
@@ -480,46 +534,71 @@ class TelegramPublisher:
         """
         target = self._admin_send_target()
         try:
-            text = _build_run_report(
+            segments = _collect_run_report_segments(
                 stats,
                 dry_run,
                 self._report_display_timezone,
                 staging=staging,
             )
-            logger.info("run_report_sending", dry_run=dry_run, staging=staging, target=target)
+            chunks = _pack_run_report_segments_for_telegram(segments)
+            logger.info(
+                "run_report_sending",
+                dry_run=dry_run,
+                staging=staging,
+                target=target,
+                report_chunks=len(chunks),
+            )
+            last_msg_id: int | None = None
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    f"{self._base_url}/sendMessage",
-                    json={
-                        "chat_id": self._alert_chat_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                )
-            try:
-                data: dict = response.json()
-            except ValueError:
-                data = {}
-            if not response.is_success:
-                desc = data.get("description", response.text) if isinstance(data, dict) else response.text
-                logger.error(
-                    "run_report_send_failed",
-                    target=target,
-                    dry_run=dry_run,
-                    http_status=response.status_code,
-                    tg_description=str(desc),
-                )
-                return
-            if not isinstance(data, dict) or not data.get("ok"):
-                logger.error(
-                    "run_report_send_failed",
-                    target=target,
-                    dry_run=dry_run,
-                    tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
-                )
-                return
-            msg_id = data.get("result", {}).get("message_id") if isinstance(data.get("result"), dict) else None
-            logger.info("run_report_sent", dry_run=dry_run, target=target, message_id=msg_id)
+                for i, text in enumerate(chunks):
+                    if i:
+                        await asyncio.sleep(0.35)
+                    response = await client.post(
+                        f"{self._base_url}/sendMessage",
+                        json={
+                            "chat_id": self._alert_chat_id,
+                            "text": text,
+                            "parse_mode": "HTML",
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = {}
+                    if not response.is_success:
+                        desc = (
+                            data.get("description", response.text) if isinstance(data, dict) else response.text
+                        )
+                        logger.error(
+                            "run_report_send_failed",
+                            target=target,
+                            dry_run=dry_run,
+                            chunk_index=i,
+                            http_status=response.status_code,
+                            tg_description=str(desc),
+                        )
+                        return
+                    if not isinstance(data, dict) or not data.get("ok"):
+                        logger.error(
+                            "run_report_send_failed",
+                            target=target,
+                            dry_run=dry_run,
+                            chunk_index=i,
+                            tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
+                        )
+                        return
+                    last_msg_id = (
+                        data.get("result", {}).get("message_id")
+                        if isinstance(data.get("result"), dict)
+                        else None
+                    )
+            logger.info(
+                "run_report_sent",
+                dry_run=dry_run,
+                target=target,
+                message_id=last_msg_id,
+                report_chunks=len(chunks),
+            )
         except Exception as exc:
             logger.error("run_report_send_failed", target=target, dry_run=dry_run, error=str(exc))

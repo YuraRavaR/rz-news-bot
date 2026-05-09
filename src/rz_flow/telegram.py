@@ -43,6 +43,9 @@ _MAX_MESSAGE_LEN = 4096
 # Maximum articles shown in the run report before truncation
 _MAX_REPORT_ARTICLES = 20
 
+# Maximum rows in the "remaining queue" section (post cap / quota tail)
+_MAX_REMAINING_IN_REPORT = 15
+
 # Per-field cap for AI snippets in the admin HTML report (many articles × long text)
 _MAX_ADMIN_AI_SNIPPET = 420
 
@@ -155,6 +158,9 @@ def _build_run_report(
         f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
         f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
     )
+    rq_n = len(stats.remaining_queued)
+    if rq_n:
+        meta_inner.append(f"queued (not started this run): {rq_n}")
     lines.append("<blockquote>" + "\n".join(meta_inner) + "</blockquote>")
 
     # Sources section
@@ -241,6 +247,36 @@ def _build_run_report(
         if len(log) > _MAX_REPORT_ARTICLES:
             lines.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
 
+    # New articles never started (stopped by post cap or Gemini quota)
+    if stats.remaining_queued:
+        reason = (stats.remaining_stop_reason or "").strip()
+        if reason == "post_cap":
+            intro = (
+                "Ліміт постів за прогоном; нижче — новини з черги, які Gemini ще не оцінював у цьому прогоні."
+            )
+        elif reason == "quota":
+            intro = (
+                "Квота Gemini; нижче — наступні у списку новин, які не стартували в цьому прогоні "
+                "(будуть знову в черзі на наступному)."
+            )
+        else:
+            intro = "Не оброблені в цьому прогоні (черга):"
+        lines.append("<b>У черзі</b>")
+        lines.append(f"<i>{_html_escape(intro)}</i>")
+        shown_rq = stats.remaining_queued[:_MAX_REMAINING_IN_REPORT]
+        for b in shown_rq:
+            title_esc = _html_escape(b.title_pl)
+            url = (b.url or "").strip()
+            src_bit = f"{_html_escape(b.source_name.strip())} · " if b.source_name.strip() else ""
+            if url:
+                href = _html_escape(url)
+                lines.append(f"  ⏳ {src_bit}<a href=\"{href}\">{title_esc}</a>")
+            else:
+                lines.append(f"  ⏳ {src_bit}{title_esc}")
+        if len(stats.remaining_queued) > _MAX_REMAINING_IN_REPORT:
+            more = len(stats.remaining_queued) - _MAX_REMAINING_IN_REPORT
+            lines.append(f"<i>… ще {more}</i>")
+
     # Summary (same numbers as funnel; kept for quick scan at end of message)
     lines.append(
         f"<b>Summary</b> · posted={stats.posted} · skipped={stats.skipped} · "
@@ -266,6 +302,7 @@ class TelegramPublisher:
         self._base_url = _TG_API_BASE.format(token=bot_token)
         self._channel_id = channel_id
         # Alerts go to admin_chat_id when set, otherwise fall back to the public channel.
+        self._admin_chat_configured = bool((admin_chat_id or "").strip())
         self._alert_chat_id = admin_chat_id or channel_id
         self._report_display_timezone = report_display_timezone
 
@@ -321,11 +358,17 @@ class TelegramPublisher:
             chat_id=self._channel_id,
         )
 
+    def _admin_send_target(self) -> str:
+        """Log label for where alerts/reports go (no chat IDs)."""
+        return "admin_chat" if self._admin_chat_configured else "channel"
+
     async def send_alert(self, message: str) -> None:
         """Send a plain-text alert to the admin chat (or channel if no admin chat configured)."""
+        target = self._admin_send_target()
         try:
+            logger.info("admin_alert_sending", target=target)
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
+                response = await client.post(
                     f"{self._base_url}/sendMessage",
                     json={
                         "chat_id": self._alert_chat_id,
@@ -333,9 +376,31 @@ class TelegramPublisher:
                         "parse_mode": "HTML",
                     },
                 )
+            try:
+                data: dict = response.json()
+            except ValueError:
+                data = {}
+            if not response.is_success:
+                desc = data.get("description", response.text) if isinstance(data, dict) else response.text
+                logger.error(
+                    "alert_send_failed",
+                    target=target,
+                    http_status=response.status_code,
+                    tg_description=str(desc),
+                )
+                return
+            if not isinstance(data, dict) or not data.get("ok"):
+                logger.error(
+                    "alert_send_failed",
+                    target=target,
+                    tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
+                )
+                return
+            msg_id = data.get("result", {}).get("message_id") if isinstance(data.get("result"), dict) else None
+            logger.info("admin_alert_sent", target=target, message_id=msg_id)
         except Exception as exc:
             # Alert failures should never crash the pipeline
-            logger.error("alert_send_failed", error=str(exc))
+            logger.error("alert_send_failed", target=target, error=str(exc))
 
     async def send_run_report(self, stats: "PipelineStats", dry_run: bool = False) -> None:
         """Send a structured run summary to the admin chat.
@@ -343,10 +408,12 @@ class TelegramPublisher:
         Sent after every pipeline run (success, quota, or partial failure).
         Silently swallows errors so a reporting failure never affects the main run.
         """
+        target = self._admin_send_target()
         try:
             text = _build_run_report(stats, dry_run, self._report_display_timezone)
+            logger.info("run_report_sending", dry_run=dry_run, target=target)
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
+                response = await client.post(
                     f"{self._base_url}/sendMessage",
                     json={
                         "chat_id": self._alert_chat_id,
@@ -355,5 +422,29 @@ class TelegramPublisher:
                         "disable_web_page_preview": True,
                     },
                 )
+            try:
+                data: dict = response.json()
+            except ValueError:
+                data = {}
+            if not response.is_success:
+                desc = data.get("description", response.text) if isinstance(data, dict) else response.text
+                logger.error(
+                    "run_report_send_failed",
+                    target=target,
+                    dry_run=dry_run,
+                    http_status=response.status_code,
+                    tg_description=str(desc),
+                )
+                return
+            if not isinstance(data, dict) or not data.get("ok"):
+                logger.error(
+                    "run_report_send_failed",
+                    target=target,
+                    dry_run=dry_run,
+                    tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
+                )
+                return
+            msg_id = data.get("result", {}).get("message_id") if isinstance(data.get("result"), dict) else None
+            logger.info("run_report_sent", dry_run=dry_run, target=target, message_id=msg_id)
         except Exception as exc:
-            logger.error("run_report_send_failed", error=str(exc))
+            logger.error("run_report_send_failed", target=target, dry_run=dry_run, error=str(exc))

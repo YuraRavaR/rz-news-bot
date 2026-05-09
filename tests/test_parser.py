@@ -202,15 +202,35 @@ class TestParseNajnowszePage:
     def test_unknown_category_url_skipped(self) -> None:
         html = """
         <html><body>
-        <a href="https://rzeszow24.info/sport/match/SPORTARTICLE123456">
+        <a href="https://rzeszow24.info/nieobslugiwana-sekcja/artykul/UNKNOWNCAT12345678">
           <div class="image-tile-overlay">
-            <h3 class="image-tile-overlay__title">Football Match</h3>
+            <h3 class="image-tile-overlay__title">Should Be Skipped</h3>
           </div>
         </a>
         </body></html>
         """
         articles = parse_najnowsze_page(html)
         assert len(articles) == 0
+
+    def test_sport_urls_parsed_as_wiadomosci(self) -> None:
+        """Sport items appear on /najnowsze with /sport/ URLs — must not be dropped."""
+        html = """
+        <html><body>
+        <a href="https://rzeszow24.info/sport/kontrakt/SPORTARTICLE123456">
+          <div class="news-listing-item__wrapper">
+            <p class="news-listing-item__text">
+              <strong>Resovia extends contract</strong>
+              Lead text here.
+            </p>
+          </div>
+        </a>
+        </body></html>
+        """
+        articles = parse_najnowsze_page(html)
+        assert len(articles) == 1
+        assert articles[0].id == "SPORTARTICLE123456"
+        assert articles[0].category == Category.WIADOMOSCI
+        assert articles[0].title_pl == "Resovia extends contract"
 
     def test_sponsored_content_excluded(self) -> None:
         html = """

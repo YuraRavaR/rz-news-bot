@@ -192,6 +192,8 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     else:
         decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
         icon = decision_icons.get(entry.decision.value, "❓")
+        if entry.decision.value == "posted" and entry.posted_to_events:
+            icon = "✅📅"
     score_str = f"{entry.score:.1f}" if entry.score is not None else "-"
     title_plain = entry.ua_title or entry.title_pl
     title_esc = _html_escape(title_plain)
@@ -206,6 +208,9 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
         head += f" (<i>{err}</i>)"
     out: list[str] = [head]
     detail_lines: list[str] = []
+    if entry.decision.value == "posted":
+        channel_label = "новини + події" if entry.posted_to_events else "новини"
+        detail_lines.append(f"<b>Канал</b>: {channel_label}")
     if entry.ai_reason:
         detail_lines.append(f"<b>AI</b>: {_html_escape(_admin_snippet(entry.ai_reason))}")
     if entry.ai_ua_summary:

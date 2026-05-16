@@ -24,6 +24,18 @@ class Settings(BaseSettings):
         default=None,
         description="Optional staging channel ID (used with CLI --staging)",
     )
+    telegram_events_channel_id: str | None = Field(
+        default=None,
+        description=(
+            "Channel ID for the dedicated events channel. "
+            "When set, articles with is_event=True are posted here in addition to the main channel. "
+            "When unset, all posts go only to the main channel."
+        ),
+    )
+    telegram_staging_events_channel_id: str | None = Field(
+        default=None,
+        description="Staging variant of TELEGRAM_EVENTS_CHANNEL_ID (used with CLI --staging)",
+    )
 
     # ── Gemini AI ─────────────────────────────────────────────────────────────
     gemini_api_key: str = Field(..., description="Google AI Studio API key")
@@ -76,6 +88,22 @@ class Settings(BaseSettings):
             msg = "TELEGRAM_STAGING_CHANNEL_ID is required for staging runs"
             raise ValueError(msg)
         return sid
+
+    def events_telegram_chat_id(self, *, staging: bool) -> str | None:
+        """Chat ID for the events channel, or None if not configured.
+
+        In staging mode, prefers TELEGRAM_STAGING_EVENTS_CHANNEL_ID; falls back to
+        the production events channel ID so staging runs still exercise dual-channel
+        logic even without a dedicated staging events channel.
+        Returns None when no events channel is configured at all — callers treat this
+        as "post to main channel only".
+        """
+        if staging:
+            sid = (self.telegram_staging_events_channel_id or "").strip()
+            if sid:
+                return sid
+        prod = (self.telegram_events_channel_id or "").strip()
+        return prod or None
 
     def staging_turso_credentials(self) -> tuple[str, str]:
         """Return (database_url, auth_token) for staging Turso; raises if incomplete."""

@@ -35,6 +35,7 @@ def _make_article(article_id: str = "TESTID123456789") -> Article:
 def _make_decision(ua_title: str = "Фестиваль у Жешові") -> AIDecision:
     return AIDecision(
         is_interesting=True,
+        is_event=True,
         score=8.0,
         category_tag=CategoryTag.FESTIVAL,
         ua_title=ua_title,
@@ -131,6 +132,7 @@ class TestBuildMessage:
         article = _make_article()
         decision = AIDecision(
             is_interesting=True,
+            is_event=True,
             score=8.0,
             category_tag=CategoryTag.CONCERT,
             ua_title="Концерт",
@@ -145,6 +147,7 @@ class TestBuildMessage:
         article = _make_article()
         decision = AIDecision(
             is_interesting=True,
+            is_event=False,
             score=7.5,
             category_tag=CategoryTag.OTHER,
             ua_title="Новина",
@@ -175,6 +178,7 @@ class TestBuildMessage:
         # Override summary to push message well over the limit
         long_decision = AIDecision(
             is_interesting=True,
+            is_event=True,
             score=8.0,
             category_tag=CategoryTag.FESTIVAL,
             ua_title="Т" * 200,

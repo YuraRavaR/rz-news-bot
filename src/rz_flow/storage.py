@@ -21,18 +21,20 @@ from rz_flow.models import AIDecision, Article, Decision, PostRecord
 # ── SQL DDL ───────────────────────────────────────────────────────────────────
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS posts (
-    id              TEXT PRIMARY KEY,
-    url             TEXT NOT NULL,
-    category        TEXT NOT NULL,
-    title_pl        TEXT NOT NULL,
-    seen_at         TEXT NOT NULL,
-    decision        TEXT NOT NULL,
-    ai_score        REAL,
-    ai_reason       TEXT,
-    tg_message_id   INTEGER,
-    ua_title        TEXT,
-    ua_summary      TEXT,
-    category_tag    TEXT
+    id                    TEXT PRIMARY KEY,
+    url                   TEXT NOT NULL,
+    category              TEXT NOT NULL,
+    title_pl              TEXT NOT NULL,
+    seen_at               TEXT NOT NULL,
+    decision              TEXT NOT NULL,
+    ai_score              REAL,
+    ai_reason             TEXT,
+    is_event              INTEGER,
+    tg_message_id         INTEGER,
+    tg_events_message_id  INTEGER,
+    ua_title              TEXT,
+    ua_summary            TEXT,
+    category_tag          TEXT
 );
 """
 
@@ -47,6 +49,8 @@ _SCHEMA_MIGRATIONS = [
     "ALTER TABLE posts ADD COLUMN ua_title TEXT",
     "ALTER TABLE posts ADD COLUMN ua_summary TEXT",
     "ALTER TABLE posts ADD COLUMN category_tag TEXT",
+    "ALTER TABLE posts ADD COLUMN is_event INTEGER",
+    "ALTER TABLE posts ADD COLUMN tg_events_message_id INTEGER",
 ]
 
 # Data migrations — one-time UPDATE statements that backfill existing rows.
@@ -81,6 +85,7 @@ class StorageProtocol(Protocol):
         decision: Decision,
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
+        tg_events_message_id: int | None = None,
     ) -> None:
         """Persist the processing result for one article."""
         ...
@@ -152,15 +157,16 @@ class TursoStorage:
         decision: Decision,
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
+        tg_events_message_id: int | None = None,
     ) -> None:
         client = self._get_client()
         await client.execute(
             """
             INSERT OR REPLACE INTO posts
               (id, url, category, title_pl, seen_at, decision,
-               ai_score, ai_reason, tg_message_id,
+               ai_score, ai_reason, is_event, tg_message_id, tg_events_message_id,
                ua_title, ua_summary, category_tag)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 article.id,
@@ -171,7 +177,9 @@ class TursoStorage:
                 decision.value,
                 ai_decision.score if ai_decision else None,
                 ai_decision.reason if ai_decision else None,
+                int(ai_decision.is_event) if ai_decision else None,
                 tg_message_id,
+                tg_events_message_id,
                 ai_decision.ua_title if ai_decision else None,
                 ai_decision.ua_summary if ai_decision else None,
                 ai_decision.category_tag.value if ai_decision else None,
@@ -203,6 +211,7 @@ class InMemoryStorage:
         decision: Decision,
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
+        tg_events_message_id: int | None = None,
     ) -> None:
         self._records[article.id] = PostRecord(
             id=article.id,
@@ -212,7 +221,9 @@ class InMemoryStorage:
             decision=decision,
             ai_score=ai_decision.score if ai_decision else None,
             ai_reason=ai_decision.reason if ai_decision else None,
+            is_event=ai_decision.is_event if ai_decision else None,
             tg_message_id=tg_message_id,
+            tg_events_message_id=tg_events_message_id,
             ua_title=ai_decision.ua_title if ai_decision else None,
             ua_summary=ai_decision.ua_summary if ai_decision else None,
             category_tag=ai_decision.category_tag.value if ai_decision else None,

@@ -42,9 +42,10 @@ def _make_article(article_id: str, category: Category = Category.IMPREZY) -> Art
     )
 
 
-def _make_interesting_decision(score: float = 8.0) -> AIDecision:
+def _make_interesting_decision(score: float = 8.0, is_event: bool = False) -> AIDecision:
     return AIDecision(
         is_interesting=True,
+        is_event=is_event,
         score=score,
         category_tag=CategoryTag.FESTIVAL,
         ua_title="Фестиваль у Жешові",
@@ -56,6 +57,7 @@ def _make_interesting_decision(score: float = 8.0) -> AIDecision:
 def _make_boring_decision(score: float = 3.0) -> AIDecision:
     return AIDecision(
         is_interesting=False,
+        is_event=False,
         score=score,
         category_tag=CategoryTag.OTHER,
         ua_title="Кримінальна новина",

@@ -31,6 +31,16 @@ from rz_flow.telegram import TelegramPublisher
 logger = structlog.get_logger(__name__)
 
 
+@dataclass(frozen=True)
+class RemainingArticleBrief:
+    """New article not started in this run (queue behind post-cap / quota stop)."""
+
+    article_id: str
+    title_pl: str
+    url: str
+    source_name: str = ""
+
+
 @dataclass
 class ArticleRunEntry:
     """Per-article result collected during the run for admin reporting."""
@@ -65,6 +75,10 @@ class PipelineStats:
     dry_run: bool = False
     quota_exhausted: bool = False  # True if Gemini daily quota was hit
     post_cap_reached: bool = False  # True if max_posts_per_run was hit
+    # New articles never started this run (indices after the stop); empty if none
+    remaining_queued: list[RemainingArticleBrief] = field(default_factory=list)
+    # Why the queue tail was skipped: "" | "post_cap" | "quota"
+    remaining_stop_reason: str = ""
     # Per-source counts for admin reporting
     source_scraped: dict[str, int] = field(default_factory=dict)
     source_new: dict[str, int] = field(default_factory=dict)
@@ -178,6 +192,18 @@ class Pipeline:
             stop_signal = await self._process_article(article, stats, dry_run)
 
             if stop_signal == "quota_exhausted":
+                tail = new_articles[i + 1 :]
+                if tail:
+                    stats.remaining_queued = [
+                        RemainingArticleBrief(
+                            article_id=a.id,
+                            title_pl=a.title_pl,
+                            url=a.url,
+                            source_name=a.source_name,
+                        )
+                        for a in tail
+                    ]
+                    stats.remaining_stop_reason = "quota"
                 log.warning(
                     "quota_exhausted_stopping",
                     processed=i + 1,
@@ -187,6 +213,18 @@ class Pipeline:
                 break
 
             if stop_signal == "cap_reached":
+                tail = new_articles[i + 1 :]
+                if tail:
+                    stats.remaining_queued = [
+                        RemainingArticleBrief(
+                            article_id=a.id,
+                            title_pl=a.title_pl,
+                            url=a.url,
+                            source_name=a.source_name,
+                        )
+                        for a in tail
+                    ]
+                    stats.remaining_stop_reason = "post_cap"
                 log.info(
                     "post_cap_reached",
                     cap=self.flow_config.pipeline.max_posts_per_run,

@@ -69,6 +69,8 @@ async def _async_main(dry_run: bool = False, init_db_only: bool = False) -> int:
         # Send run report to admin chat after every run (only if admin chat is configured)
         if settings.telegram_admin_chat_id:
             await admin.send_run_report(stats, dry_run=dry_run)
+        else:
+            log.info("run_report_skipped", reason="telegram_admin_chat_id_unset")
 
         # Write summary to GitHub Actions step summary (no-op locally)
         quota_flag = " [QUOTA EXHAUSTED]" if stats.quota_exhausted else ""

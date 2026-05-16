@@ -324,6 +324,9 @@ class TestPipelineRunBasic:
         assert len(stats.article_log) == 1
         assert stats.article_log[0].article_id == "QUOTA_ART_1"
         assert stats.article_log[0].report_icon == "⏸"
+        assert len(stats.remaining_queued) == 2
+        assert stats.remaining_stop_reason == "quota"
+        assert {x.article_id for x in stats.remaining_queued} == {"QUOTA_ART_2", "QUOTA_ART_3"}
 
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")
@@ -370,6 +373,8 @@ class TestPipelineRunBasic:
         assert stats.article_log[0].decision == Decision.POSTED
         assert stats.article_log[1].article_id == "QUOTA_ART_2"
         assert stats.article_log[1].report_icon == "⏸"
+        assert stats.remaining_queued == []
+        assert stats.remaining_stop_reason == ""
 
 
 class TestPipelinePostCap:
@@ -404,6 +409,13 @@ class TestPipelinePostCap:
 
         assert stats.posted == 2
         assert stats.post_cap_reached is True
+        assert len(stats.remaining_queued) == 3
+        assert stats.remaining_stop_reason == "post_cap"
+        assert [x.article_id for x in stats.remaining_queued] == [
+            "ART_0002_XYZABCDE",
+            "ART_0003_XYZABCDE",
+            "ART_0004_XYZABCDE",
+        ]
         # Only 2 articles should be published despite 5 being available
         assert mock_tg.publish.call_count == 2
 

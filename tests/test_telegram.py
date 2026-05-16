@@ -290,6 +290,98 @@ class TestBuildRunReport:
         assert "<b>-</b>" in text  # grouped under unknown source when source_name empty
         assert 'href="https://example.com/news/1"' in text
 
+    def test_run_report_includes_remaining_queue(self) -> None:
+        """Admin report lists articles not started (post cap / quota tail)."""
+        from rz_flow.pipeline import PipelineStats, RemainingArticleBrief
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            total_scraped=10,
+            new_articles=5,
+            posted=2,
+            skipped=0,
+            errors=0,
+            post_cap_reached=True,
+            remaining_stop_reason="post_cap",
+            remaining_queued=[
+                RemainingArticleBrief(
+                    article_id="a1",
+                    title_pl="Tytuł A",
+                    url="https://example.com/a1",
+                    source_name="rzeszow24/najnowsze",
+                ),
+                RemainingArticleBrief(
+                    article_id="a2",
+                    title_pl="Tytuł B",
+                    url="",
+                    source_name="",
+                ),
+            ],
+        )
+        text = _build_run_report(stats, dry_run=False)
+        assert "<b>У черзі</b>" in text
+        assert "queued (not started this run): 2" in text
+        assert "Ліміт постів за прогоном" in text
+        assert 'href="https://example.com/a1"' in text
+        assert "rzeszow24/najnowsze" in text
+        assert "Tytuł B" in text
+
+    def test_run_report_remaining_queue_quota_intro(self) -> None:
+        """Admin 'У черзі' block uses quota wording when remaining_stop_reason is quota."""
+        from rz_flow.pipeline import PipelineStats, RemainingArticleBrief
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            remaining_stop_reason="quota",
+            remaining_queued=[
+                RemainingArticleBrief(
+                    article_id="q1",
+                    title_pl="Title Q",
+                    url="https://example.com/q",
+                    source_name="src",
+                )
+            ],
+        )
+        text = _build_run_report(stats, dry_run=False)
+        assert "<b>У черзі</b>" in text
+        assert "Квота Gemini" in text
+
+    def test_run_report_remaining_queue_unknown_reason_fallback(self) -> None:
+        """Non-empty queue with unknown reason uses generic intro."""
+        from rz_flow.pipeline import PipelineStats, RemainingArticleBrief
+        from rz_flow.telegram import _build_run_report
+
+        stats = PipelineStats(
+            remaining_stop_reason="weird",
+            remaining_queued=[
+                RemainingArticleBrief(
+                    article_id="x1",
+                    title_pl="T",
+                    url="https://example.com/x",
+                )
+            ],
+        )
+        text = _build_run_report(stats, dry_run=False)
+        assert "Не оброблені в цьому прогоні (черга)" in text
+
+    def test_run_report_remaining_queue_truncates_after_15(self) -> None:
+        """More than 15 queued rows: ellipsis line with remaining count."""
+        from rz_flow.pipeline import PipelineStats, RemainingArticleBrief
+        from rz_flow.telegram import _build_run_report
+
+        queued = [
+            RemainingArticleBrief(
+                article_id=f"id{i}",
+                title_pl=f"Title {i}",
+                url=f"https://example.com/{i}",
+            )
+            for i in range(17)
+        ]
+        stats = PipelineStats(remaining_stop_reason="post_cap", remaining_queued=queued)
+        text = _build_run_report(stats, dry_run=False)
+        assert "queued (not started this run): 17" in text
+        assert "… ще 2" in text
+
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────
 class TestTelegramPublisher:
@@ -444,3 +536,64 @@ class TestTelegramPublisher:
 
         data = json.loads(route.calls[0].request.content)
         assert data["chat_id"] == "-100channel"
+
+
+class TestSendRunReportRespx:
+    """TelegramPublisher.send_run_report — HTTP handling (no real Telegram)."""
+
+    @respx.mock
+    async def test_send_run_report_posts_to_admin_chat(self) -> None:
+        import json
+
+        from rz_flow.pipeline import PipelineStats
+
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 99}})
+        )
+        publisher = TelegramPublisher(
+            bot_token="fake-token",
+            channel_id="-100channel",
+            admin_chat_id="777admin",
+        )
+        await publisher.send_run_report(PipelineStats(posted=1, skipped=0), dry_run=False)
+
+        assert route.called
+        data = json.loads(route.calls[0].request.content)
+        assert data["chat_id"] == "777admin"
+        assert data["parse_mode"] == "HTML"
+        assert data["disable_web_page_preview"] is True
+
+    @respx.mock
+    async def test_send_run_report_swallows_http_500(self) -> None:
+        from rz_flow.pipeline import PipelineStats
+
+        respx.post(_tg_url("sendMessage")).mock(return_value=Response(500, text="Error"))
+        publisher = TelegramPublisher(
+            bot_token="fake-token",
+            channel_id="-100channel",
+            admin_chat_id="777admin",
+        )
+        await publisher.send_run_report(PipelineStats())
+
+    @respx.mock
+    async def test_send_run_report_swallows_ok_false_with_200(self) -> None:
+        from rz_flow.pipeline import PipelineStats
+
+        respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": False, "description": "Forbidden: bot was blocked"})
+        )
+        publisher = TelegramPublisher(
+            bot_token="fake-token",
+            channel_id="-100channel",
+            admin_chat_id="777admin",
+        )
+        await publisher.send_run_report(PipelineStats())
+
+    @respx.mock
+    async def test_send_alert_swallows_ok_false_with_200(self) -> None:
+        """Telegram can return HTTP 200 with ok:false — alert must not raise."""
+        respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": False, "description": "chat not found"})
+        )
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100channel")
+        await publisher.send_alert("oops")

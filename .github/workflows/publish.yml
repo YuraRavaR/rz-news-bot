@@ -19,6 +19,14 @@ on:
         options:
           - "false"
           - "true"
+      staging:
+        description: "Staging (use staging channel + staging Turso DB)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   # ── Publish (runs on cron and manual dispatch) ───────────────────────────
@@ -47,27 +55,42 @@ jobs:
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_STAGING_DATABASE_URL: ${{ secrets.TURSO_STAGING_DATABASE_URL }}
+          TURSO_STAGING_AUTH_TOKEN: ${{ secrets.TURSO_STAGING_AUTH_TOKEN }}
           # Dummy values for non-DB settings (init-db doesn't use them)
           TELEGRAM_BOT_TOKEN: "dummy"
           TELEGRAM_CHANNEL_ID: "dummy"
           GEMINI_API_KEY: "dummy"
-        run: uv run --no-dev rz-flow --init-db
+        run: |
+          STAGING_FLAG=""
+          if [ "${{ github.event.inputs.staging }}" = "true" ]; then
+            STAGING_FLAG="--staging"
+          fi
+          uv run --no-dev rz-flow --init-db $STAGING_FLAG
 
       - name: Run pipeline
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TELEGRAM_EVENTS_CHANNEL_ID: ${{ secrets.TELEGRAM_EVENTS_CHANNEL_ID }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          TELEGRAM_STAGING_CHANNEL_ID: ${{ secrets.TELEGRAM_STAGING_CHANNEL_ID }}
+          TELEGRAM_STAGING_EVENTS_CHANNEL_ID: ${{ secrets.TELEGRAM_STAGING_EVENTS_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_STAGING_DATABASE_URL: ${{ secrets.TURSO_STAGING_DATABASE_URL }}
+          TURSO_STAGING_AUTH_TOKEN: ${{ secrets.TURSO_STAGING_AUTH_TOKEN }}
         run: |
-          DRY_RUN_FLAG=""
+          FLAGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            DRY_RUN_FLAG="--dry-run"
+            FLAGS="$FLAGS --dry-run"
           fi
-          uv run --no-dev rz-flow $DRY_RUN_FLAG
+          if [ "${{ github.event.inputs.staging }}" = "true" ]; then
+            FLAGS="$FLAGS --staging"
+          fi
+          uv run --no-dev rz-flow $FLAGS
 
       - name: Save run summary
         if: always()
@@ -75,4 +98,5 @@ jobs:
           echo "## Rz-Flow Run Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Dry run**: ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Staging**: ${{ github.event.inputs.staging || 'false' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Time**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

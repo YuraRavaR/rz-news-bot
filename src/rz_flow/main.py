@@ -33,7 +33,7 @@ async def _async_main(
     flow_config = load_flow_config()
     log = structlog.get_logger("main")
 
-    if staging:
+    if staging and not init_db_only:
         missing = settings.staging_config_errors()
         if missing:
             log.error("staging_config_incomplete", missing=missing)

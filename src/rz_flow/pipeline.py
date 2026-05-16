@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 
 import structlog
@@ -29,6 +29,39 @@ from rz_flow.storage import StorageProtocol
 from rz_flow.telegram import TelegramPublisher
 
 logger = structlog.get_logger(__name__)
+
+
+def _order_new_articles_round_robin_oldest_first(articles: list[Article]) -> list[Article]:
+    """Reorder new articles: round-robin across sources, oldest DOM row first per source.
+
+    ``fetch_articles`` concatenates each source in config order (newest-first DOM per
+    source). We reverse each source's slice for oldest-first, then interleave sources
+    so one article from source 1, one from source 2, … until all queues are empty.
+    """
+    if not articles:
+        return []
+    order_keys: list[str] = []
+    by_key: dict[str, list[Article]] = {}
+    for a in articles:
+        key = a.source_name.strip()
+        if key not in by_key:
+            by_key[key] = []
+            order_keys.append(key)
+        by_key[key].append(a)
+    queues: dict[str, deque[Article]] = {
+        k: deque(reversed(v)) for k, v in by_key.items()
+    }
+    out: list[Article] = []
+    while True:
+        took_any = False
+        for key in order_keys:
+            q = queues[key]
+            if q:
+                out.append(q.popleft())
+                took_any = True
+        if not took_any:
+            break
+    return out
 
 
 @dataclass(frozen=True)
@@ -61,6 +94,8 @@ class ArticleRunEntry:
     # Gemini rationale / Ukrainian summary when evaluation ran
     ai_reason: str | None = None
     ai_ua_summary: str | None = None
+    # True when the article was also published to the events channel
+    posted_to_events: bool = False
 
 
 @dataclass
@@ -112,25 +147,43 @@ class Pipeline:
     settings: Settings
     storage: StorageProtocol
     flow_config: FlowConfig
+    use_staging_channel: bool = False
     ai_filter: GeminiAIFilter = field(init=False)
     publisher: TelegramPublisher = field(init=False)
+    # None when TELEGRAM_EVENTS_CHANNEL_ID is not configured — events still post to main channel
+    events_publisher: TelegramPublisher | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.ai_filter = GeminiAIFilter(
             api_key=self.settings.gemini_api_key,
             model=self.settings.gemini_model,
         )
+        publish_id = self.settings.publish_telegram_chat_id(staging=self.use_staging_channel)
         self.publisher = TelegramPublisher(
             bot_token=self.settings.telegram_bot_token,
-            channel_id=self.settings.telegram_channel_id,
+            channel_id=publish_id,
             report_display_timezone=self.flow_config.pipeline.report_display_timezone,
+            mark_channel_posts_staging=self.use_staging_channel,
         )
+        events_id = self.settings.events_telegram_chat_id(staging=self.use_staging_channel)
+        if events_id:
+            self.events_publisher = TelegramPublisher(
+                bot_token=self.settings.telegram_bot_token,
+                channel_id=events_id,
+                report_display_timezone=self.flow_config.pipeline.report_display_timezone,
+                mark_channel_posts_staging=self.use_staging_channel,
+            )
+            logger.info("events_channel_configured", events_channel_id=events_id)
+        else:
+            logger.info("events_channel_not_configured")
 
     async def run(self, dry_run: bool = False) -> PipelineStats:
         """Execute the full pipeline and return statistics.
 
         Args:
-            dry_run: If True, evaluate articles but do NOT publish to Telegram.
+            dry_run: If True, evaluate articles but do NOT publish to Telegram and do NOT
+                persist decisions to Turso. With ``use_staging_channel=True``, still uses
+                staging Turso for ``filter_new_ids`` reads only.
         """
         stats = PipelineStats(dry_run=dry_run)
         stats.report_gemini_model = self.settings.gemini_model
@@ -175,6 +228,7 @@ class Pipeline:
         all_ids = [a.id for a in all_articles]
         new_ids_set = set(await self.storage.filter_new_ids(all_ids))
         new_articles = [a for a in all_articles if a.id in new_ids_set]
+        new_articles = _order_new_articles_round_robin_oldest_first(new_articles)
 
         stats.new_articles = len(new_articles)
         seen_count = stats.total_scraped - stats.new_articles
@@ -258,6 +312,17 @@ class Pipeline:
     ) -> str:
         """Process a single article: AI evaluate → maybe publish → save.
 
+        Routing logic:
+          - is_interesting + is_event + events_publisher configured
+              → post to events channel first, then post to main channel
+          - is_interesting + (not is_event OR events_publisher not configured)
+              → post to main channel only
+          - not is_interesting → skip both channels
+
+        Events channel failure is non-fatal: if the events channel post fails,
+        the error is logged and we still proceed to post on the main channel.
+        Main channel failure IS fatal for the article (marked as ERROR).
+
         Returns a stop-signal string for the caller:
             "continue"        — normal; keep processing remaining articles
             "quota_exhausted" — Gemini daily quota hit; stop immediately (article not saved)
@@ -266,6 +331,8 @@ class Pipeline:
         ai_decision: AIDecision | None = None
         decision = Decision.ERROR
         tg_message_id: int | None = None
+        tg_events_message_id: int | None = None
+        posted_to_events = False
         error_msg: str | None = None
 
         log = logger.bind(article_id=article.id, category=article.category.value)
@@ -278,20 +345,47 @@ class Pipeline:
                 "ai_evaluated",
                 score=ai_decision.score,
                 is_interesting=ai_decision.is_interesting,
+                is_event=ai_decision.is_event,
                 reason=ai_decision.reason,
             )
 
             # Stage 3b: Apply threshold and publish
-            if ai_decision.is_interesting and ai_decision.score >= self.settings.ai_min_score:
+            should_publish = ai_decision.is_interesting and ai_decision.score >= self.settings.ai_min_score
+            route_to_events = should_publish and ai_decision.is_event and self.events_publisher is not None
+
+            if should_publish:
                 if dry_run:
+                    channels = ["events", "main"] if route_to_events else ["main"]
                     log.info(
                         "dry_run_would_publish",
                         score=ai_decision.score,
                         ua_title=ai_decision.ua_title,
+                        channels=channels,
                     )
                     stats.posted += 1
                     decision = Decision.POSTED
+                    posted_to_events = route_to_events
                 else:
+                    # Events channel first — failure is non-fatal
+                    if route_to_events:
+                        assert self.events_publisher is not None  # narrowing for type checker
+                        try:
+                            events_result = await self.events_publisher.publish(article, ai_decision)
+                            tg_events_message_id = events_result.message_id
+                            posted_to_events = True
+                            log.info(
+                                "published_to_events_channel",
+                                tg_events_message_id=tg_events_message_id,
+                            )
+                        except Exception as events_exc:
+                            # Non-fatal: log and continue to publish on the main channel
+                            log.error(
+                                "events_channel_publish_failed",
+                                error=str(events_exc),
+                                article_id=article.id,
+                            )
+
+                    # Main channel — failure IS fatal for the article
                     result = await self.publisher.publish(article, ai_decision)
                     tg_message_id = result.message_id
                     log.info(
@@ -299,6 +393,7 @@ class Pipeline:
                         score=ai_decision.score,
                         tg_message_id=tg_message_id,
                         ua_title=ai_decision.ua_title,
+                        posted_to_events=posted_to_events,
                     )
                     stats.posted += 1
                     decision = Decision.POSTED
@@ -363,6 +458,7 @@ class Pipeline:
                 article_url=article.url,
                 ai_reason=ai_decision.reason if ai_decision else None,
                 ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
+                posted_to_events=posted_to_events,
             )
         )
 
@@ -374,6 +470,7 @@ class Pipeline:
                     decision=decision,
                     ai_decision=ai_decision,
                     tg_message_id=tg_message_id,
+                    tg_events_message_id=tg_events_message_id,
                 )
             except Exception as save_exc:
                 log.error("save_failed", error=str(save_exc))

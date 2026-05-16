@@ -42,6 +42,14 @@ class AIDecision(BaseModel):
     """Structured response from Gemini AI."""
 
     is_interesting: bool
+    is_event: bool = Field(
+        ...,
+        description=(
+            "True if this is a specific upcoming public event "
+            "(concert, festival, exhibition, sports match, fair, cultural/community gathering). "
+            "False for general news, infrastructure, transport, or any non-event content."
+        ),
+    )
     score: float = Field(..., ge=0, le=10, description="Relevance score for Rzeszów residents")
     category_tag: CategoryTag
     ua_title: str = Field(..., description="Ukrainian translation of the title")
@@ -66,7 +74,9 @@ class PostRecord(BaseModel):
     decision: Decision
     ai_score: float | None = None
     ai_reason: str | None = None
+    is_event: bool | None = None
     tg_message_id: int | None = None
+    tg_events_message_id: int | None = None
     ua_title: str | None = None
     ua_summary: str | None = None
     category_tag: str | None = None

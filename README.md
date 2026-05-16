@@ -46,7 +46,7 @@ src/rz_flow/
 ├── telegram.py        — Telegram Bot API publisher
 ├── pipeline.py        — pipeline orchestrator: scrape → filter → AI → publish → save
 ├── logging_config.py  — pretty TTY renderer locally, JSON for CI
-└── main.py            — CLI entry point (--dry-run, --init-db)
+└── main.py            — CLI entry point (--dry-run, --staging, --init-db)
 ```
 
 ---
@@ -82,6 +82,9 @@ cp .env.example .env
 | `GEMINI_MODEL` | e.g. `gemini-2.0-flash` or `gemini-2.0-flash-lite` |
 | `TURSO_DATABASE_URL` | `turso db show rz-flow --url` |
 | `TURSO_AUTH_TOKEN` | `turso db tokens create rz-flow` |
+| `TELEGRAM_STAGING_CHANNEL_ID` | (Optional) Second channel for `uv run rz-flow --staging` |
+| `TURSO_STAGING_DATABASE_URL` | (Optional) Separate DB URL — **required** with staging flag |
+| `TURSO_STAGING_AUTH_TOKEN` | (Optional) Token for staging DB |
 
 ### 3. Create the database
 
@@ -90,13 +93,34 @@ turso db create rz-flow        # one-time
 uv run rz-flow --init-db
 ```
 
+For a **staging** database (used with `--staging` only):
+
+```bash
+turso db create rz-flow-staging
+uv run rz-flow --init-db --staging
+```
+
 ### 4. Dry run (no Telegram publishing)
 
 ```bash
 uv run rz-flow --dry-run
 ```
 
-### 5. Production run
+### 5. Staging channel (preview posts without touching production dedup)
+
+Requires `TELEGRAM_STAGING_CHANNEL_ID`, `TURSO_STAGING_DATABASE_URL`, and `TURSO_STAGING_AUTH_TOKEN` in `.env`.
+
+```bash
+uv run rz-flow --staging
+```
+
+**Staging + dry run:** same staging Turso for reads (which articles are “new”), but nothing is written to the DB and nothing is posted to Telegram — good for a safe rehearsal:
+
+```bash
+uv run rz-flow --staging --dry-run
+```
+
+### 6. Production run
 
 ```bash
 uv run rz-flow

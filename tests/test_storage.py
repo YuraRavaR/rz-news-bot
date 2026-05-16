@@ -21,9 +21,10 @@ def _make_article(article_id: str = "TESTID123456789") -> Article:
     )
 
 
-def _make_ai_decision(score: float = 8.0) -> AIDecision:
+def _make_ai_decision(score: float = 8.0, is_event: bool = True) -> AIDecision:
     return AIDecision(
         is_interesting=True,
+        is_event=is_event,
         score=score,
         category_tag=CategoryTag.FESTIVAL,
         ua_title="Тестова Стаття",

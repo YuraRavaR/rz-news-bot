@@ -26,5 +26,5 @@ sources:
 pipeline:
   inter_ai_delay_seconds: 5.0
   inter_post_delay_seconds: 2.0
-  max_posts_per_run: 5
+  max_posts_per_run: 10
   report_display_timezone: Europe/Warsaw

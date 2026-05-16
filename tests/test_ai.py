@@ -47,6 +47,7 @@ def _make_gemini_response(payload: dict[str, object]) -> MagicMock:
 
 VALID_AI_RESPONSE = {
     "is_interesting": True,
+    "is_event": True,
     "score": 8.5,
     "category_tag": "festyn",
     "ua_title": "Музичний Фестиваль у Жешові 2026",
@@ -56,6 +57,7 @@ VALID_AI_RESPONSE = {
 
 SKIP_AI_RESPONSE = {
     "is_interesting": False,
+    "is_event": False,
     "score": 2.0,
     "category_tag": "inne",
     "ua_title": "Злочинець затриманий поліцією",

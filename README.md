@@ -23,9 +23,12 @@ rzeszow-news.pl ─┘
 1. **Scraper** fetches the latest articles from both news sources using browser-like headers over HTTP/2 — with automatic retry on timeouts
 2. **Parser** extracts structured `Article` objects from raw HTML
 3. **Turso** (SQLite in the cloud) filters out articles already seen in previous runs
-4. **Gemini AI** scores each article (0–10) for relevance to Rzeszów residents, translates the title and body into Ukrainian
-5. Articles scoring **≥ 7** are published to the Telegram channel; the rest are saved as `skipped`
-6. All results (posted / skipped / error) are persisted so articles are never processed twice
+4. **Gemini AI** scores each article (0–10) for relevance to Rzeszów residents, translates the title and summary into Ukrainian, flags whether it's a specific upcoming **event**, and assigns a category tag (concert / festival / sport / transport / other)
+5. Articles scoring **≥ 7** are published to the Telegram channel — with a hashtag derived from the category tag and a link back to the original source (label follows the actual source domain); the rest are saved as `skipped`
+6. Articles flagged as an **event** are additionally cross-posted to a dedicated events channel, if `TELEGRAM_EVENTS_CHANNEL_ID` is configured (failure to post there is non-fatal — the main-channel post still goes out)
+7. Publishing stops early once `max_posts_per_run` is reached, so a backlog never floods the channel in one run — the rest is retried on the next run
+8. All results (posted / skipped / error) are persisted so articles are never processed twice
+9. After every run, a structured admin report (elapsed time, per-source counts, per-article log) is sent to `TELEGRAM_ADMIN_CHAT_ID` if configured
 
 If a source times out, the pipeline continues with the remaining sources. Gemini quota exhaustion is handled gracefully — unprocessed articles are retried on the next run.
 
@@ -78,11 +81,13 @@ cp .env.example .env
 | `TELEGRAM_BOT_TOKEN` | [@BotFather](https://t.me/BotFather) → `/newbot` |
 | `TELEGRAM_CHANNEL_ID` | [@userinfobot](https://t.me/userinfobot) or `/getUpdates` |
 | `TELEGRAM_ADMIN_CHAT_ID` | Your personal chat ID (optional — enables per-run admin reports) |
+| `TELEGRAM_EVENTS_CHANNEL_ID` | (Optional) Dedicated channel for event articles (concerts, festivals, etc.) — when set, `is_event` articles are cross-posted here **in addition to** the main channel |
 | `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `GEMINI_MODEL` | e.g. `gemini-2.0-flash` or `gemini-2.0-flash-lite` |
 | `TURSO_DATABASE_URL` | `turso db show rz-flow --url` |
 | `TURSO_AUTH_TOKEN` | `turso db tokens create rz-flow` |
 | `TELEGRAM_STAGING_CHANNEL_ID` | (Optional) Second channel for `uv run rz-flow --staging` |
+| `TELEGRAM_STAGING_EVENTS_CHANNEL_ID` | (Optional) Staging variant of `TELEGRAM_EVENTS_CHANNEL_ID`; falls back to the production events channel if unset |
 | `TURSO_STAGING_DATABASE_URL` | (Optional) Separate DB URL — **required** with staging flag |
 | `TURSO_STAGING_AUTH_TOKEN` | (Optional) Token for staging DB |
 
@@ -159,7 +164,7 @@ Environment variables:
 |---|---|---|
 | `AI_MIN_SCORE` | `7` | Minimum Gemini score (0–10) to publish |
 | `SCRAPER_TIMEOUT` | `15` | HTTP timeout per source (seconds) |
-| `APP_ENV` | `production` | Set to `development` to disable real publishing |
+| `APP_ENV` | `production` | Set to `development` to suppress crash/quota Telegram alerts (used for local runs); use CLI `--dry-run` to skip real publishing |
 
 ---
 
@@ -183,7 +188,7 @@ uv run mypy src/rz_flow/
 
 ## CI/CD (GitHub Actions)
 
-The workflow (`.github/workflows/publish.yml`) runs automatically on the schedule and can be triggered manually with an optional `dry_run` flag.
+The workflow (`.github/workflows/publish.yml`) runs automatically on the schedule and can be triggered manually with optional `dry_run` and `staging` flags (`workflow_dispatch` inputs).
 
 **Required GitHub Secrets** (`Settings → Secrets and variables → Actions`):
 

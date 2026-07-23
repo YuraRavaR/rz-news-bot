@@ -197,10 +197,15 @@ The workflow (`.github/workflows/publish.yml`) runs automatically on the schedul
 | `TELEGRAM_BOT_TOKEN` | Bot token |
 | `TELEGRAM_CHANNEL_ID` | Target channel ID |
 | `TELEGRAM_ADMIN_CHAT_ID` | Admin chat ID for run reports (optional) |
+| `TELEGRAM_EVENTS_CHANNEL_ID` | Dedicated events channel ID (optional) |
 | `GEMINI_API_KEY` | Google AI Studio key |
 | `GEMINI_MODEL` | Model name (optional, falls back to `gemini-2.0-flash`) |
 | `TURSO_DATABASE_URL` | Turso database URL |
 | `TURSO_AUTH_TOKEN` | Turso auth token |
+| `TELEGRAM_STAGING_CHANNEL_ID` | Staging channel ID — required only for the manual `staging: true` dispatch input |
+| `TELEGRAM_STAGING_EVENTS_CHANNEL_ID` | Staging events channel ID (optional) |
+| `TURSO_STAGING_DATABASE_URL` | Staging Turso DB URL — required only for `staging: true` |
+| `TURSO_STAGING_AUTH_TOKEN` | Staging Turso auth token — required only for `staging: true` |
 
 ---
 

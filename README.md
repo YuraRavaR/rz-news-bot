@@ -153,8 +153,11 @@ pipeline:
   inter_ai_delay_seconds: 5.0     # pause between Gemini calls (free tier: 15 RPM)
   inter_post_delay_seconds: 2.0   # pause after each Telegram post
   max_posts_per_run: 5            # cap successful posts per run
+  max_error_attempts: 3           # retries across runs before an article is dropped
   report_display_timezone: Europe/Warsaw   # optional IANA name; omit or null → UTC in report header
 ```
+
+`max_error_attempts` guards against a transient failure (network blip, malformed AI response) permanently retiring an article: a failed article stays in the queue and is retried on later runs until the budget is spent. Set it to `1` to never retry.
 
 `report_display_timezone` must be a valid IANA zone if set (same validation as at startup). GitHub Actions uses the same committed file, so CI and local runs stay aligned without extra env vars.
 
@@ -184,11 +187,33 @@ uv run ruff format src/ tests/
 uv run mypy src/rz_flow/
 ```
 
+Install the pre-commit hooks once so lint and type errors are caught before they reach CI:
+
+```bash
+uv run pre-commit install
+```
+
+### Canary tests
+
+Parser tests run against HTML fixtures, which stay green even after a source site changes its markup. The `live` tests hit the real sites to catch that drift. They are excluded from `pytest` by default and run on a daily schedule:
+
+```bash
+uv run pytest -m live --no-cov
+```
+
+A failure means the parser needs updating — refresh the fixtures in `tests/fixtures/` as part of the fix.
+
 ---
 
 ## CI/CD (GitHub Actions)
 
-The workflow (`.github/workflows/publish.yml`) runs automatically on the schedule and can be triggered manually with optional `dry_run` and `staging` flags (`workflow_dispatch` inputs).
+| Workflow | Trigger | Purpose |
+|---|---|---|
+| `ci.yml` | push (non-`main`), PR | ruff, mypy, pytest on Python 3.12 |
+| `publish.yml` | schedule + manual | The actual bot run |
+| `canary.yml` | daily + manual | Live scrape of both sources |
+
+`publish.yml` can be triggered manually with optional `dry_run` and `staging` flags (`workflow_dispatch` inputs).
 
 **Required GitHub Secrets** (`Settings → Secrets and variables → Actions`):
 

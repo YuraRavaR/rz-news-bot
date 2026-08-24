@@ -39,12 +39,18 @@ dev = [
     "ruff>=0.11",
     "pre-commit>=4.2",
     "types-beautifulsoup4>=4.12",
+    "types-pyyaml>=6.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--cov=src/rz_flow --cov-report=term-missing --cov-report=xml"
+# Canary tests hit the real news sites, so they are excluded by default and run on a
+# schedule instead (see .github/workflows/canary.yml). Run them with: pytest -m live
+addopts = "--cov=src/rz_flow --cov-report=term-missing --cov-report=xml -m 'not live'"
+markers = [
+    "live: hits real news sites over the network (deselected by default)",
+]
 filterwarnings = [
     # Third-party deprecations we don't control
     "ignore::DeprecationWarning:google.genai",
@@ -56,6 +62,11 @@ strict = true
 python_version = "3.12"
 files = ["src/rz_flow"]
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# libsql-client ships no py.typed marker; TursoStorage wraps it behind StorageProtocol.
+module = ["libsql_client.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100

@@ -3,6 +3,10 @@ name: Rz-Flow Publish
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# The bot only reads its own source and talks to external APIs.
+permissions:
+  contents: read
+
 on:
   # Every ~3h at :23 UTC (not :00 — less queue contention per GitHub schedule docs)
   schedule:
@@ -33,6 +37,9 @@ jobs:
   publish:
     name: Publish to Telegram
     runs-on: ubuntu-latest
+    # A healthy run takes 2-4 minutes. Without this the GitHub default is 6 hours,
+    # so one hung request could burn a large slice of the monthly Actions budget.
+    timeout-minutes: 25
 
     steps:
       - name: Checkout

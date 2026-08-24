@@ -63,6 +63,14 @@ class Decision(StrEnum):
     ERROR = "error"
 
 
+class StopSignal(StrEnum):
+    """Why the per-article loop should stop (or not) after processing one article."""
+
+    CONTINUE = "continue"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    CAP_REACHED = "cap_reached"
+
+
 class PostRecord(BaseModel):
     """Record stored in Turso after processing an article."""
 
@@ -80,6 +88,10 @@ class PostRecord(BaseModel):
     ua_title: str | None = None
     ua_summary: str | None = None
     category_tag: str | None = None
+    error_attempts: int = Field(
+        default=0,
+        description="Consecutive failed processing attempts; reset to 0 on success",
+    )
 
 
 class PublishResult(BaseModel):

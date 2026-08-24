@@ -6,11 +6,10 @@ import pytest
 import structlog
 
 from rz_flow.logging_config import (
-    _PrettyRenderer,
     _drop_ai_evaluated,
+    _PrettyRenderer,
     configure_logging,
 )
-
 
 # ── configure_logging smoke tests ─────────────────────────────────────────────
 
@@ -123,7 +122,11 @@ class TestPrettyRenderer:
 
     def test_pipeline_started_lists_source_names(self) -> None:
         sources = [
-            {"name": "rzeszow24/najnowsze", "base_url": "https://rzeszow24.info/najnowsze", "max_articles": 5}
+            {
+                "name": "rzeszow24/najnowsze",
+                "base_url": "https://rzeszow24.info/najnowsze",
+                "max_articles": 5,
+            }
         ]
         result = self._call("pipeline_started", sources=sources, model="m", min_score=7)
         assert "rzeszow24/najnowsze" in result

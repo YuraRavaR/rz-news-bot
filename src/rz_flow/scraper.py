@@ -14,7 +14,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig
 from rz_flow.models import Article
-from rz_flow.sources import get_active_sources
+from rz_flow.sources import ScraperSource, get_active_sources
 
 logger = structlog.get_logger(__name__)
 
@@ -49,13 +49,12 @@ _HEADERS = {
     reraise=True,
 )
 async def _fetch_one(
-    source: object,
+    source: ScraperSource,
     client: httpx.AsyncClient,
     max_articles: int,
 ) -> list[Article]:
     """Thin wrapper around source.fetch that tenacity can decorate."""
-    fetch = getattr(source, "fetch")
-    return await fetch(client, max_articles)  # type: ignore[no-any-return]
+    return await source.fetch(client, max_articles)
 
 
 async def fetch_articles(
@@ -89,7 +88,7 @@ async def fetch_articles(
         headers=_HEADERS,
         http2=True,  # Chrome uses HTTP/2 — helps bypass some WAFs
     ) as client:
-        for source, src_cfg in zip(sources, enabled):
+        for source, src_cfg in zip(sources, enabled, strict=True):
             log = logger.bind(name=source.name)
             log.info("scrape_source_start", url=source.url)
             try:

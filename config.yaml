@@ -10,6 +10,10 @@
 #   inter_ai_delay_seconds   - pause between consecutive Gemini API calls
 #                              (free tier: 15 RPM = 4 s minimum; 5 s recommended)
 #   inter_post_delay_seconds - extra pause after each successful Telegram post
+#   max_posts_per_run        - stop publishing after this many posts (rest waits for
+#                              the next run, so a backlog never floods the channel)
+#   max_error_attempts       - how many runs may fail on one article before it is
+#                              retired for good (1 = never retry)
 #   report_display_timezone  - optional IANA zone for admin run-report clock (omit = UTC)
 
 sources:
@@ -27,4 +31,5 @@ pipeline:
   inter_ai_delay_seconds: 5.0
   inter_post_delay_seconds: 2.0
   max_posts_per_run: 10
+  max_error_attempts: 3
   report_display_timezone: Europe/Warsaw

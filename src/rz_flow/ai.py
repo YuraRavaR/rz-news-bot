@@ -196,7 +196,7 @@ def _build_response_schema() -> dict[str, object]:
 class GeminiAIFilter:
     """Wraps the Gemini API client with retry and structured output."""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, api_key: str, model: str = "gemini-3.5-flash-lite") -> None:
         self._client = genai.Client(api_key=api_key)
         self._model = model
         self._schema = _build_response_schema()

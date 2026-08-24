@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.genai import errors as genai_errors
 
-from rz_flow.ai import GeminiQuotaExhaustedError
+from rz_flow.ai import GeminiQuotaExhaustedError, GeminiResponseIncompleteError
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
@@ -631,6 +631,302 @@ class TestPipelineStagingChannel:
         )
         assert p.publisher._channel_id == "-100111"
         assert p.publisher._mark_channel_posts_staging is False
+
+
+class TestTransientErrorRetrySemantics:
+    """A one-off failure must not retire an article; a persistent one eventually must.
+
+    Before this, any exception outside the quota/503 paths was written as ERROR and
+    filter_new_ids excluded it forever — a single network blip dropped the article.
+    """
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_errored_article_is_retried_on_the_next_run(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        article = _make_article("FLAKY_ARTICLE_123")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        # First run blows up, second run succeeds.
+        mock_ai.evaluate = AsyncMock(
+            side_effect=[RuntimeError("transient network blip"), _make_interesting_decision()]
+        )
+
+        mock_tg = MagicMock()
+        mock_tg_cls.return_value = mock_tg
+        publish_result = MagicMock()
+        publish_result.message_id = 99
+        mock_tg.publish = AsyncMock(return_value=publish_result)
+
+        pipeline = _build_pipeline(storage)
+
+        first = await pipeline.run()
+        assert first.errors == 1
+        assert first.posted == 0
+
+        second = await pipeline.run()
+        assert second.new_articles == 1, "errored article should be offered again"
+        assert second.posted == 1
+
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.decision == Decision.POSTED
+        assert record.error_attempts == 0
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_article_is_retired_after_budget_is_spent(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        storage = InMemoryStorage(max_error_attempts=3)
+        article = _make_article("ALWAYS_BROKEN_123")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(side_effect=RuntimeError("permanently broken"))
+
+        pipeline = _build_pipeline(storage)
+
+        for _ in range(3):
+            assert (await pipeline.run()).new_articles == 1
+
+        assert (await pipeline.run()).new_articles == 0
+        assert mock_ai.evaluate.await_count == 3
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_truncated_gemini_response_is_not_persisted(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        """Hitting the token ceiling is our problem, not the article's."""
+        article = _make_article("TRUNCATED_123456")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(
+            side_effect=GeminiResponseIncompleteError("hit max_output_tokens")
+        )
+
+        pipeline = _build_pipeline(storage)
+        stats = await pipeline.run()
+
+        assert stats.errors == 0
+        assert storage.count() == 0, "must stay unsaved so the next run retries it"
+        assert stats.article_log[0].report_icon == "✂️"
+
+
+class TestSaveFailureHandling:
+    """A lost write after a successful post means the next run posts a duplicate."""
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_save_is_retried_before_giving_up(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        article = _make_article("SAVE_RETRY_12345")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(return_value=_make_interesting_decision())
+
+        mock_tg = MagicMock()
+        mock_tg_cls.return_value = mock_tg
+        publish_result = MagicMock()
+        publish_result.message_id = 99
+        mock_tg.publish = AsyncMock(return_value=publish_result)
+
+        storage = InMemoryStorage()
+        real_save = storage.save_decision
+        calls = {"n": 0}
+
+        async def flaky_save(*args: object, **kwargs: object) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("turso unreachable")
+            await real_save(*args, **kwargs)  # type: ignore[arg-type]
+
+        storage.save_decision = flaky_save  # type: ignore[method-assign]
+
+        pipeline = _build_pipeline(storage)
+        with patch("rz_flow.pipeline._SAVE_RETRY_DELAY_S", 0.0):
+            stats = await pipeline.run()
+
+        assert calls["n"] == 2
+        assert storage.get_record(article.id) is not None
+        assert stats.alerts == []
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_permanent_save_failure_after_post_raises_duplicate_alert(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+    ) -> None:
+        article = _make_article("SAVE_DEAD_123456")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(return_value=_make_interesting_decision())
+
+        mock_tg = MagicMock()
+        mock_tg_cls.return_value = mock_tg
+        publish_result = MagicMock()
+        publish_result.message_id = 99
+        mock_tg.publish = AsyncMock(return_value=publish_result)
+
+        storage = InMemoryStorage()
+        storage.save_decision = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ConnectionError("turso down")
+        )
+
+        pipeline = _build_pipeline(storage)
+        with patch("rz_flow.pipeline._SAVE_RETRY_DELAY_S", 0.0):
+            stats = await pipeline.run()
+
+        assert stats.posted == 1
+        assert len(stats.alerts) == 1
+        assert "повторно" in stats.alerts[0]
+        assert article.url in stats.alerts[0]
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_dry_run_never_touches_storage(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        article = _make_article("DRY_NO_SAVE_1234")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(return_value=_make_interesting_decision())
+
+        pipeline = _build_pipeline(storage)
+        stats = await pipeline.run(dry_run=True)
+
+        assert stats.posted == 1
+        assert storage.count() == 0
+        assert stats.alerts == []
+
+
+class TestSourceHealthAlerts:
+    """A layout change makes the parser return [] — indistinguishable from a quiet day."""
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    async def test_alerts_when_source_returns_nothing(
+        self,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        mock_fetch.return_value = ([], {"rzeszow24/najnowsze": 0})
+
+        pipeline = _build_pipeline(storage)
+        stats = await pipeline.run()
+
+        assert len(stats.alerts) == 1
+        assert "rzeszow24/najnowsze" in stats.alerts[0]
+        assert "https://rzeszow24.info/najnowsze" in stats.alerts[0]
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_no_alert_when_source_is_healthy(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        article = _make_article("HEALTHY_12345678")
+        mock_fetch.return_value = ([article], {"rzeszow24/najnowsze": 1})
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(return_value=_make_boring_decision())
+
+        pipeline = _build_pipeline(storage)
+        stats = await pipeline.run()
+
+        assert stats.alerts == []
+
+    @patch("rz_flow.pipeline.fetch_articles")
+    @patch("rz_flow.pipeline.GeminiAIFilter")
+    @patch("rz_flow.pipeline.TelegramPublisher")
+    async def test_alert_fires_even_when_other_sources_work(
+        self,
+        mock_tg_cls: MagicMock,
+        mock_ai_cls: MagicMock,
+        mock_fetch: MagicMock,
+        storage: InMemoryStorage,
+    ) -> None:
+        article = _make_article("ONE_GOOD_1234567")
+        article = article.model_copy(update={"source_name": "rzeszow-news.pl"})
+        mock_fetch.return_value = (
+            [article],
+            {"rzeszow24/najnowsze": 0, "rzeszow-news.pl": 1},
+        )
+
+        mock_ai = MagicMock()
+        mock_ai_cls.return_value = mock_ai
+        mock_ai.evaluate = AsyncMock(return_value=_make_boring_decision())
+
+        pipeline = Pipeline(
+            settings=_make_settings(),
+            storage=storage,
+            flow_config=FlowConfig(
+                sources=[
+                    SourceConfig(
+                        scraper="NajnowszeScraper",
+                        base_url="https://rzeszow24.info/najnowsze",
+                        max_articles=5,
+                    ),
+                    SourceConfig(
+                        scraper="RzeszowNewsScraper",
+                        base_url="https://rzeszow-news.pl",
+                        max_articles=5,
+                    ),
+                ],
+                pipeline=PipelineConfig(
+                    inter_ai_delay_seconds=0.0, inter_post_delay_seconds=0.0
+                ),
+            ),
+        )
+        stats = await pipeline.run()
+
+        assert len(stats.alerts) == 1
+        assert "rzeszow24/najnowsze" in stats.alerts[0]
+        assert "rzeszow-news.pl" not in stats.alerts[0]
 
 
 class TestPipelineStats:

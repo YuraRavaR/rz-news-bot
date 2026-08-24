@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import MutableMapping
 from typing import Any
 from urllib.parse import urlparse
 
 import structlog
+from structlog.typing import EventDict, WrappedLogger
 
 # ── ANSI colour helpers ────────────────────────────────────────────────────────
 _R = "\033[0m"
@@ -32,7 +34,9 @@ _GREEN = "\033[32m"
 _CYAN = "\033[36m"
 
 
-def _drop_ai_evaluated(logger: object, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+def _drop_ai_evaluated(
+    logger: WrappedLogger, method: str, event_dict: EventDict
+) -> EventDict:
     """Drop ai_evaluated — its data surfaces in the published/skipped line."""
     if event_dict.get("event") == "ai_evaluated":
         raise structlog.DropEvent()
@@ -46,7 +50,7 @@ class _PrettyRenderer:
     Warn/error   → full context + traceback attached below.
     """
 
-    def __call__(self, logger: object, method: str, event_dict: dict[str, Any]) -> str:
+    def __call__(self, logger: WrappedLogger, method: str, event_dict: EventDict) -> str:
         level = event_dict.pop("level", "info")
         ts = event_dict.pop("timestamp", "")
         event = event_dict.pop("event", "?")
@@ -72,7 +76,9 @@ class _PrettyRenderer:
 
         return line
 
-    def _format(self, event: str, ctx: dict[str, Any], level: str) -> str:  # noqa: C901 PLR0911
+    def _format(  # noqa: C901 PLR0911
+        self, event: str, ctx: MutableMapping[str, Any], level: str
+    ) -> str:
         match event:
             case "pipeline_started":
                 sources = ctx.get("sources", [])

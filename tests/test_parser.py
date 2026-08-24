@@ -441,7 +441,7 @@ class TestParserEdgeCases:
         assert len(articles) == 0
 
     def test_najnowsze_uses_mobile_title_fallback(self) -> None:
-        """When h3.image-tile-overlay__title is absent, falls back to .image-tile-overlay-mobile p."""
+        """Falls back to .image-tile-overlay-mobile p when the h3 title is absent."""
         html = """
         <html><body>
         <a href="https://rzeszow24.info/imprezy/event/MOBILEID1234567890">

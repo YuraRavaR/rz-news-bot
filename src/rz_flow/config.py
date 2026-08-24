@@ -27,8 +27,8 @@ class Settings(BaseSettings):
     telegram_events_channel_id: str | None = Field(
         default=None,
         description=(
-            "Channel ID for the dedicated events channel. "
-            "When set, articles with is_event=True are posted here in addition to the main channel. "
+            "Channel ID for the dedicated events channel. When set, articles with "
+            "is_event=True are posted here in addition to the main channel. "
             "When unset, all posts go only to the main channel."
         ),
     )

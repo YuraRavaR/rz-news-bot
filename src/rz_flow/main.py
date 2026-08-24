@@ -4,7 +4,7 @@ Usage:
     uv run rz-flow               # normal production run
     uv run rz-flow --dry-run     # evaluate but don't publish (prod Turso)
     uv run rz-flow --staging     # publish to staging channel + staging Turso DB
-    uv run rz-flow --staging --dry-run   # full run against staging DB, no writes / no Telegram posts
+    uv run rz-flow --staging --dry-run   # staging DB reads only, no writes / no posts
     uv run rz-flow --init-db     # create DB tables and exit
     uv run rz-flow --init-db --staging   # init staging DB only
 """
@@ -44,7 +44,11 @@ async def _async_main(
     else:
         db_url, db_token = settings.turso_database_url, settings.turso_auth_token
 
-    storage = create_storage(database_url=db_url, auth_token=db_token)
+    storage = create_storage(
+        database_url=db_url,
+        auth_token=db_token,
+        max_error_attempts=flow_config.pipeline.max_error_attempts,
+    )
 
     try:
         await storage.init()
@@ -89,8 +93,12 @@ async def _async_main(
 
         # Send run report to admin chat after every run (only if admin chat is configured)
         if settings.telegram_admin_chat_id:
+            for alert in stats.alerts:
+                await admin.send_alert(alert)
             await admin.send_run_report(stats, dry_run=dry_run, staging=staging)
         else:
+            if stats.alerts:
+                log.warning("pipeline_alerts", alerts=stats.alerts)
             log.info("run_report_skipped", reason="telegram_admin_chat_id_unset")
 
         # Write summary to GitHub Actions step summary (no-op locally)

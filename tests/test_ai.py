@@ -9,17 +9,25 @@ to patch the client. This ensures:
 """
 
 import json
+from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from google.genai import errors as genai_errors
+from google.genai import types
+from tenacity import RetryCallState
 
 from rz_flow.ai import (
     GeminiAIFilter,
     GeminiQuotaExhaustedError,
     GeminiRateLimitError,
+    GeminiResponseIncompleteError,
+    _build_response_schema,
+    _build_system_prompt,
     _classify_gemini_error,
+    _gemini_retry_wait,
     _is_daily_quota_exhausted,
+    _is_truncated,
     _parse_retry_after,
 )
 from rz_flow.models import Article, Category, CategoryTag
@@ -146,10 +154,9 @@ class TestGeminiAIFilterEvaluate:
         contents_arg = call_kwargs.kwargs.get("contents") or call_kwargs.args[1]
         assert article.title_pl in contents_arg
 
-    @patch("rz_flow.ai.asyncio.sleep", new_callable=AsyncMock)
     @patch("rz_flow.ai.genai.Client")
     async def test_retries_on_per_minute_rate_limit(
-        self, mock_client_cls: MagicMock, mock_sleep: AsyncMock
+        self, mock_client_cls: MagicMock
     ) -> None:
         """GeminiRateLimitError (per-minute 429) is retried automatically."""
         mock_client = MagicMock()
@@ -170,14 +177,10 @@ class TestGeminiAIFilterEvaluate:
         assert decision.is_interesting is True
         # Should have been called twice (first fail → retry → success)
         assert mock_client.aio.models.generate_content.call_count == 2
-        # Our code slept for exactly the retryDelay from the error (10s).
-        # tenacity may add its own sleep on top — we only verify ours was called.
-        mock_sleep.assert_any_call(10.0)
 
-    @patch("rz_flow.ai.asyncio.sleep", new_callable=AsyncMock)
     @patch("rz_flow.ai.genai.Client")
     async def test_raises_quota_exhausted_for_daily_limit(
-        self, mock_client_cls: MagicMock, mock_sleep: AsyncMock
+        self, mock_client_cls: MagicMock
     ) -> None:
         """Daily quota exhaustion raises GeminiQuotaExhaustedError — NOT retried."""
         mock_client = MagicMock()
@@ -207,10 +210,9 @@ class TestGeminiAIFilterEvaluate:
         # Must NOT retry — only one API call attempt
         assert mock_client.aio.models.generate_content.call_count == 1
 
-    @patch("rz_flow.ai.asyncio.sleep", new_callable=AsyncMock)
     @patch("rz_flow.ai.genai.Client")
     async def test_raises_after_max_retries_on_rate_limit(
-        self, mock_client_cls: MagicMock, _mock_sleep: AsyncMock
+        self, mock_client_cls: MagicMock
     ) -> None:
         """After 3 per-minute rate limit attempts, GeminiRateLimitError is re-raised."""
         mock_client = MagicMock()
@@ -327,7 +329,11 @@ class TestGeminiHelpers:
                 "error": {
                     "code": 429,
                     "details": [
-                        {"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}
+                        {
+                            "violations": [
+                                {"quotaId": "GenerateRequestsPerDayPerProjectPerModel"}
+                            ]
+                        }
                     ],
                 }
             },
@@ -347,3 +353,126 @@ class TestGeminiHelpers:
         err = genai_errors.ClientError(400, {"error": {"code": 400, "message": "bad request"}})
         result = _classify_gemini_error(err)
         assert result is err
+
+
+class TestGeminiRetryWait:
+    """Waiting is tenacity's job now — evaluate() no longer sleeps on its own."""
+
+    @staticmethod
+    def _state(exc: Exception | None, attempt: int = 1) -> RetryCallState:
+        state = RetryCallState(retry_object=None, fn=None, args=(), kwargs={})
+        state.attempt_number = attempt
+        outcome: Future = Future()
+        if exc is not None:
+            outcome.set_exception(exc)
+        else:
+            outcome.set_result(None)
+        state.outcome = outcome
+        return state
+
+    def test_honours_gemini_retry_delay(self) -> None:
+        wait = _gemini_retry_wait(self._state(GeminiRateLimitError("429", retry_after=45.0)))
+        assert wait == 45.0
+
+    def test_caps_absurd_retry_delay(self) -> None:
+        wait = _gemini_retry_wait(self._state(GeminiRateLimitError("429", retry_after=9999.0)))
+        assert wait <= 60.0
+
+    def test_never_waits_less_than_exponential_floor(self) -> None:
+        """A tiny retryDelay must not defeat backoff on repeated failures."""
+        wait = _gemini_retry_wait(self._state(GeminiRateLimitError("429", retry_after=0.1)))
+        assert wait >= 5.0
+
+    def test_falls_back_to_exponential_for_other_errors(self) -> None:
+        wait = _gemini_retry_wait(self._state(RuntimeError("503")))
+        assert 0 < wait <= 60.0
+
+
+class TestTruncationDetection:
+    """A response cut off at the token ceiling yields unparseable JSON."""
+
+    def _response(self, finish_reason: object) -> MagicMock:
+        candidate = MagicMock()
+        candidate.finish_reason = finish_reason
+        response = MagicMock()
+        response.candidates = [candidate]
+        return response
+
+    def test_detects_max_tokens_enum(self) -> None:
+        assert _is_truncated(self._response(types.FinishReason.MAX_TOKENS)) is True
+
+    def test_detects_max_tokens_string(self) -> None:
+        assert _is_truncated(self._response("MAX_TOKENS")) is True
+
+    def test_normal_stop_is_not_truncated(self) -> None:
+        assert _is_truncated(self._response(types.FinishReason.STOP)) is False
+
+    def test_missing_candidates_is_not_truncated(self) -> None:
+        response = MagicMock()
+        response.candidates = None
+        assert _is_truncated(response) is False
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_evaluate_raises_incomplete_on_truncation(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        truncated = self._response(types.FinishReason.MAX_TOKENS)
+        truncated.text = '{"is_interesting": true, "ua_ti'
+        mock_client.aio.models.generate_content = AsyncMock(return_value=truncated)
+
+        ai = GeminiAIFilter(api_key="fake-key")
+        with pytest.raises(GeminiResponseIncompleteError):
+            await ai.evaluate(_make_article())
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_truncation_is_not_retried(self, mock_client_cls: MagicMock) -> None:
+        """Retrying the same prompt would truncate again — the next run is the fix."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        truncated = self._response("MAX_TOKENS")
+        truncated.text = "{"
+        mock_client.aio.models.generate_content = AsyncMock(return_value=truncated)
+
+        ai = GeminiAIFilter(api_key="fake-key")
+        with pytest.raises(GeminiResponseIncompleteError):
+            await ai.evaluate(_make_article())
+
+        assert mock_client.aio.models.generate_content.call_count == 1
+
+
+class TestPromptThreshold:
+    """The publish threshold lives in Settings — the prompt must not hardcode its own."""
+
+    def test_prompt_uses_configured_threshold(self) -> None:
+        assert "score 8–10" in _build_system_prompt(8.0)
+        assert "score 7–10" not in _build_system_prompt(8.0)
+
+    def test_prompt_renders_whole_numbers_without_decimal(self) -> None:
+        assert "score 7–10" in _build_system_prompt(7.0)
+
+    def test_prompt_keeps_fractional_thresholds(self) -> None:
+        assert "score 7.5–10" in _build_system_prompt(7.5)
+
+    def test_schema_description_matches_threshold(self) -> None:
+        schema = _build_response_schema(8.0)
+        properties = schema["properties"]
+        assert isinstance(properties, dict)
+        assert "score >= 8" in properties["is_interesting"]["description"]
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_filter_sends_configured_threshold_to_gemini(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=_make_gemini_response(VALID_AI_RESPONSE)
+        )
+
+        ai = GeminiAIFilter(api_key="fake-key", min_score=9.0)
+        await ai.evaluate(_make_article())
+
+        config = mock_client.aio.models.generate_content.call_args.kwargs["config"]
+        assert "score 9–10" in config.system_instruction

@@ -19,16 +19,25 @@ from dataclasses import dataclass, field
 import structlog
 from google.genai.errors import ServerError as GeminiServerError
 
-from rz_flow.ai import GeminiAIFilter, GeminiQuotaExhaustedError
+from rz_flow.ai import (
+    GeminiAIFilter,
+    GeminiQuotaExhaustedError,
+    GeminiResponseIncompleteError,
+)
 from rz_flow.config import Settings
-from rz_flow.flow_config import FlowConfig
-from rz_flow.models import AIDecision, Article, Decision
+from rz_flow.flow_config import FlowConfig, SourceConfig
+from rz_flow.models import AIDecision, Article, Decision, StopSignal
 from rz_flow.scraper import fetch_articles
-from rz_flow.sources import get_active_sources
+from rz_flow.sources import ScraperSource, get_active_sources
 from rz_flow.storage import StorageProtocol
 from rz_flow.telegram import TelegramPublisher
 
 logger = structlog.get_logger(__name__)
+
+# Storage writes are retried in-process: the alternative to a successful write is a
+# duplicate post on the next run, so it is worth a few seconds.
+_SAVE_MAX_ATTEMPTS = 3
+_SAVE_RETRY_DELAY_S = 1.0
 
 
 def _order_new_articles_round_robin_oldest_first(articles: list[Article]) -> list[Article]:
@@ -121,6 +130,9 @@ class PipelineStats:
     source_urls: dict[str, str] = field(default_factory=dict)
     # Per-article log for admin run report
     article_log: list[ArticleRunEntry] = field(default_factory=list)
+    # Operational warnings worth pushing to the admin chat immediately, separate from
+    # the run report (e.g. a source that went silent, a post that may have duplicated).
+    alerts: list[str] = field(default_factory=list)
     # Admin run-report extras (set in Pipeline.run)
     elapsed_s: int = 0
     report_gemini_model: str = ""
@@ -157,6 +169,7 @@ class Pipeline:
         self.ai_filter = GeminiAIFilter(
             api_key=self.settings.gemini_api_key,
             model=self.settings.gemini_model,
+            min_score=self.settings.ai_min_score,
         )
         publish_id = self.settings.publish_telegram_chat_id(staging=self.use_staging_channel)
         self.publisher = TelegramPublisher(
@@ -194,10 +207,10 @@ class Pipeline:
             stats.elapsed_s = max(0, round(time.monotonic() - _start))
 
         active = self.flow_config.enabled_sources
-        stats.source_urls = {
-            s.name: src.base_url
-            for s, src in zip(get_active_sources(self.flow_config), active)
-        }
+        # Instantiate scrapers once — this pairing drives both the log line and the
+        # clickable source links in the admin run report.
+        source_pairs = list(zip(get_active_sources(self.flow_config), active, strict=True))
+        stats.source_urls = {s.name: src.base_url for s, src in source_pairs}
 
         # ── Stage 1: Scrape ───────────────────────────────────────────────────
         log = logger.bind(dry_run=dry_run)
@@ -205,7 +218,7 @@ class Pipeline:
             "pipeline_started",
             sources=[
                 {"name": s.name, "base_url": src.base_url, "max_articles": src.max_articles}
-                for s, src in zip(get_active_sources(self.flow_config), active)
+                for s, src in source_pairs
             ],
             model=self.settings.gemini_model,
             min_score=self.settings.ai_min_score,
@@ -218,6 +231,7 @@ class Pipeline:
 
         stats.total_scraped = len(all_articles)
         stats.source_scraped = source_scraped
+        self._check_source_health(stats, source_pairs, log)
 
         if not all_articles:
             log.info("no_articles_found")
@@ -245,7 +259,7 @@ class Pipeline:
         for i, article in enumerate(new_articles):
             stop_signal = await self._process_article(article, stats, dry_run)
 
-            if stop_signal == "quota_exhausted":
+            if stop_signal is StopSignal.QUOTA_EXHAUSTED:
                 tail = new_articles[i + 1 :]
                 if tail:
                     stats.remaining_queued = [
@@ -266,7 +280,7 @@ class Pipeline:
                 stats.quota_exhausted = True
                 break
 
-            if stop_signal == "cap_reached":
+            if stop_signal is StopSignal.CAP_REACHED:
                 tail = new_articles[i + 1 :]
                 if tail:
                     stats.remaining_queued = [
@@ -304,12 +318,34 @@ class Pipeline:
         )
         return stats
 
+    @staticmethod
+    def _check_source_health(
+        stats: PipelineStats,
+        source_pairs: list[tuple[ScraperSource, SourceConfig]],
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Flag enabled sources that returned nothing.
+
+        A layout change on the news site makes the parser return an empty list, which
+        otherwise looks exactly like a quiet news day: the run succeeds, exits 0, and
+        the channel just stops updating. Surfacing it is the only way to notice.
+        """
+        dead = [s.name for s, _ in source_pairs if stats.source_scraped.get(s.name, 0) == 0]
+        if not dead:
+            return
+        log.warning("source_returned_no_articles", sources=dead)
+        urls = ", ".join(f"{name} ({stats.source_urls.get(name, '?')})" for name in dead)
+        stats.alerts.append(
+            f"Джерело не повернуло жодної статті: {urls}. "
+            "Ймовірно змінилась верстка сайту або він недоступний — перевірте парсер."
+        )
+
     async def _process_article(
         self,
         article: Article,
         stats: PipelineStats,
         dry_run: bool,
-    ) -> str:
+    ) -> StopSignal:
         """Process a single article: AI evaluate → maybe publish → save.
 
         Routing logic:
@@ -323,10 +359,12 @@ class Pipeline:
         the error is logged and we still proceed to post on the main channel.
         Main channel failure IS fatal for the article (marked as ERROR).
 
-        Returns a stop-signal string for the caller:
-            "continue"        — normal; keep processing remaining articles
-            "quota_exhausted" — Gemini daily quota hit; stop immediately (article not saved)
-            "cap_reached"     — max_posts_per_run reached after this post; stop the loop
+        Failure modes fall into two groups:
+          - Not the article's fault (quota, 503, truncated output): nothing is written
+            to storage, so the article resurfaces untouched on the next run.
+          - Everything else: recorded as ERROR with an incremented attempt counter.
+            Storage keeps returning it as "new" until the retry budget runs out, so a
+            one-off network blip cannot retire an article permanently.
         """
         ai_decision: AIDecision | None = None
         decision = Decision.ERROR
@@ -350,8 +388,13 @@ class Pipeline:
             )
 
             # Stage 3b: Apply threshold and publish
-            should_publish = ai_decision.is_interesting and ai_decision.score >= self.settings.ai_min_score
-            route_to_events = should_publish and ai_decision.is_event and self.events_publisher is not None
+            should_publish = (
+                ai_decision.is_interesting
+                and ai_decision.score >= self.settings.ai_min_score
+            )
+            route_to_events = (
+                should_publish and ai_decision.is_event and self.events_publisher is not None
+            )
 
             if should_publish:
                 if dry_run:
@@ -370,7 +413,9 @@ class Pipeline:
                     if route_to_events:
                         assert self.events_publisher is not None  # narrowing for type checker
                         try:
-                            events_result = await self.events_publisher.publish(article, ai_decision)
+                            events_result = await self.events_publisher.publish(
+                                article, ai_decision
+                            )
                             tg_events_message_id = events_result.message_id
                             posted_to_events = True
                             log.info(
@@ -418,7 +463,7 @@ class Pipeline:
                     article_url=article.url,
                 )
             )
-            return "quota_exhausted"
+            return StopSignal.QUOTA_EXHAUSTED
 
         except GeminiServerError as exc:
             # 503 UNAVAILABLE after retries — transient server overload.
@@ -437,7 +482,26 @@ class Pipeline:
                     article_url=article.url,
                 )
             )
-            return "continue"
+            return StopSignal.CONTINUE
+
+        except GeminiResponseIncompleteError as exc:
+            # Output hit the token ceiling, so the JSON is unparseable. The article is
+            # fine — leave it unsaved and let the next run have another go.
+            log.warning("gemini_truncated_skipping", error=str(exc))
+            stats.article_log.append(
+                ArticleRunEntry(
+                    article_id=article.id,
+                    title_pl=article.title_pl,
+                    ua_title=None,
+                    score=None,
+                    decision=Decision.SKIPPED,
+                    error_msg=f"Gemini response truncated: {exc}",
+                    report_icon="✂️",
+                    source_name=article.source_name,
+                    article_url=article.url,
+                )
+            )
+            return StopSignal.CONTINUE
 
         except Exception as exc:
             log.exception("article_error", error=str(exc))
@@ -464,6 +528,42 @@ class Pipeline:
 
         # Stage 3c: Save result so we don't retry — skipped in dry_run (no side effects)
         if not dry_run:
+            await self._save_decision_with_retry(
+                article=article,
+                decision=decision,
+                ai_decision=ai_decision,
+                tg_message_id=tg_message_id,
+                tg_events_message_id=tg_events_message_id,
+                stats=stats,
+                log=log,
+            )
+
+        # Signal cap after the post is saved so the article is not retried next run
+        cap = self.flow_config.pipeline.max_posts_per_run
+        if decision == Decision.POSTED and stats.posted >= cap:
+            return StopSignal.CAP_REACHED
+
+        return StopSignal.CONTINUE
+
+    async def _save_decision_with_retry(
+        self,
+        *,
+        article: Article,
+        decision: Decision,
+        ai_decision: AIDecision | None,
+        tg_message_id: int | None,
+        tg_events_message_id: int | None,
+        stats: PipelineStats,
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Persist the outcome, retrying transient storage failures.
+
+        A lost write after a successful post is the expensive case: the article stays
+        absent from storage, so the next run treats it as new and publishes it a second
+        time. Retry first, and if it still fails, tell the admin a duplicate is coming.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, _SAVE_MAX_ATTEMPTS + 1):
             try:
                 await self.storage.save_decision(
                     article=article,
@@ -472,12 +572,22 @@ class Pipeline:
                     tg_message_id=tg_message_id,
                     tg_events_message_id=tg_events_message_id,
                 )
+                return
             except Exception as save_exc:
-                log.error("save_failed", error=str(save_exc))
+                last_exc = save_exc
+                log.warning("save_failed", error=str(save_exc), attempt=attempt)
+                if attempt < _SAVE_MAX_ATTEMPTS:
+                    await asyncio.sleep(_SAVE_RETRY_DELAY_S * attempt)
 
-        # Signal cap after the post is saved so the article is not retried next run
-        cap = self.flow_config.pipeline.max_posts_per_run
-        if decision == Decision.POSTED and stats.posted >= cap:
-            return "cap_reached"
-
-        return "continue"
+        log.error("save_failed_permanently", error=str(last_exc), article_id=article.id)
+        if decision == Decision.POSTED:
+            stats.alerts.append(
+                f"Пост опубліковано, але не збережено в БД: {article.url} "
+                f"({type(last_exc).__name__}: {last_exc}). "
+                "Наступний запуск, найімовірніше, опублікує цю статтю повторно."
+            )
+        else:
+            stats.alerts.append(
+                f"Не вдалося зберегти результат обробки {article.url} "
+                f"({type(last_exc).__name__}: {last_exc})."
+            )

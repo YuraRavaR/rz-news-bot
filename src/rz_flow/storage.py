@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS posts (
     tg_events_message_id  INTEGER,
     ua_title              TEXT,
     ua_summary            TEXT,
-    category_tag          TEXT
+    category_tag          TEXT,
+    error_attempts        INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -51,6 +52,7 @@ _SCHEMA_MIGRATIONS = [
     "ALTER TABLE posts ADD COLUMN category_tag TEXT",
     "ALTER TABLE posts ADD COLUMN is_event INTEGER",
     "ALTER TABLE posts ADD COLUMN tg_events_message_id INTEGER",
+    "ALTER TABLE posts ADD COLUMN error_attempts INTEGER NOT NULL DEFAULT 0",
 ]
 
 # Data migrations — one-time UPDATE statements that backfill existing rows.
@@ -61,9 +63,17 @@ _SCHEMA_MIGRATIONS = [
 # Existing DB records were stored without a prefix, so we backfill them here
 # to prevent the bot from re-processing already-seen articles after the upgrade.
 _DATA_MIGRATIONS = [
-    "UPDATE posts SET id = 'rz24/' || id WHERE url LIKE '%rzeszow24.info%' AND id NOT LIKE 'rz24/%'",
-    "UPDATE posts SET id = 'rzn/' || id WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
+    "UPDATE posts SET id = 'rz24/' || id "
+    "WHERE url LIKE '%rzeszow24.info%' AND id NOT LIKE 'rz24/%'",
+    "UPDATE posts SET id = 'rzn/' || id "
+    "WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
 ]
+
+
+# How many times an article may fail before we stop retrying it. A transient blip
+# (network, malformed AI JSON) must not retire an article permanently, but a genuinely
+# broken one must not be retried forever either.
+DEFAULT_MAX_ERROR_ATTEMPTS = 3
 
 
 # ── Protocol (interface) ──────────────────────────────────────────────────────
@@ -76,7 +86,11 @@ class StorageProtocol(Protocol):
         ...
 
     async def filter_new_ids(self, article_ids: list[str]) -> list[str]:
-        """Return only IDs that have NOT been seen before."""
+        """Return IDs that still need processing.
+
+        That means never-seen articles *plus* previously errored ones that have
+        not yet used up their retry budget.
+        """
         ...
 
     async def save_decision(
@@ -99,9 +113,15 @@ class StorageProtocol(Protocol):
 class TursoStorage:
     """Turso / libsql-backed storage — used in production."""
 
-    def __init__(self, database_url: str, auth_token: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        auth_token: str,
+        max_error_attempts: int = DEFAULT_MAX_ERROR_ATTEMPTS,
+    ) -> None:
         self._url = self._normalize_url(database_url)
         self._token = auth_token
+        self._max_error_attempts = max_error_attempts
         self._client: libsql_client.Client | None = None
 
     @staticmethod
@@ -144,12 +164,18 @@ class TursoStorage:
 
         client = self._get_client()
         placeholders = ", ".join("?" * len(article_ids))
+        # "Settled" = posted, skipped, or errored past the retry budget. Anything else
+        # in this batch still needs work, including rows we are about to retry.
         result = await client.execute(
-            f"SELECT id FROM posts WHERE id IN ({placeholders})",
-            article_ids,
+            f"""
+            SELECT id FROM posts
+            WHERE id IN ({placeholders})
+              AND NOT (decision = ? AND COALESCE(error_attempts, 0) < ?)
+            """,
+            [*article_ids, Decision.ERROR.value, self._max_error_attempts],
         )
-        seen_ids = {row[0] for row in result.rows}
-        return [aid for aid in article_ids if aid not in seen_ids]
+        settled_ids = {row[0] for row in result.rows}
+        return [aid for aid in article_ids if aid not in settled_ids]
 
     async def save_decision(
         self,
@@ -160,13 +186,35 @@ class TursoStorage:
         tg_events_message_id: int | None = None,
     ) -> None:
         client = self._get_client()
+        is_error = decision == Decision.ERROR
+        # UPSERT rather than INSERT OR REPLACE so error_attempts can accumulate across
+        # runs — REPLACE deletes the old row and would reset the counter every time.
         await client.execute(
             """
-            INSERT OR REPLACE INTO posts
+            INSERT INTO posts
               (id, url, category, title_pl, seen_at, decision,
                ai_score, ai_reason, is_event, tg_message_id, tg_events_message_id,
-               ua_title, ua_summary, category_tag)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ua_title, ua_summary, category_tag, error_attempts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                url                  = excluded.url,
+                category             = excluded.category,
+                title_pl             = excluded.title_pl,
+                seen_at              = excluded.seen_at,
+                decision             = excluded.decision,
+                ai_score             = excluded.ai_score,
+                ai_reason            = excluded.ai_reason,
+                is_event             = excluded.is_event,
+                tg_message_id        = excluded.tg_message_id,
+                tg_events_message_id = excluded.tg_events_message_id,
+                ua_title             = excluded.ua_title,
+                ua_summary           = excluded.ua_summary,
+                category_tag         = excluded.category_tag,
+                error_attempts       = CASE
+                    WHEN excluded.decision = ?
+                    THEN COALESCE(posts.error_attempts, 0) + 1
+                    ELSE 0
+                END
             """,
             [
                 article.id,
@@ -183,6 +231,8 @@ class TursoStorage:
                 ai_decision.ua_title if ai_decision else None,
                 ai_decision.ua_summary if ai_decision else None,
                 ai_decision.category_tag.value if ai_decision else None,
+                1 if is_error else 0,
+                Decision.ERROR.value,
             ],
         )
 
@@ -194,16 +244,28 @@ class TursoStorage:
 
 # ── InMemoryStorage (tests) ───────────────────────────────────────────────────
 class InMemoryStorage:
-    """In-memory storage for tests — no Turso connection required."""
+    """In-memory storage for tests — no Turso connection required.
 
-    def __init__(self) -> None:
+    Mirrors TursoStorage semantics, including the error retry budget.
+    """
+
+    def __init__(self, max_error_attempts: int = DEFAULT_MAX_ERROR_ATTEMPTS) -> None:
         self._records: dict[str, PostRecord] = {}
+        self._max_error_attempts = max_error_attempts
 
     async def init(self) -> None:
         pass  # nothing to create
 
     async def filter_new_ids(self, article_ids: list[str]) -> list[str]:
-        return [aid for aid in article_ids if aid not in self._records]
+        return [aid for aid in article_ids if not self._is_settled(aid)]
+
+    def _is_settled(self, article_id: str) -> bool:
+        record = self._records.get(article_id)
+        if record is None:
+            return False
+        if record.decision != Decision.ERROR:
+            return True
+        return record.error_attempts >= self._max_error_attempts
 
     async def save_decision(
         self,
@@ -213,6 +275,8 @@ class InMemoryStorage:
         tg_message_id: int | None = None,
         tg_events_message_id: int | None = None,
     ) -> None:
+        previous = self._records.get(article.id)
+        prior_attempts = previous.error_attempts if previous else 0
         self._records[article.id] = PostRecord(
             id=article.id,
             url=article.url,
@@ -227,6 +291,7 @@ class InMemoryStorage:
             ua_title=ai_decision.ua_title if ai_decision else None,
             ua_summary=ai_decision.ua_summary if ai_decision else None,
             category_tag=ai_decision.category_tag.value if ai_decision else None,
+            error_attempts=prior_attempts + 1 if decision == Decision.ERROR else 0,
         )
 
     async def close(self) -> None:
@@ -243,6 +308,14 @@ class InMemoryStorage:
         return len(self._records)
 
 
-def create_storage(database_url: str, auth_token: str) -> TursoStorage:
+def create_storage(
+    database_url: str,
+    auth_token: str,
+    max_error_attempts: int = DEFAULT_MAX_ERROR_ATTEMPTS,
+) -> TursoStorage:
     """Factory that creates a TursoStorage (used in main pipeline)."""
-    return TursoStorage(database_url=database_url, auth_token=auth_token)
+    return TursoStorage(
+        database_url=database_url,
+        auth_token=auth_token,
+        max_error_attempts=max_error_attempts,
+    )

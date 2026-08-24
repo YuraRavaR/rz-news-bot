@@ -15,7 +15,7 @@ import asyncio
 import re
 from collections import defaultdict
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -229,7 +229,11 @@ def _collect_run_report_segments(
     report_display_timezone: str | None,
     staging: bool,
 ) -> list[str]:
-    """Return report body as segments (join with ``\\n`` = full report; pack for Telegram separately)."""
+    """Return report body as segments.
+
+    Joining them with ``\\n`` yields the full report; packing them for Telegram's
+    length limit is a separate step.
+    """
     from rz_flow.pipeline import ArticleRunEntry
 
     now_line = format_run_report_clock(datetime.now(UTC), report_display_timezone)
@@ -501,11 +505,15 @@ class TelegramPublisher:
                     },
                 )
             try:
-                data: dict = response.json()
+                data: dict[str, Any] = response.json()
             except ValueError:
                 data = {}
             if not response.is_success:
-                desc = data.get("description", response.text) if isinstance(data, dict) else response.text
+                desc = (
+                    data.get("description", response.text)
+                    if isinstance(data, dict)
+                    else response.text
+                )
                 logger.error(
                     "alert_send_failed",
                     target=target,
@@ -517,10 +525,13 @@ class TelegramPublisher:
                 logger.error(
                     "alert_send_failed",
                     target=target,
-                    tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
+                    tg_description=(
+                        str(data.get("description", "")) if isinstance(data, dict) else ""
+                    ),
                 )
                 return
-            msg_id = data.get("result", {}).get("message_id") if isinstance(data.get("result"), dict) else None
+            result = data.get("result")
+            msg_id = result.get("message_id") if isinstance(result, dict) else None
             logger.info("admin_alert_sent", target=target, message_id=msg_id)
         except Exception as exc:
             # Alert failures should never crash the pipeline
@@ -573,7 +584,9 @@ class TelegramPublisher:
                         data = {}
                     if not response.is_success:
                         desc = (
-                            data.get("description", response.text) if isinstance(data, dict) else response.text
+                            data.get("description", response.text)
+                            if isinstance(data, dict)
+                            else response.text
                         )
                         logger.error(
                             "run_report_send_failed",
@@ -590,7 +603,11 @@ class TelegramPublisher:
                             target=target,
                             dry_run=dry_run,
                             chunk_index=i,
-                            tg_description=str(data.get("description", "")) if isinstance(data, dict) else "",
+                            tg_description=(
+                                str(data.get("description", ""))
+                                if isinstance(data, dict)
+                                else ""
+                            ),
                         )
                         return
                     last_msg_id = (

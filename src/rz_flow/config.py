@@ -27,8 +27,8 @@ class Settings(BaseSettings):
     telegram_events_channel_id: str | None = Field(
         default=None,
         description=(
-            "Channel ID for the dedicated events channel. "
-            "When set, articles with is_event=True are posted here in addition to the main channel. "
+            "Channel ID for the dedicated events channel. When set, articles with "
+            "is_event=True are posted here in addition to the main channel. "
             "When unset, all posts go only to the main channel."
         ),
     )
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # ── Gemini AI ─────────────────────────────────────────────────────────────
     gemini_api_key: str = Field(..., description="Google AI Studio API key")
-    gemini_model: str = Field(default="gemini-2.0-flash", description="Gemini model name")
+    gemini_model: str = Field(default="gemini-3.5-flash-lite", description="Gemini model name")
 
     # ── Turso (libsql) ────────────────────────────────────────────────────────
     turso_database_url: str = Field(..., description="libsql:// URL from turso db show")

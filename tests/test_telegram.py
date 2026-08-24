@@ -174,8 +174,7 @@ class TestBuildMessage:
     def test_message_truncated_when_over_4096_chars(self) -> None:
         """Very long summaries must be truncated to fit Telegram's 4096-char limit."""
         article = _make_article()
-        decision = _make_decision(ua_title="Т" * 200)
-        # Override summary to push message well over the limit
+        # Summary long enough to push the rendered message well over the limit
         long_decision = AIDecision(
             is_interesting=True,
             is_event=True,
@@ -279,7 +278,9 @@ class TestBuildRunReport:
         from rz_flow.pipeline import PipelineStats
         from rz_flow.telegram import _build_run_report
 
-        text = _build_run_report(PipelineStats(), dry_run=False, report_display_timezone="Europe/Warsaw")
+        text = _build_run_report(
+            PipelineStats(), dry_run=False, report_display_timezone="Europe/Warsaw"
+        )
         first = text.split("\n", 1)[0]
         assert " UTC" not in first
         assert "Rz-Flow" in first
@@ -691,7 +692,9 @@ class TestSendRunReportRespx:
         from rz_flow.pipeline import PipelineStats
 
         respx.post(_tg_url("sendMessage")).mock(
-            return_value=Response(200, json={"ok": False, "description": "Forbidden: bot was blocked"})
+            return_value=Response(
+                200, json={"ok": False, "description": "Forbidden: bot was blocked"}
+            )
         )
         publisher = TelegramPublisher(
             bot_token="fake-token",

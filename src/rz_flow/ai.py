@@ -4,24 +4,32 @@ Uses Gemini's structured output (response_schema) to get a guaranteed
 JSON response that maps directly to the AIDecision Pydantic model.
 This avoids brittle regex parsing of LLM text output.
 
-Error handling strategy — three distinct cases:
+Error handling strategy — four distinct cases:
   1. Transient (network timeout, 5xx)   → retry with exponential backoff
-  2. Per-minute rate limit (429 RPM)    → retry after Retry-After delay
+  2. Per-minute rate limit (429 RPM)    → retry, honouring Gemini's own retryDelay
   3. Daily quota exhausted (429 + PerDay limit=0) → raise GeminiQuotaExhaustedError
      The pipeline catches this and stops immediately — no point retrying
      until tomorrow when the quota resets.
+  4. Response truncated at max_output_tokens → raise GeminiResponseIncompleteError.
+     The JSON is unparseable but the article itself is fine, so the pipeline
+     retries it on the next run instead of burning it as a permanent error.
 """
 
-import asyncio
 import json
 import re
 
 import structlog
 from google import genai
 from google.genai import errors as genai_errors
-from google.genai.errors import ServerError as GeminiServerError
 from google.genai import types
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from google.genai.errors import ServerError as GeminiServerError
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from rz_flow.models import AIDecision, Article, CategoryTag
 
@@ -45,6 +53,14 @@ class GeminiRateLimitError(Exception):
     def __init__(self, message: str, retry_after: float = 30.0) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class GeminiResponseIncompleteError(Exception):
+    """Gemini stopped before finishing the JSON (usually max_output_tokens).
+
+    Not the article's fault, so it must NOT be persisted as a permanent error —
+    the pipeline leaves it unsaved and picks it up again on the next run.
+    """
 
 
 def _parse_retry_after(error: genai_errors.ClientError) -> float:
@@ -94,8 +110,47 @@ def _classify_gemini_error(exc: Exception) -> Exception:
     retry_after = _parse_retry_after(exc)
     return GeminiRateLimitError(str(exc), retry_after=retry_after)
 
+
+# Upper bound on a single backoff wait, so one hostile Retry-After cannot stall the run.
+_MAX_RETRY_WAIT_S = 60.0
+
+_base_wait = wait_exponential_jitter(initial=5, max=_MAX_RETRY_WAIT_S, jitter=2)
+
+
+def _gemini_retry_wait(retry_state: RetryCallState) -> float:
+    """Back off using Gemini's own retryDelay when it sent one, else exponential.
+
+    Waiting is left entirely to tenacity: sleeping inside ``evaluate`` as well
+    would apply both delays to every single 429.
+    """
+    fallback = _base_wait(retry_state)
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, GeminiRateLimitError):
+        return min(max(exc.retry_after, fallback), _MAX_RETRY_WAIT_S)
+    return fallback
+
+
+# The response carries three free-text Ukrainian fields; Cyrillic costs roughly twice
+# as many tokens as Latin, so 512 sat close enough to the ceiling that long summaries
+# came back as truncated (unparseable) JSON.
+_MAX_OUTPUT_TOKENS = 1024
+
+
+def _is_truncated(response: object) -> bool:
+    """True when Gemini stopped at the token ceiling, leaving the JSON unfinished."""
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason is None:
+            continue
+        # FinishReason is a str enum, so this also matches a plain "MAX_TOKENS".
+        if str(getattr(finish_reason, "value", finish_reason)) == "MAX_TOKENS":
+            return True
+    return False
+
+
 # ── Prompt ────────────────────────────────────────────────────────────────────
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT_TEMPLATE = """\
 Ти — редактор двох Telegram-каналів для україномовних мешканців міста Жешув (Польща):
   • "Rzeszów для своїх" — головний новинний канал
   • "Rzeszów — події" — виключно анонси майбутніх публічних подій
@@ -115,12 +170,14 @@ is_event = False для:
 ❌ Загальних новин про місто без конкретного заходу
 ❌ Транспорту, розкладів, послуг
 
-КРИТЕРІЇ ПУБЛІКАЦІЇ (score 7–10, is_interesting = True):
+КРИТЕРІЇ ПУБЛІКАЦІЇ (score {min_score}–10, is_interesting = True):
 ✅ Публічні події (концерти, фестивалі, ярмарки, виставки, культурні заходи)
 ✅ Важлива міська інфраструктура: нові об'єкти, ремонти доріг/комунікацій
 ✅ Корисна інформація для мешканців: транспорт, школи, лікарні, послуги
-✅ Екстремальні погодні попередження IMGW (шторм, сильний вітер 70+ км/год, повінь, ожеледиця) — якщо стосується Жешова або Підкарпаття
-✅ Спорт ЛИШЕ: дербі, кубкові матчі, матчі проти гучних/відомих клубів (Wieczysta, Legia, Wisła тощо), вихід до екстраклясу / фіналу
+✅ Екстремальні погодні попередження IMGW (шторм, сильний вітер 70+ км/год,
+   повінь, ожеледиця) — якщо стосується Жешова або Підкарпаття
+✅ Спорт ЛИШЕ: дербі, кубкові матчі, матчі проти гучних/відомих клубів
+   (Wieczysta, Legia, Wisła тощо), вихід до екстраклясу / фіналу
 
 НЕ ПУБЛІКУВАТИ (score 0–4, is_interesting = False):
 ❌ Кримінальні новини, ДТП, вбивства
@@ -137,7 +194,8 @@ is_event = False для:
 ❌ Рутинні повідомлення про дорожні роботи (якщо не закривається ключова артерія надовго)
 ❌ Ветеринарні та санітарні заходи (вакцинація тварин, дезінфекція, боротьба зі шкідниками)
 ❌ Природа, екологія, сільське господарство — якщо не стосується безпеки мешканців міста
-❌ Будівельні та ремонтні роботи на стадіонах, аренах, спортивних об'єктах (трибуни, освітлення, газон)
+❌ Будівельні та ремонтні роботи на стадіонах, аренах, спортивних об'єктах
+   (трибуни, освітлення, газон)
 
 НЕЙТРАЛЬНИЙ КОНТЕНТ (score 5–6): якщо сумніваєшся.
 
@@ -150,21 +208,39 @@ _USER_PROMPT_TEMPLATE = """Категорія: {category}
 Оціни та переклади українською."""
 
 
-def _build_response_schema() -> dict[str, object]:
+def _build_system_prompt(min_score: float) -> str:
+    """Render the system prompt with the publish threshold the pipeline actually enforces.
+
+    The threshold lives in Settings.ai_min_score; interpolating it here keeps the
+    model's notion of "interesting" from drifting away from the code's.
+    """
+    return _SYSTEM_PROMPT_TEMPLATE.format(min_score=_format_score(min_score))
+
+
+def _format_score(score: float) -> str:
+    """Render a threshold for prompt text: 7.0 → '7', 7.5 → '7.5'."""
+    return str(int(score)) if score == int(score) else str(score)
+
+
+def _build_response_schema(min_score: float) -> dict[str, object]:
     """Build the JSON Schema that Gemini will enforce for its response."""
+    threshold = _format_score(min_score)
     return {
         "type": "object",
         "properties": {
             "is_interesting": {
                 "type": "boolean",
-                "description": "True if score >= 7 and article should be published",
+                "description": (
+                    f"True if score >= {threshold} and article should be published"
+                ),
             },
             "is_event": {
                 "type": "boolean",
                 "description": (
-                    "True ONLY for a specific upcoming public event "
-                    "(concert, festival, exhibition, sports match, fair, cultural/community gathering). "
-                    "False for general news, infrastructure, transport, or any non-event content."
+                    "True ONLY for a specific upcoming public event (concert, festival, "
+                    "exhibition, sports match, fair, cultural/community gathering). "
+                    "False for general news, infrastructure, transport, "
+                    "or any non-event content."
                 ),
             },
             "score": {
@@ -189,23 +265,37 @@ def _build_response_schema() -> dict[str, object]:
                 "description": "One-sentence explanation of the decision (for logs)",
             },
         },
-        "required": ["is_interesting", "is_event", "score", "category_tag", "ua_title", "ua_summary", "reason"],
+        "required": [
+            "is_interesting",
+            "is_event",
+            "score",
+            "category_tag",
+            "ua_title",
+            "ua_summary",
+            "reason",
+        ],
     }
 
 
 class GeminiAIFilter:
     """Wraps the Gemini API client with retry and structured output."""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gemini-3.5-flash-lite",
+        min_score: float = 7.0,
+    ) -> None:
         self._client = genai.Client(api_key=api_key)
         self._model = model
-        self._schema = _build_response_schema()
+        self._system_prompt = _build_system_prompt(min_score)
+        self._schema = _build_response_schema(min_score)
 
     @retry(
         # Retry per-minute rate limits AND server-side 5xx (e.g. 503 high demand).
         # GeminiQuotaExhaustedError is NOT retried — it propagates up immediately.
         retry=retry_if_exception_type((GeminiRateLimitError, GeminiServerError)),
-        wait=wait_exponential(multiplier=2, min=5, max=60),
+        wait=_gemini_retry_wait,
         stop=stop_after_attempt(3),
         reraise=True,
     )
@@ -215,6 +305,7 @@ class GeminiAIFilter:
         Raises:
             GeminiQuotaExhaustedError: daily quota is 0 — stop the pipeline.
             GeminiRateLimitError: per-minute limit hit — retried automatically.
+            GeminiResponseIncompleteError: output truncated — retry on the next run.
             ValueError: empty or unparseable Gemini response.
         """
         user_content = _USER_PROMPT_TEMPLATE.format(
@@ -228,11 +319,11 @@ class GeminiAIFilter:
                 model=self._model,
                 contents=user_content,
                 config=types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_PROMPT,
+                    system_instruction=self._system_prompt,
                     response_mime_type="application/json",
                     response_schema=self._schema,
                     temperature=0.3,
-                    max_output_tokens=512,
+                    max_output_tokens=_MAX_OUTPUT_TOKENS,
                 ),
             )
         except genai_errors.ClientError as exc:
@@ -243,13 +334,18 @@ class GeminiAIFilter:
                     article_id=article.id,
                     retry_after=classified.retry_after,
                 )
-                # Sleep for the exact delay Gemini asked for before tenacity retries
-                await asyncio.sleep(classified.retry_after)
-                raise classified
+                raise classified from exc
             if isinstance(classified, GeminiQuotaExhaustedError):
                 logger.error("gemini_quota_exhausted", article_id=article.id)
-                raise classified
+                raise classified from exc
             raise  # other 4xx/5xx — re-raise original
+
+        if _is_truncated(response):
+            logger.warning("gemini_response_truncated", article_id=article.id)
+            raise GeminiResponseIncompleteError(
+                f"Gemini hit max_output_tokens ({_MAX_OUTPUT_TOKENS}) on article "
+                f"{article.id} — response JSON is incomplete, retrying next run"
+            )
 
         raw_text = response.text
         if not raw_text:

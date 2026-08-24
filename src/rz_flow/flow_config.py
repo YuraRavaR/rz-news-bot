@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+from rz_flow.storage import DEFAULT_MAX_ERROR_ATTEMPTS
+
 _DEFAULT_CONFIG_PATH = "config.yaml"
 
 
@@ -40,6 +42,14 @@ class PipelineConfig(BaseModel):
     inter_ai_delay_seconds: float = 5.0
     inter_post_delay_seconds: float = 2.0
     max_posts_per_run: int = 5
+    max_error_attempts: int = Field(
+        default=DEFAULT_MAX_ERROR_ATTEMPTS,
+        ge=1,
+        description=(
+            "How many times a failing article is retried on later runs before it is "
+            "retired permanently. 1 = never retry."
+        ),
+    )
     report_display_timezone: str | None = Field(
         default=None,
         description=(

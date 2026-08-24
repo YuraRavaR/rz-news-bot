@@ -30,7 +30,9 @@ async def test_async_main_skips_send_run_report_when_no_admin_chat(
         publishers.append(m)
         return m
 
-    monkeypatch.setattr(main_mod, "get_settings", lambda: _make_settings(telegram_admin_chat_id=None))
+    monkeypatch.setattr(
+        main_mod, "get_settings", lambda: _make_settings(telegram_admin_chat_id=None)
+    )
     monkeypatch.setattr(main_mod, "create_storage", lambda **kw: storage)
     monkeypatch.setattr(main_mod, "load_flow_config", _make_flow_config)
     monkeypatch.setattr(

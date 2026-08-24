@@ -1,0 +1,40 @@
+name: Canary
+
+# Fixtures are frozen snapshots, so the normal suite stays green even after a source
+# site changes its markup — the failure only shows up in production as an empty feed.
+# These tests hit the real sites to catch that drift.
+
+on:
+  schedule:
+    - cron: "17 5 * * *" # daily, before the first publish run of the day
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Live source check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Scrape live sources
+        run: uv run pytest -q -m live --no-cov

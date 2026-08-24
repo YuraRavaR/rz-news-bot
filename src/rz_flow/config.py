@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # ── Gemini AI ─────────────────────────────────────────────────────────────
     gemini_api_key: str = Field(..., description="Google AI Studio API key")
-    gemini_model: str = Field(default="gemini-2.0-flash", description="Gemini model name")
+    gemini_model: str = Field(default="gemini-3.5-flash-lite", description="Gemini model name")
 
     # ── Turso (libsql) ────────────────────────────────────────────────────────
     turso_database_url: str = Field(..., description="libsql:// URL from turso db show")

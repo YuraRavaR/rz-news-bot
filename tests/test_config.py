@@ -23,7 +23,7 @@ def _make_settings(**overrides: object) -> Settings:
         "turso_staging_database_url": None,
         "turso_staging_auth_token": None,
         # Optional fields — set explicitly to avoid .env overriding them
-        "gemini_model": "gemini-2.0-flash",
+        "gemini_model": "gemini-3.5-flash-lite",
         "ai_min_score": 7.0,
         "app_env": "production",
     }
@@ -54,9 +54,9 @@ class TestSettingsDefaults:
         assert s.gemini_model == "gemini-test-model"
 
     def test_gemini_model_field_default_in_schema(self) -> None:
-        """The schema-level default is gemini-2.0-flash (can be overridden by env)."""
+        """The schema-level default is gemini-3.5-flash-lite (can be overridden by env)."""
         field_info = Settings.model_fields["gemini_model"]
-        assert field_info.default == "gemini-2.0-flash"
+        assert field_info.default == "gemini-3.5-flash-lite"
 
     def test_default_ai_min_score(self) -> None:
         """ai_min_score defaults to 7.0 when not overridden."""

@@ -83,7 +83,7 @@ cp .env.example .env
 | `TELEGRAM_ADMIN_CHAT_ID` | Your personal chat ID (optional — enables per-run admin reports) |
 | `TELEGRAM_EVENTS_CHANNEL_ID` | (Optional) Dedicated channel for event articles (concerts, festivals, etc.) — when set, `is_event` articles are cross-posted here **in addition to** the main channel |
 | `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| `GEMINI_MODEL` | e.g. `gemini-2.0-flash` or `gemini-2.0-flash-lite` |
+| `GEMINI_MODEL` | e.g. `gemini-3.5-flash-lite` or `gemini-2.5-flash` |
 | `TURSO_DATABASE_URL` | `turso db show rz-flow --url` |
 | `TURSO_AUTH_TOKEN` | `turso db tokens create rz-flow` |
 | `TELEGRAM_STAGING_CHANNEL_ID` | (Optional) Second channel for `uv run rz-flow --staging` |
@@ -199,7 +199,7 @@ The workflow (`.github/workflows/publish.yml`) runs automatically on the schedul
 | `TELEGRAM_ADMIN_CHAT_ID` | Admin chat ID for run reports (optional) |
 | `TELEGRAM_EVENTS_CHANNEL_ID` | Dedicated events channel ID (optional) |
 | `GEMINI_API_KEY` | Google AI Studio key |
-| `GEMINI_MODEL` | Model name (optional, falls back to `gemini-2.0-flash`) |
+| `GEMINI_MODEL` | Model name (optional, falls back to `gemini-3.5-flash-lite`) |
 | `TURSO_DATABASE_URL` | Turso database URL |
 | `TURSO_AUTH_TOKEN` | Turso auth token |
 | `TELEGRAM_STAGING_CHANNEL_ID` | Staging channel ID — required only for the manual `staging: true` dispatch input |

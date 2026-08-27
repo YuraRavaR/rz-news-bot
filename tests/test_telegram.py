@@ -421,8 +421,8 @@ class TestBuildRunReport:
         text = _build_run_report(stats, dry_run=False)
         assert "Not processed in this run:" in text
 
-    def test_run_report_remaining_queue_truncates_after_15(self) -> None:
-        """More than 15 queued rows: ellipsis line with remaining count."""
+    def test_run_report_remaining_queue_lists_all_rows(self) -> None:
+        """All queued rows appear in the report (no artificial cap)."""
         from rz_flow.pipeline import PipelineStats, RemainingArticleBrief
         from rz_flow.telegram import _build_run_report
 
@@ -437,8 +437,10 @@ class TestBuildRunReport:
         stats = PipelineStats(remaining_stop_reason="post_cap", remaining_queued=queued)
         text = _build_run_report(stats, dry_run=False)
         assert "not evaluated this run: 17" in text
-        assert "… 2 more" in text
         assert "not_evaluated_this_run=17" in text
+        for i in range(17):
+            assert f"Title {i}" in text
+        assert "… " not in text
 
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────

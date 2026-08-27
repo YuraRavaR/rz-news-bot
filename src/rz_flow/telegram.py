@@ -41,12 +41,6 @@ _TG_API_BASE = "https://api.telegram.org/bot{token}"
 # Maximum message length Telegram allows (HTML entities count toward it)
 _MAX_MESSAGE_LEN = 4096
 
-# Maximum articles shown in the run report before truncation
-_MAX_REPORT_ARTICLES = 20
-
-# Maximum rows in the "remaining queue" section (post cap / quota tail)
-_MAX_REMAINING_IN_REPORT = 15
-
 # Per-field cap for AI snippets in the admin HTML report (many articles × long text)
 _MAX_ADMIN_AI_SNIPPET = 420
 
@@ -289,9 +283,8 @@ def _collect_run_report_segments(
     if not log:
         segments.append(f"<i>No new articles</i> (scraped={stats.total_scraped})")
     else:
-        shown = log[:_MAX_REPORT_ARTICLES]
         by_source: dict[str, list[ArticleRunEntry]] = defaultdict(list)
-        for entry in shown:
+        for entry in log:
             src_key = entry.source_name.strip() if entry.source_name.strip() else "-"
             by_source[src_key].append(entry)
 
@@ -312,8 +305,6 @@ def _collect_run_report_segments(
             for entry in entries:
                 body = "\n".join(_article_run_report_lines(entry))
                 segments.append(f"<b>{_html_escape(src)}</b>\n{body}")
-        if len(log) > _MAX_REPORT_ARTICLES:
-            segments.append(f"<i>… {len(log) - _MAX_REPORT_ARTICLES} more articles</i>")
 
     if stats.remaining_queued:
         reason = (stats.remaining_stop_reason or "").strip()
@@ -331,8 +322,7 @@ def _collect_run_report_segments(
             intro = "Not processed in this run:"
         segments.append("<b>Pending evaluation</b>")
         segments.append(f"<i>{_html_escape(intro)}</i>")
-        shown_rq = stats.remaining_queued[:_MAX_REMAINING_IN_REPORT]
-        for b in shown_rq:
+        for b in stats.remaining_queued:
             title_esc = _html_escape(b.title_pl)
             url = (b.url or "").strip()
             src_bit = f"{_html_escape(b.source_name.strip())} · " if b.source_name.strip() else ""
@@ -341,9 +331,6 @@ def _collect_run_report_segments(
                 segments.append(f"  ⏳ {src_bit}<a href=\"{href}\">{title_esc}</a>")
             else:
                 segments.append(f"  ⏳ {src_bit}{title_esc}")
-        if len(stats.remaining_queued) > _MAX_REMAINING_IN_REPORT:
-            more = len(stats.remaining_queued) - _MAX_REMAINING_IN_REPORT
-            segments.append(f"<i>… {more} more</i>")
 
     summary_bits = [
         f"posted={stats.posted}",

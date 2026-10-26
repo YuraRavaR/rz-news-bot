@@ -45,7 +45,7 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 
 ### Retry/persistence semantics (the subtle part)
 
-- **Never persisted, so the article retries next run untouched:** `GeminiQuotaExhaustedError`, `GeminiServerError` (503), `GeminiResponseIncompleteError` (truncated JSON). These are not the article's fault.
+- **Deferred: never persisted, so the article retries next run untouched:** every subclass of `DeferralError` (`errors.py`): `GeminiQuotaExhaustedError`, `GeminiUnavailableError` (5xx after retries), `GeminiResponseIncompleteError` (truncated JSON). These are not the article's fault. Each one carries its run-report icon, message and `StopSignal`; `Pipeline` handles them all in one `except`. Early stops go through `Pipeline._stop_early`, and a new stop reason needs an entry in `_REMAINING_STOP_REASONS`.
 - **Any other exception** saves the article as `ERROR` and increments `error_attempts` (an UPSERT, so the counter accumulates). `filter_new_ids` keeps treating ERROR rows as new until `error_attempts >= max_error_attempts`.
 - `--dry-run` reads from storage but never writes to it. `--staging` switches both the Telegram channel and the Turso DB, so production dedup is never touched.
 - `TursoStorage` and `InMemoryStorage` both implement `StorageProtocol` and must behave the same way. Tests use `InMemoryStorage` and never touch a real DB. Schema changes go in `_SCHEMA_MIGRATIONS` in `storage.py` (`ALTER TABLE`, duplicate-column errors suppressed) or `_DATA_MIGRATIONS` (idempotent `UPDATE`s, errors not suppressed). There is no migration framework.

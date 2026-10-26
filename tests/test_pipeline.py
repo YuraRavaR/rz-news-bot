@@ -11,9 +11,12 @@ unittest.mock.AsyncMock so we test the orchestration logic in isolation:
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from google.genai import errors as genai_errors
 
-from rz_flow.ai import GeminiQuotaExhaustedError, GeminiResponseIncompleteError
+from rz_flow.ai import (
+    GeminiQuotaExhaustedError,
+    GeminiResponseIncompleteError,
+    GeminiUnavailableError,
+)
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
@@ -373,6 +376,7 @@ class TestPipelineRunBasic:
         assert len(stats.article_log) == 1
         assert stats.article_log[0].article_id == "QUOTA_ART_1"
         assert stats.article_log[0].report_icon == "⏸"
+        assert stats.article_log[0].decision == Decision.DEFERRED
         assert len(stats.remaining_queued) == 2
         assert stats.remaining_stop_reason == "quota"
         assert {x.article_id for x in stats.remaining_queued} == {"QUOTA_ART_2", "QUOTA_ART_3"}
@@ -530,13 +534,11 @@ class TestPipelineBranchCoverage:
         mock_fetch: MagicMock,
         storage: InMemoryStorage,
     ) -> None:
-        """GeminiServerError (503) is transient: article NOT saved, pipeline continues."""
+        """Gemini 503 after retries is transient: article Deferred, pipeline continues."""
         articles = [_make_article("GOOD_ART_X123456"), _make_article("SERVER_ERR_ART_01X")]
         mock_fetch.return_value = (articles, {"rzeszow24/najnowsze": 2})
 
-        server_err = genai_errors.ServerError(
-            503, {"error": {"code": 503, "message": "Service Unavailable"}}
-        )
+        server_err = GeminiUnavailableError("503 Service Unavailable")
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
@@ -553,7 +555,7 @@ class TestPipelineBranchCoverage:
         pipeline = _build_pipeline(storage)
         stats = await pipeline.run()
 
-        # GeminiServerError → "continue" (not counted as error)
+        # GeminiUnavailableError → "continue" (not counted as error)
         assert stats.errors == 0
         assert stats.posted == 1
         # Article that hit ServerError is NOT saved — will be retried next run
@@ -562,6 +564,8 @@ class TestPipelineBranchCoverage:
         assert storage.get_record("GOOD_ART_X123456") is not None
         assert len(stats.article_log) == 2
         assert stats.article_log[0].report_icon == "🔄"
+        assert stats.article_log[0].decision == Decision.DEFERRED
+        assert stats.deferred == 1
         assert stats.article_log[1].decision == Decision.POSTED
 
     @patch("rz_flow.pipeline.fetch_articles")
@@ -751,6 +755,7 @@ class TestTransientErrorRetrySemantics:
         assert stats.errors == 0
         assert storage.count() == 0, "must stay unsaved so the next run retries it"
         assert stats.article_log[0].report_icon == "✂️"
+        assert stats.article_log[0].decision == Decision.DEFERRED
 
 
 class TestSaveFailureHandling:

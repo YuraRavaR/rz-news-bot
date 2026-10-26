@@ -13,6 +13,9 @@ Error handling strategy — four distinct cases:
   4. Response truncated at max_output_tokens → raise GeminiResponseIncompleteError.
      The JSON is unparseable but the article itself is fine, so the pipeline
      retries it on the next run instead of burning it as a permanent error.
+
+Cases 3 and 4, and a 5xx that outlives the retries (GeminiUnavailableError), are
+DeferralErrors: the Article is Deferred rather than recorded as an Error.
 """
 
 import json
@@ -31,20 +34,36 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from rz_flow.models import AIDecision, Article, CategoryTag
+from rz_flow.errors import DeferralError
+from rz_flow.models import AIDecision, Article, CategoryTag, StopSignal
 
 logger = structlog.get_logger(__name__)
 
 
 # ── Custom exceptions ─────────────────────────────────────────────────────────
-class GeminiQuotaExhaustedError(Exception):
+class GeminiQuotaExhaustedError(DeferralError):
     """Daily/project quota for Gemini API is fully exhausted.
 
     This is NOT retryable during the current run — quota resets at midnight UTC.
     The pipeline should stop processing remaining articles to avoid noise in logs.
     """
 
-    pass
+    report_icon = "⏸"
+    stop_signal = StopSignal.QUOTA_EXHAUSTED
+
+    @property
+    def report_message(self) -> str:
+        return "Gemini daily quota exhausted — not saved, will retry on next run"
+
+
+class GeminiUnavailableError(DeferralError):
+    """Gemini kept answering 5xx (e.g. 503 high demand) after the in-process retries."""
+
+    report_icon = "🔄"
+
+    @property
+    def report_message(self) -> str:
+        return f"Gemini temporarily unavailable (503): {self}"
 
 
 class GeminiRateLimitError(Exception):
@@ -55,12 +74,18 @@ class GeminiRateLimitError(Exception):
         self.retry_after = retry_after
 
 
-class GeminiResponseIncompleteError(Exception):
+class GeminiResponseIncompleteError(DeferralError):
     """Gemini stopped before finishing the JSON (usually max_output_tokens).
 
     Not the article's fault, so it must NOT be persisted as a permanent error —
     the pipeline leaves it unsaved and picks it up again on the next run.
     """
+
+    report_icon = "✂️"
+
+    @property
+    def report_message(self) -> str:
+        return f"Gemini response truncated: {self}"
 
 
 def _parse_retry_after(error: genai_errors.ClientError) -> float:
@@ -294,7 +319,7 @@ class GeminiAIFilter:
     @retry(
         # Retry per-minute rate limits AND server-side 5xx (e.g. 503 high demand).
         # GeminiQuotaExhaustedError is NOT retried — it propagates up immediately.
-        retry=retry_if_exception_type((GeminiRateLimitError, GeminiServerError)),
+        retry=retry_if_exception_type((GeminiRateLimitError, GeminiUnavailableError)),
         wait=_gemini_retry_wait,
         stop=stop_after_attempt(3),
         reraise=True,
@@ -305,6 +330,7 @@ class GeminiAIFilter:
         Raises:
             GeminiQuotaExhaustedError: daily quota is 0 — stop the pipeline.
             GeminiRateLimitError: per-minute limit hit — retried automatically.
+            GeminiUnavailableError: 5xx — retried automatically, then Deferred.
             GeminiResponseIncompleteError: output truncated — retry on the next run.
             ValueError: empty or unparseable Gemini response.
         """
@@ -338,7 +364,9 @@ class GeminiAIFilter:
             if isinstance(classified, GeminiQuotaExhaustedError):
                 logger.error("gemini_quota_exhausted", article_id=article.id)
                 raise classified from exc
-            raise  # other 4xx/5xx — re-raise original
+            raise  # other 4xx — re-raise original
+        except GeminiServerError as exc:
+            raise GeminiUnavailableError(str(exc)) from exc
 
         if _is_truncated(response):
             logger.warning("gemini_response_truncated", article_id=article.id)

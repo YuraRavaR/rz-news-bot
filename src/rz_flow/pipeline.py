@@ -17,14 +17,10 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 
 import structlog
-from google.genai.errors import ServerError as GeminiServerError
 
-from rz_flow.ai import (
-    GeminiAIFilter,
-    GeminiQuotaExhaustedError,
-    GeminiResponseIncompleteError,
-)
+from rz_flow.ai import GeminiAIFilter
 from rz_flow.config import Settings
+from rz_flow.errors import DeferralError
 from rz_flow.flow_config import FlowConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Decision, StopSignal
 from rz_flow.scraper import fetch_articles
@@ -38,6 +34,13 @@ logger = structlog.get_logger(__name__)
 # duplicate post on the next run, so it is worth a few seconds.
 _SAVE_MAX_ATTEMPTS = 3
 _SAVE_RETRY_DELAY_S = 1.0
+
+# Early stops of the Run → the reason recorded for the "not reached" list in the
+# run report. A new stop reason needs an entry here and wording in the report.
+_REMAINING_STOP_REASONS: dict[StopSignal, str] = {
+    StopSignal.QUOTA_EXHAUSTED: "quota",
+    StopSignal.CAP_REACHED: "post_cap",
+}
 
 
 def _order_new_articles_round_robin_oldest_first(articles: list[Article]) -> list[Article]:
@@ -130,6 +133,8 @@ class PipelineStats:
     source_urls: dict[str, str] = field(default_factory=dict)
     # Per-article log for admin run report
     article_log: list[ArticleRunEntry] = field(default_factory=list)
+    # Articles left for the next Run by a failure that was not their fault
+    deferred: int = 0
     # Operational warnings worth pushing to the admin chat immediately, separate from
     # the run report (e.g. a source that went silent, a post that may have duplicated).
     alerts: list[str] = field(default_factory=list)
@@ -148,7 +153,8 @@ class PipelineStats:
             f"new={self.new_articles}, "
             f"posted={self.posted}, "
             f"skipped={self.skipped}, "
-            f"errors={self.errors}"
+            f"errors={self.errors}, "
+            f"deferred={self.deferred}"
         )
 
 
@@ -261,46 +267,8 @@ class Pipeline:
         for i, article in enumerate(new_articles):
             stop_signal = await self._process_article(article, stats, dry_run)
 
-            if stop_signal is StopSignal.QUOTA_EXHAUSTED:
-                tail = new_articles[i + 1 :]
-                if tail:
-                    stats.remaining_queued = [
-                        RemainingArticleBrief(
-                            article_id=a.id,
-                            title_pl=a.title_pl,
-                            url=a.url,
-                            source_name=a.source_name,
-                        )
-                        for a in tail
-                    ]
-                    stats.remaining_stop_reason = "quota"
-                log.warning(
-                    "quota_exhausted_stopping",
-                    processed=i + 1,
-                    remaining=len(new_articles) - i - 1,
-                )
-                stats.quota_exhausted = True
-                break
-
-            if stop_signal is StopSignal.CAP_REACHED:
-                tail = new_articles[i + 1 :]
-                if tail:
-                    stats.remaining_queued = [
-                        RemainingArticleBrief(
-                            article_id=a.id,
-                            title_pl=a.title_pl,
-                            url=a.url,
-                            source_name=a.source_name,
-                        )
-                        for a in tail
-                    ]
-                    stats.remaining_stop_reason = "post_cap"
-                log.info(
-                    "post_cap_reached",
-                    cap=self.flow_config.pipeline.max_posts_per_run,
-                    remaining=len(new_articles) - i - 1,
-                )
-                stats.post_cap_reached = True
+            if stop_signal is not StopSignal.CONTINUE:
+                self._stop_early(stats, stop_signal, new_articles[i + 1 :], log)
                 break
 
             is_last = i == len(new_articles) - 1
@@ -319,6 +287,36 @@ class Pipeline:
             elapsed_s=stats.elapsed_s,
         )
         return stats
+
+    def _stop_early(
+        self,
+        stats: PipelineStats,
+        stop_signal: StopSignal,
+        tail: list[Article],
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Record why the Run stopped and which new Articles it never reached."""
+        if tail:
+            stats.remaining_queued = [
+                RemainingArticleBrief(
+                    article_id=a.id,
+                    title_pl=a.title_pl,
+                    url=a.url,
+                    source_name=a.source_name,
+                )
+                for a in tail
+            ]
+            stats.remaining_stop_reason = _REMAINING_STOP_REASONS[stop_signal]
+        if stop_signal is StopSignal.QUOTA_EXHAUSTED:
+            stats.quota_exhausted = True
+        elif stop_signal is StopSignal.CAP_REACHED:
+            stats.post_cap_reached = True
+        log.warning(
+            "run_stopped_early",
+            reason=stop_signal.value,
+            remaining=len(tail),
+            cap=self.flow_config.pipeline.max_posts_per_run,
+        )
 
     @staticmethod
     def _check_source_health(
@@ -362,8 +360,9 @@ class Pipeline:
         Main channel failure IS fatal for the article (marked as ERROR).
 
         Failure modes fall into two groups:
-          - Not the article's fault (quota, 503, truncated output): nothing is written
-            to storage, so the article resurfaces untouched on the next run.
+          - Not the article's fault (any DeferralError): the article is Deferred.
+            Nothing is written to storage, so it resurfaces untouched on the next run;
+            the error's stop signal may end the run early.
           - Everything else: recorded as ERROR with an incremented attempt counter.
             Storage keeps returning it as "new" until the retry budget runs out, so a
             one-off network blip cannot retire an article permanently.
@@ -449,61 +448,30 @@ class Pipeline:
                 stats.skipped += 1
                 decision = Decision.SKIPPED
 
-        except GeminiQuotaExhaustedError:
-            # Do NOT save as error — we'll retry this article on the next run
-            # (it won't appear in filter_new_ids since it's not persisted)
+        except DeferralError as exc:
+            # Not the article's fault: do NOT save — it won't be in storage, so
+            # filter_new_ids returns it again on the next run.
+            log.warning(
+                "article_deferred",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                stop_signal=exc.stop_signal.value,
+            )
+            stats.deferred += 1
             stats.article_log.append(
                 ArticleRunEntry(
                     article_id=article.id,
                     title_pl=article.title_pl,
                     ua_title=None,
                     score=None,
-                    decision=Decision.SKIPPED,
-                    error_msg="Gemini daily quota exhausted — not saved, will retry on next run",
-                    report_icon="⏸",
+                    decision=Decision.DEFERRED,
+                    error_msg=exc.report_message,
+                    report_icon=exc.report_icon,
                     source_name=article.source_name,
                     article_url=article.url,
                 )
             )
-            return StopSignal.QUOTA_EXHAUSTED
-
-        except GeminiServerError as exc:
-            # 503 UNAVAILABLE after retries — transient server overload.
-            # Do NOT save to DB so the article is retried on the next pipeline run.
-            log.warning("gemini_unavailable_skipping", error=str(exc))
-            stats.article_log.append(
-                ArticleRunEntry(
-                    article_id=article.id,
-                    title_pl=article.title_pl,
-                    ua_title=None,
-                    score=None,
-                    decision=Decision.SKIPPED,
-                    error_msg=f"Gemini temporarily unavailable (503): {exc}",
-                    report_icon="🔄",
-                    source_name=article.source_name,
-                    article_url=article.url,
-                )
-            )
-            return StopSignal.CONTINUE
-
-        except GeminiResponseIncompleteError as exc:
-            # Output hit the token ceiling, so the JSON is unparseable. The article is
-            # fine — leave it unsaved and let the next run have another go.
-            log.warning("gemini_truncated_skipping", error=str(exc))
-            stats.article_log.append(
-                ArticleRunEntry(
-                    article_id=article.id,
-                    title_pl=article.title_pl,
-                    ua_title=None,
-                    score=None,
-                    decision=Decision.SKIPPED,
-                    error_msg=f"Gemini response truncated: {exc}",
-                    report_icon="✂️",
-                    source_name=article.source_name,
-                    article_url=article.url,
-                )
-            )
-            return StopSignal.CONTINUE
+            return exc.stop_signal
 
         except Exception as exc:
             log.exception("article_error", error=str(exc))

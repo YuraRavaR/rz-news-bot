@@ -184,7 +184,7 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     if entry.report_icon:
         icon = entry.report_icon
     else:
-        decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
+        decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌", "deferred": "🔄"}
         icon = decision_icons.get(entry.decision.value, "❓")
         if entry.decision.value == "posted" and entry.posted_to_events:
             icon = "✅📅"
@@ -256,6 +256,7 @@ def _collect_run_report_segments(
     meta_inner.append(
         f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
         f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
+        + (f" · deferred {stats.deferred}" if stats.deferred else "")
     )
     rq_n = len(stats.remaining_queued)
     if rq_n:
@@ -337,6 +338,8 @@ def _collect_run_report_segments(
         f"skipped={stats.skipped}",
         f"errors={stats.errors}",
     ]
+    if stats.deferred:
+        summary_bits.append(f"deferred={stats.deferred}")
     n_queued = len(stats.remaining_queued)
     if n_queued:
         summary_bits.append(f"not_evaluated_this_run={n_queued}")

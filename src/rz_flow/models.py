@@ -61,6 +61,8 @@ class Decision(StrEnum):
     POSTED = "posted"
     SKIPPED = "skipped"
     ERROR = "error"
+    # Run-report only: a Deferred Article is never written to storage.
+    DEFERRED = "deferred"
 
 
 class StopSignal(StrEnum):

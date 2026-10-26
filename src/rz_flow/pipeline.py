@@ -135,6 +135,9 @@ class PipelineStats:
     source_new: dict[str, int] = field(default_factory=dict)
     # source name → scrape URL (for clickable admin run report)
     source_urls: dict[str, str] = field(default_factory=dict)
+    # source name → max_articles, for Sources whose whole window was new Articles
+    # (older ones may have been cut off; the window may need to grow)
+    source_window_full: dict[str, int] = field(default_factory=dict)
     # Per-article log for admin run report
     article_log: list[ArticleRunEntry] = field(default_factory=list)
     # Articles left for the next Run by a failure that was not their fault
@@ -266,6 +269,7 @@ class Pipeline:
         # Per-source new-article counts for the admin run report
         stats.source_new = dict(Counter(a.source_name for a in new_articles))
         log.info("filter_complete", new=stats.new_articles, seen=seen_count)
+        self._check_source_windows(stats, source_pairs, log)
 
         if not new_articles:
             log.info("no_new_articles")
@@ -365,6 +369,24 @@ class Pipeline:
             f"Джерело не повернуло жодної статті: {urls}. "
             "Ймовірно змінилась верстка сайту або він недоступний — перевірте парсер."
         )
+
+    @staticmethod
+    def _check_source_windows(
+        stats: PipelineStats,
+        source_pairs: list[tuple[ScraperSource, SourceConfig]],
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Flag Sources that returned their full window, every Article in it new.
+
+        A listing page shows only its newest ``max_articles`` Articles; if more than
+        that appeared since the last Run, the older ones were never seen.
+        """
+        for source, src in source_pairs:
+            scraped = stats.source_scraped.get(source.name, 0)
+            if scraped == src.max_articles and stats.source_new.get(source.name, 0) == scraped:
+                stats.source_window_full[source.name] = src.max_articles
+        if stats.source_window_full:
+            log.warning("source_window_full", sources=stats.source_window_full)
 
     async def _process_article(
         self,

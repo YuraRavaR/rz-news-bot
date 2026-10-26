@@ -8,6 +8,7 @@ runs end to end.
 """
 
 import json
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -45,15 +46,28 @@ def _settings() -> Settings:
     )
 
 
-def _flow_config() -> FlowConfig:
-    return FlowConfig(
-        sources=[
+_RZ24 = "rzeszow24/najnowsze"
+_RZN = "rzeszow-news.pl"
+
+
+def _flow_config(rz24_window: int = 5, rzn_window: int | None = None) -> FlowConfig:
+    sources = [
+        SourceConfig(
+            scraper="NajnowszeScraper",
+            base_url="https://rzeszow24.info/najnowsze",
+            max_articles=rz24_window,
+        )
+    ]
+    if rzn_window is not None:
+        sources.append(
             SourceConfig(
-                scraper="NajnowszeScraper",
-                base_url="https://rzeszow24.info/najnowsze",
-                max_articles=5,
+                scraper="RzeszowNewsScraper",
+                base_url="https://rzeszow-news.pl/",
+                max_articles=rzn_window,
             )
-        ],
+        )
+    return FlowConfig(
+        sources=sources,
         pipeline=PipelineConfig(
             gemini_model="gemini-test-model",
             max_posts_per_run=10,
@@ -63,15 +77,32 @@ def _flow_config() -> FlowConfig:
     )
 
 
-def _article(article_id: str) -> Article:
+def _article(article_id: str, title: str | None = None) -> Article:
+    """A rzeszow24 Article; each ID gets its own title unless one is given."""
     return Article(
         id=article_id,
-        url=f"https://rzeszow24.info/imprezy/{article_id}",
+        url=f"https://rzeszow24.info/imprezy/{title_slug(title or article_id)}/{article_id}",
         category=Category.IMPREZY,
-        title_pl="Koncert w Rzeszowie",
+        title_pl=title or f"Koncert w Rzeszowie {article_id}",
         summary_pl="Opis koncertu.",
-        source_name="rzeszow24/najnowsze",
+        source_name=_RZ24,
     )
+
+
+def _rzn_article(slug: str, title: str | None = None) -> Article:
+    """A rzeszow-news.pl Article, whose ID is its slug."""
+    return Article(
+        id=f"rzn/{slug}",
+        url=f"https://rzeszow-news.pl/{slug}/",
+        category=Category.WIADOMOSCI,
+        title_pl=title or f"Wiadomość {slug}",
+        summary_pl="Opis.",
+        source_name=_RZN,
+    )
+
+
+def title_slug(title: str) -> str:
+    return "-".join(title.lower().split())
 
 
 def _event_decision(is_event: bool = True) -> AIDecision:
@@ -127,20 +158,28 @@ def storage() -> InMemoryStorage:
 async def _run(
     storage: InMemoryStorage,
     articles: list[Article],
-    decision: AIDecision,
+    decision: AIDecision | None = None,
     *,
     dry_run: bool = False,
+    evaluate: AsyncMock | None = None,
+    flow_config: FlowConfig | None = None,
 ) -> PipelineStats:
-    """One Run over ``articles`` on shared storage, every Article judged ``decision``."""
+    """One Run over ``articles`` on shared storage.
+
+    Every Article is judged ``decision`` unless an ``evaluate`` mock is given, which
+    also lets a test count how often Gemini was asked.
+    """
     with (
         patch("rz_flow.pipeline.fetch_articles", new_callable=AsyncMock) as fetch,
         patch("rz_flow.pipeline.GeminiAIFilter") as ai_cls,
     ):
-        fetch.return_value = (articles, {"rzeszow24/najnowsze": len(articles)})
+        fetch.return_value = (articles, dict(Counter(a.source_name for a in articles)))
         ai = MagicMock()
-        ai.evaluate = AsyncMock(return_value=decision)
+        ai.evaluate = evaluate or AsyncMock(return_value=decision)
         ai_cls.return_value = ai
-        pipeline = Pipeline(settings=_settings(), storage=storage, flow_config=_flow_config())
+        pipeline = Pipeline(
+            settings=_settings(), storage=storage, flow_config=flow_config or _flow_config()
+        )
         return await pipeline.run(dry_run=dry_run)
 
 
@@ -466,3 +505,70 @@ class TestGeminiModelFromConfig:
         report = _build_run_report(stats, dry_run=False)
         assert "gemini-test-model" in report
         assert "gemini-from-env" not in report
+
+
+def _source_line(report: str, source_name: str) -> str:
+    """The run report's line for one Source in the Sources block."""
+    lines = [line for line in report.splitlines() if f">{source_name}</a>" in line]
+    assert len(lines) == 1, f"expected one Sources line for {source_name}"
+    return lines[0]
+
+
+class TestSourceWindowWarning:
+    """A Source whose whole window is new may have had older Articles cut off."""
+
+    async def test_full_window_of_new_articles_is_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"WIN_{i}") for i in range(3)]
+
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        line = _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+        assert "⚠️" in line
+        assert "max_articles=3" in line
+
+    async def test_fewer_articles_than_the_window_are_not_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"FEW_{i}") for i in range(2)]
+
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        assert "⚠️" not in _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+
+    async def test_full_window_with_an_article_already_in_storage_is_not_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        seen = _article("SEEN_0")
+        await _run(storage, [seen], _event_decision(), flow_config=_flow_config(3))
+
+        articles = [seen, _article("SEEN_1"), _article("SEEN_2")]
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        assert "⚠️" not in _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+
+    async def test_other_sources_are_unaffected(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"MIX_{i}") for i in range(3)] + [_rzn_article("mix-a")]
+
+        stats = await _run(
+            storage, articles, _event_decision(), flow_config=_flow_config(3, rzn_window=3)
+        )
+
+        report = _build_run_report(stats, dry_run=False)
+        assert "⚠️" in _source_line(report, _RZ24)
+        assert "⚠️" not in _source_line(report, _RZN)
+
+    async def test_dry_run_also_flags_a_full_window(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"DRYWIN_{i}") for i in range(3)]
+
+        stats = await _run(
+            storage, articles, _event_decision(), dry_run=True, flow_config=_flow_config(3)
+        )
+
+        assert "max_articles=3" in _source_line(_build_run_report(stats, dry_run=True), _RZ24)
+        assert storage.count() == 0

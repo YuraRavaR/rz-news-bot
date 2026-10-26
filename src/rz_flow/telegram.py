@@ -369,6 +369,12 @@ def _collect_run_report_segments(
             scraped = stats.source_scraped.get(name, 0)
             new = stats.source_new.get(name, 0)
             tail = f": {new} new of {scraped}"
+            window = stats.source_window_full.get(name)
+            if window is not None:
+                tail += (
+                    f" ⚠️ вікно max_articles={window} заповнене лише новими статтями: "
+                    "старіші могли не потрапити, варто його збільшити"
+                )
             url = stats.source_urls.get(name, "").strip()
             if url:
                 safe_href = _html_escape(url)

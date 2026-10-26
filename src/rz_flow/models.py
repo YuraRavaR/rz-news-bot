@@ -118,6 +118,14 @@ class UnconfirmedArticle(BaseModel):
     title_pl: str
 
 
+class JudgedArticle(BaseModel):
+    """A stored Article the AI judged: a possible original for later Repeats."""
+
+    id: str
+    url: str
+    title_pl: str
+
+
 class PublishResult(BaseModel):
     """Result returned by the Telegram publisher."""
 

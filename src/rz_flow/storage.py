@@ -15,7 +15,14 @@ from typing import Protocol, runtime_checkable
 
 import libsql_client
 
-from rz_flow.models import AIDecision, Article, Decision, PostRecord, UnconfirmedArticle
+from rz_flow.models import (
+    AIDecision,
+    Article,
+    Decision,
+    JudgedArticle,
+    PostRecord,
+    UnconfirmedArticle,
+)
 
 # ── SQL DDL ───────────────────────────────────────────────────────────────────
 _CREATE_TABLE = """
@@ -69,6 +76,15 @@ _DATA_MIGRATIONS = [
     "UPDATE posts SET id = 'rzn/' || id WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
 ]
 
+
+# Outcomes the AI reached for an Article: such Articles are originals for Repeats.
+# Error and Repeat rows never are (the AI never judged them).
+_JUDGED_OUTCOMES = (
+    Decision.POSTED,
+    Decision.SKIPPED,
+    Decision.PUBLISHING,
+    Decision.UNCONFIRMED,
+)
 
 # How many times an article may fail before we stop retrying it. A transient blip
 # (network, malformed AI JSON) must not retire an article permanently, but a genuinely
@@ -130,6 +146,12 @@ class StorageProtocol(Protocol):
 
         Runs once at the start of every non-dry Run, before scraping. Safe only
         because production Runs never overlap.
+        """
+        ...
+
+    async def recent_judged_articles(self, since: datetime) -> list[JudgedArticle]:
+        """AI-judged Articles (Published, Skipped, Publishing, Unconfirmed) whose
+        last write is at or after ``since``, oldest first.
         """
         ...
 
@@ -319,6 +341,24 @@ class TursoStorage:
             )
         return stale
 
+    async def recent_judged_articles(self, since: datetime) -> list[JudgedArticle]:
+        client = self._get_client()
+        placeholders = ", ".join("?" * len(_JUDGED_OUTCOMES))
+        # seen_at is an ISO-8601 UTC string, so string order is time order and the
+        # seen_at index serves the range
+        result = await client.execute(
+            f"""
+            SELECT id, url, title_pl FROM posts
+            WHERE seen_at >= ? AND decision IN ({placeholders})
+            ORDER BY seen_at
+            """,
+            [
+                since.astimezone(UTC).isoformat(timespec="microseconds"),
+                *(d.value for d in _JUDGED_OUTCOMES),
+            ],
+        )
+        return [JudgedArticle(id=r[0], url=r[1], title_pl=r[2]) for r in result.rows]
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
@@ -410,6 +450,15 @@ class InMemoryStorage:
         for record in stale:
             self._records[record.id] = record.model_copy(update={"decision": Decision.UNCONFIRMED})
         return [UnconfirmedArticle(id=r.id, url=r.url, title_pl=r.title_pl) for r in stale]
+
+    async def recent_judged_articles(self, since: datetime) -> list[JudgedArticle]:
+        judged = [
+            r
+            for r in self._records.values()
+            if r.decision in _JUDGED_OUTCOMES and r.seen_at >= since
+        ]
+        judged.sort(key=lambda r: r.seen_at)
+        return [JudgedArticle(id=r.id, url=r.url, title_pl=r.title_pl) for r in judged]
 
     async def close(self) -> None:
         pass

@@ -587,6 +587,7 @@ class TestPipelineBranchCoverage:
         broken_storage = MagicMock()
         broken_storage.resolve_stale_publishing = AsyncMock(return_value=[])
         broken_storage.filter_new_ids = AsyncMock(return_value=[article.id])
+        broken_storage.recent_judged_articles = AsyncMock(return_value=[])
         broken_storage.save_decision = AsyncMock(side_effect=RuntimeError("DB connection lost"))
 
         pipeline = Pipeline(

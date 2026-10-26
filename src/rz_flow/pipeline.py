@@ -15,6 +15,7 @@ import asyncio
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 import structlog
 
@@ -35,6 +36,9 @@ logger = structlog.get_logger(__name__)
 # duplicate post on the next run, so it is worth a few seconds.
 _SAVE_MAX_ATTEMPTS = 3
 _SAVE_RETRY_DELAY_S = 1.0
+
+# How far back stored AI-judged Articles count as originals for Repeats
+_REPEAT_WINDOW = timedelta(hours=72)
 
 # Early stops of the Run → the reason recorded for the "not reached" list in the
 # run report. A new stop reason needs an entry here and wording in the report.
@@ -300,9 +304,13 @@ class Pipeline:
             return stats
 
         # ── Stage 3: Repeat check + AI evaluate + publish ─────────────────────
-        # Originals are Articles the AI judged earlier in this Run, so of two
-        # Articles about one Story the earlier one in Run order is the original.
+        # Originals are Articles the AI judged in the last 72 hours (read once, oldest
+        # first) and earlier in this Run, so of two Articles about one Story the
+        # earlier one is the original.
         stories = StoryIndex(_slug_finder([s for s, _ in source_pairs]))
+        since = datetime.now(UTC) - _REPEAT_WINDOW
+        for judged in await self.storage.recent_judged_articles(since):
+            stories.add(Original(article_id=judged.id, url=judged.url, title_pl=judged.title_pl))
         for i, article in enumerate(new_articles):
             original = stories.find_original(article)
             if original is not None:

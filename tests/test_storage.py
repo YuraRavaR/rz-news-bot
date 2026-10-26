@@ -9,12 +9,15 @@ Two levels:
 
 import pathlib
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from rz_flow import storage as storage_module
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.storage import InMemoryStorage, TursoStorage, create_storage
+
+_HOUR = timedelta(hours=1)
 
 # The original May 2026 schema, before ua_*/is_event/error_attempts existed.
 _LEGACY_POSTS_TABLE = """
@@ -721,3 +724,60 @@ async def _repeat_of(storage: InMemoryStorage | TursoStorage, article_id: str) -
         "SELECT repeat_of FROM posts WHERE id = ?", [article_id]
     )
     return result.rows[0][0] if result.rows else None
+
+
+async def _set_last_write(
+    storage: InMemoryStorage | TursoStorage, article_id: str, when: datetime
+) -> None:
+    """Backdate one record's last write."""
+    if isinstance(storage, InMemoryStorage):
+        record = storage.get_record(article_id)
+        assert record is not None
+        storage._records[article_id] = record.model_copy(update={"seen_at": when})
+        return
+    await storage._get_client().execute(
+        "UPDATE posts SET seen_at = ? WHERE id = ?", [when.isoformat(), article_id]
+    )
+
+
+class TestRecentJudgedArticlesContract:
+    """The AI-judged rows of the last 72 hours: the originals a new Article may repeat."""
+
+    async def test_returns_judged_outcomes_and_never_error_or_repeat(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.save_decision(_make_article("J_POSTED"), Decision.POSTED)
+        await any_storage.save_decision(_make_article("J_SKIPPED"), Decision.SKIPPED)
+        await any_storage.save_decision(_make_article("J_ERROR"), Decision.ERROR)
+        await any_storage.save_decision(
+            _make_article("J_REPEAT"), Decision.REPEAT, repeat_of="J_POSTED"
+        )
+        await any_storage.mark_publishing(_make_article("J_UNCONFIRMED"))
+        await any_storage.resolve_stale_publishing()
+        await any_storage.mark_publishing(_make_article("J_PUBLISHING"))
+
+        rows = await any_storage.recent_judged_articles(since=datetime.now(UTC) - _HOUR)
+
+        assert {r.id for r in rows} == {"J_POSTED", "J_SKIPPED", "J_UNCONFIRMED", "J_PUBLISHING"}
+        posted = next(r for r in rows if r.id == "J_POSTED")
+        assert posted.url == _make_article("J_POSTED").url
+        assert posted.title_pl == _make_article("J_POSTED").title_pl
+
+    async def test_window_includes_its_boundary_and_nothing_older(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        since = datetime(2026, 10, 23, 12, 0, 0, 500000, tzinfo=UTC)
+        for article_id, when in [
+            ("W_AT_BOUNDARY", since),
+            ("W_INSIDE", since + _HOUR),
+            ("W_JUST_OUTSIDE", since - timedelta(microseconds=1)),
+            ("W_OLD", since - 24 * _HOUR),
+        ]:
+            await any_storage.save_decision(_make_article(article_id), Decision.POSTED)
+            await _set_last_write(any_storage, article_id, when)
+
+        rows = await any_storage.recent_judged_articles(since=since)
+
+        assert {r.id for r in rows} == {"W_AT_BOUNDARY", "W_INSIDE"}
+        # Oldest first, so the earliest Article about a Story is its original
+        assert [r.id for r in rows] == ["W_AT_BOUNDARY", "W_INSIDE"]

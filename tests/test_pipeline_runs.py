@@ -11,6 +11,7 @@ import json
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -738,3 +739,76 @@ class TestRepeatInOneRun:
         assert "🔁" in _build_run_report(stats, dry_run=True)
         assert storage.count() == 0
         assert bot_api.posts == []
+
+
+class TestRepeatAcrossRuns:
+    """Originals also include AI-judged Articles from the last 72 hours."""
+
+    async def test_story_judged_in_an_earlier_run_is_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        first = _article("ACROSS_A", "Nowe rondo na Krakowskiej")
+        await _run(storage, [first], _event_decision(is_event=False))
+        republished = _article("ACROSS_B", "Nowe rondo na Krakowskiej")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [first, republished], evaluate=evaluate)
+
+        assert evaluate.await_count == 0
+        assert bot_api.posts == [_MAIN]
+        assert stats.repeats == 1
+        assert stats.article_log[0].original is not None
+        assert stats.article_log[0].original.article_id == first.id
+        record = storage.get_record(republished.id)
+        assert record is not None
+        assert record.repeat_of == first.id
+
+    async def test_original_older_than_72_hours_is_not_matched(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        first = _article("OLD_A", "Nowe rondo na Krakowskiej")
+        await _run(storage, [first], _event_decision(is_event=False))
+        record = storage.get_record(first.id)
+        assert record is not None
+        storage._records[first.id] = record.model_copy(
+            update={"seen_at": datetime.now(UTC) - timedelta(hours=73)}
+        )
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage, [_article("OLD_B", "Nowe rondo na Krakowskiej")], evaluate=evaluate
+        )
+
+        assert evaluate.await_count == 1
+        assert stats.repeats == 0
+
+    async def test_dry_run_matches_stored_originals_too(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        first = _article("DRYX_A", "Nowe rondo na Krakowskiej")
+        await _run(storage, [first], _event_decision(is_event=False))
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage,
+            [_article("DRYX_B", "Nowe rondo na Krakowskiej")],
+            evaluate=evaluate,
+            dry_run=True,
+        )
+
+        assert evaluate.await_count == 0
+        assert stats.repeats == 1
+        assert storage.get_record("DRYX_B") is None
+
+    async def test_no_storage_read_without_new_articles(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        article = _article("NOREAD_A")
+        await _run(storage, [article], _event_decision(is_event=False))
+        read = AsyncMock(wraps=storage.recent_judged_articles)
+
+        with patch.object(storage, "recent_judged_articles", read):
+            stats = await _run(storage, [article], _event_decision(is_event=False))
+
+        assert stats.new_articles == 0
+        read.assert_not_awaited()

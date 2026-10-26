@@ -14,6 +14,7 @@ from httpx import Response
 
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.telegram import (
+    TelegramDeliveryUnknownError,
     TelegramPublisher,
     _build_message,
     _html_escape,
@@ -494,16 +495,37 @@ class TestTelegramPublisher:
         assert "🧪 STAGING" in data["text"]
         assert "Чернетковий канал" in data["text"]
 
-    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
     @respx.mock
-    async def test_raises_on_persistent_http_error(self, _mock_sleep: AsyncMock) -> None:
-        respx.post(_tg_url("sendMessage")).mock(
+    async def test_5xx_is_delivery_unknown_and_not_retried(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
             return_value=Response(500, json={"ok": False, "description": "Internal Server Error"})
         )
 
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(TelegramDeliveryUnknownError):
             await publisher.publish(_make_article(), _make_decision())
+        assert route.call_count == 1
+
+    @respx.mock
+    async def test_5xx_with_html_body_is_delivery_unknown(self) -> None:
+        respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(502, text="<html>Bad Gateway</html>")
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramDeliveryUnknownError, match="502"):
+            await publisher.publish(_make_article(), _make_decision())
+
+    @respx.mock
+    async def test_read_timeout_is_delivery_unknown_and_not_retried(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            side_effect=httpx.ReadTimeout("timed out")
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramDeliveryUnknownError):
+            await publisher.publish(_make_article(), _make_decision())
+        assert route.call_count == 1
 
     @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
     @respx.mock

@@ -480,3 +480,110 @@ async def _fetch_row(storage: TursoStorage, article_id: str) -> dict[str, object
     result = await client.execute("SELECT * FROM posts WHERE id = ?", [article_id])
     assert len(result.rows) == 1, f"expected exactly one row for {article_id}"
     return dict(zip(result.columns, result.rows[0], strict=True))
+
+
+# ── Contract: both storages behave the same for Publishing / Unconfirmed ──────
+@pytest.fixture(params=["memory", "turso"])
+async def any_storage(
+    request: pytest.FixtureRequest, tmp_path: pathlib.Path
+) -> AsyncIterator[InMemoryStorage | TursoStorage]:
+    """Each contract test runs once per storage implementation."""
+    if request.param == "memory":
+        yield InMemoryStorage(max_error_attempts=3)
+        return
+    storage = TursoStorage(
+        database_url=f"file:{tmp_path / 'contract.db'}",
+        auth_token="",
+        max_error_attempts=3,
+    )
+    await storage.init()
+    yield storage
+    await storage.close()
+
+
+async def _outcome(
+    storage: InMemoryStorage | TursoStorage, article_id: str
+) -> tuple[Decision, int] | None:
+    """(outcome, error attempts) of one Article, or None when there is no record."""
+    if isinstance(storage, InMemoryStorage):
+        record = storage.get_record(article_id)
+        return (record.decision, record.error_attempts) if record else None
+    client = storage._get_client()
+    result = await client.execute(
+        "SELECT decision, error_attempts FROM posts WHERE id = ?", [article_id]
+    )
+    if not result.rows:
+        return None
+    return Decision(result.rows[0][0]), int(result.rows[0][1])
+
+
+class TestPublishingContract:
+    async def test_mark_publishing_new_article(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("PUB_NEW_123456789")
+
+        previous = await any_storage.mark_publishing(article)
+
+        assert previous is None
+        assert await _outcome(any_storage, article.id) == (Decision.PUBLISHING, 0)
+
+    async def test_mark_publishing_error_article_keeps_attempts(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("PUB_ERR_123456789")
+        await any_storage.save_decision(article, Decision.ERROR)
+        await any_storage.save_decision(article, Decision.ERROR)
+
+        previous = await any_storage.mark_publishing(article)
+
+        assert previous is Decision.ERROR
+        assert await _outcome(any_storage, article.id) == (Decision.PUBLISHING, 2)
+
+    async def test_publishing_is_settled(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("PUB_SETTLED_12345")
+        await any_storage.mark_publishing(article)
+
+        assert await any_storage.filter_new_ids([article.id]) == []
+
+    async def test_resolve_stale_publishing_turns_it_unconfirmed(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        stale = _make_article("PUB_STALE_1234567")
+        posted = _make_article("PUB_POSTED_123456")
+        await any_storage.mark_publishing(stale)
+        await any_storage.save_decision(posted, Decision.POSTED, _make_ai_decision())
+
+        resolved = await any_storage.resolve_stale_publishing()
+
+        assert [(a.id, a.url, a.title_pl) for a in resolved] == [
+            (stale.id, stale.url, stale.title_pl)
+        ]
+        assert await _outcome(any_storage, stale.id) == (Decision.UNCONFIRMED, 0)
+        assert await _outcome(any_storage, posted.id) == (Decision.POSTED, 0)
+        # Resolved once: a second pass finds nothing.
+        assert await any_storage.resolve_stale_publishing() == []
+
+    async def test_unconfirmed_is_settled(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("UNCONF_SETTLED_12")
+        await any_storage.mark_publishing(article)
+        await any_storage.resolve_stale_publishing()
+
+        assert await any_storage.filter_new_ids([article.id]) == []
+
+    async def test_published_over_publishing_resets_attempts(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("PUB_DONE_12345678")
+        await any_storage.save_decision(article, Decision.ERROR)
+        await any_storage.mark_publishing(article)
+
+        await any_storage.save_decision(
+            article, Decision.POSTED, _make_ai_decision(), tg_message_id=7
+        )
+
+        assert await _outcome(any_storage, article.id) == (Decision.POSTED, 0)

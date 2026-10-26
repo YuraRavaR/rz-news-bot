@@ -26,7 +26,7 @@ from rz_flow.models import AIDecision, Article, Decision, StopSignal
 from rz_flow.scraper import fetch_articles
 from rz_flow.sources import ScraperSource, get_active_sources
 from rz_flow.storage import StorageProtocol
-from rz_flow.telegram import TelegramPublisher
+from rz_flow.telegram import TelegramDeliveryUnknownError, TelegramPublisher
 
 logger = structlog.get_logger(__name__)
 
@@ -40,6 +40,7 @@ _SAVE_RETRY_DELAY_S = 1.0
 _REMAINING_STOP_REASONS: dict[StopSignal, str] = {
     StopSignal.QUOTA_EXHAUSTED: "quota",
     StopSignal.CAP_REACHED: "post_cap",
+    StopSignal.PUBLISHING_BLOCKED: "publishing_blocked",
 }
 
 
@@ -124,9 +125,11 @@ class PipelineStats:
     dry_run: bool = False
     quota_exhausted: bool = False  # True if Gemini daily quota was hit
     post_cap_reached: bool = False  # True if max_posts_per_run was hit
+    # Why the Run stopped early; CONTINUE when it went through every new Article
+    stop_signal: StopSignal = StopSignal.CONTINUE
     # New articles never started this run (indices after the stop); empty if none
     remaining_queued: list[RemainingArticleBrief] = field(default_factory=list)
-    # Why the queue tail was skipped: "" | "post_cap" | "quota"
+    # Why the queue tail was skipped: "" | "post_cap" | "quota" | "publishing_blocked"
     remaining_stop_reason: str = ""
     # Per-source counts for admin reporting
     source_scraped: dict[str, int] = field(default_factory=dict)
@@ -233,6 +236,11 @@ class Pipeline:
             model=self.settings.gemini_model,
             min_score=self.settings.ai_min_score,
         )
+        # Before scraping, so a Publishing Article is resolved even after it has
+        # dropped off its Source's listing page.
+        if not dry_run:
+            await self._resolve_stale_publishing(stats, log)
+
         try:
             all_articles, source_scraped = await fetch_articles(self.settings, self.flow_config)
         except Exception as exc:
@@ -298,6 +306,7 @@ class Pipeline:
         log: structlog.stdlib.BoundLogger,
     ) -> None:
         """Record why the Run stopped and which new Articles it never reached."""
+        stats.stop_signal = stop_signal
         if tail:
             stats.remaining_queued = [
                 RemainingArticleBrief(
@@ -319,6 +328,22 @@ class Pipeline:
             remaining=len(tail),
             cap=self.flow_config.pipeline.max_posts_per_run,
         )
+
+    async def _resolve_stale_publishing(
+        self, stats: PipelineStats, log: structlog.stdlib.BoundLogger
+    ) -> None:
+        """Turn Publishing records left by an earlier Run into Unconfirmed, alerting once.
+
+        Their Post may already be in the Main channel, so they are never posted again;
+        the admin checks the channel by hand.
+        """
+        for article in await self.storage.resolve_stale_publishing():
+            log.warning("publishing_unconfirmed", article_id=article.id, url=article.url)
+            stats.alerts.append(
+                f"Не вдалося підтвердити публікацію статті «{article.title_pl}»: "
+                f"{article.url}. Перевірте основний канал: якщо поста там немає, "
+                "опублікуйте його вручну. Бот більше не публікуватиме цю статтю."
+            )
 
     @staticmethod
     def _check_source_health(
@@ -416,6 +441,10 @@ class Pipeline:
                     decision = Decision.POSTED
                     posted_to_events = route_to_events
                 else:
+                    # Write-ahead record: if delivery turns out uncertain, it stays
+                    # Publishing and the Article is never posted again (ADR 0001).
+                    await self.storage.mark_publishing(article)
+
                     # Main channel first — failure IS fatal for the article
                     result = await self.publisher.publish(article, ai_decision)
                     tg_message_id = result.message_id
@@ -475,6 +504,26 @@ class Pipeline:
                 )
             )
             return exc.stop_signal
+
+        except TelegramDeliveryUnknownError as exc:
+            # The Post may be in the Main channel: leave the record Publishing, never
+            # send again, and stop — an unhealthy Telegram would only pile up more.
+            log.error("main_channel_delivery_unknown", error=str(exc))
+            stats.article_log.append(
+                ArticleRunEntry(
+                    article_id=article.id,
+                    title_pl=article.title_pl,
+                    ua_title=ai_decision.ua_title if ai_decision else None,
+                    score=ai_decision.score if ai_decision else None,
+                    decision=Decision.PUBLISHING,
+                    error_msg=f"delivery unknown, check the main channel ({exc})",
+                    source_name=article.source_name,
+                    article_url=article.url,
+                    ai_reason=ai_decision.reason if ai_decision else None,
+                    ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
+                )
+            )
+            return StopSignal.PUBLISHING_BLOCKED
 
         except Exception as exc:
             log.exception("article_error", error=str(exc))

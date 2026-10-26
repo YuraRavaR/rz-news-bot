@@ -44,6 +44,23 @@ _MAX_MESSAGE_LEN = 4096
 # Per-field cap for AI snippets in the admin HTML report (many articles × long text)
 _MAX_ADMIN_AI_SNIPPET = 420
 
+# Failures after the request may have reached Telegram: the Post may be in the channel.
+_DELIVERY_UNKNOWN_ERRORS = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.ProtocolError,
+)
+
+
+class TelegramDeliveryUnknownError(Exception):
+    """The Post may or may not be in the channel (timeout after sending, or a 5xx).
+
+    Never retried: a second send could produce a Duplicate. The Article stays
+    Publishing and a later Run turns it Unconfirmed.
+    """
+
 
 def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
     """Single-line-ish snippet for Telegram HTML (avoids huge admin messages)."""
@@ -184,7 +201,13 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     if entry.report_icon:
         icon = entry.report_icon
     else:
-        decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌", "deferred": "🔄"}
+        decision_icons = {
+            "posted": "✅",
+            "skipped": "⏭",
+            "error": "❌",
+            "deferred": "🔄",
+            "publishing": "❔",
+        }
         icon = decision_icons.get(entry.decision.value, "❓")
         if entry.decision.value == "posted" and entry.posted_to_events:
             icon = "✅📅"
@@ -247,6 +270,10 @@ def _collect_run_report_segments(
         flags += " ⚠️ QUOTA"
     if stats.post_cap_reached:
         flags += " 🔒 CAP"
+    if stats.remaining_stop_reason == "publishing_blocked" or any(
+        e.decision.value == "publishing" for e in stats.article_log
+    ):
+        flags += " ⛔ PUBLISHING BLOCKED"
 
     head_lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> - {now_line}"]
 
@@ -323,6 +350,12 @@ def _collect_run_report_segments(
             intro = (
                 "Gemini quota exhausted; below are the next articles in the list that did not "
                 "start in this run (they will be retried on the next run)."
+            )
+        elif reason == "publishing_blocked":
+            intro = (
+                "Publishing stopped (Telegram unreachable or delivery uncertain, or storage "
+                "unavailable); below are articles not reached in this run (they will be "
+                "retried on the next run)."
             )
         else:
             intro = "Not processed in this run:"
@@ -406,6 +439,15 @@ def _build_run_report(
     return "\n".join(segments)
 
 
+def _tg_description(response: httpx.Response) -> str:
+    """Telegram's error description; gateways in front of it may answer with HTML."""
+    try:
+        description = response.json().get("description")
+    except ValueError:
+        description = None
+    return str(description) if description else response.text[:200]
+
+
 class TelegramPublisher:
     """Publishes messages to a Telegram channel via Bot API."""
 
@@ -435,7 +477,8 @@ class TelegramPublisher:
         """Send a message to the Telegram channel, retrying failed attempts.
 
         Returns PublishResult with the message_id assigned by Telegram.
-        Raises httpx.HTTPStatusError on persistent failures.
+        Raises httpx.HTTPStatusError on persistent failures, and
+        TelegramDeliveryUnknownError (never retried) when the Post may have gone out.
         """
         return await self.publish_once(article, decision)
 
@@ -443,7 +486,8 @@ class TelegramPublisher:
         """Send a message to the Telegram channel with a single attempt.
 
         Used for the events channel, whose Post is never retried.
-        Raises httpx.HTTPStatusError on any failure.
+        Raises TelegramDeliveryUnknownError when the Post may have gone out, and
+        httpx.HTTPStatusError on any other failure.
         """
         text = _build_message(
             article,
@@ -452,15 +496,24 @@ class TelegramPublisher:
         )
 
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                f"{self._base_url}/sendMessage",
-                json={
-                    "chat_id": self._channel_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": False,
-                },
-            )
+            try:
+                response = await client.post(
+                    f"{self._base_url}/sendMessage",
+                    json={
+                        "chat_id": self._channel_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": False,
+                    },
+                )
+            except _DELIVERY_UNKNOWN_ERRORS as exc:
+                logger.error(
+                    "telegram_delivery_unknown",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    chat_id=self._channel_id,
+                )
+                raise TelegramDeliveryUnknownError(f"{type(exc).__name__}: {exc}") from exc
 
             # Handle rate limiting: respect Retry-After header
             if response.status_code == 429:
@@ -471,13 +524,17 @@ class TelegramPublisher:
 
             if not response.is_success:
                 # Log Telegram's actual error description before raising
-                tg_error = response.json().get("description", response.text)
+                tg_error = _tg_description(response)
                 logger.error(
                     "telegram_api_error",
                     status_code=response.status_code,
                     tg_description=tg_error,
                     chat_id=self._channel_id,
                 )
+                if response.is_server_error:
+                    raise TelegramDeliveryUnknownError(
+                        f"HTTP {response.status_code}: {tg_error}"
+                    )
                 response.raise_for_status()
 
         data = response.json()

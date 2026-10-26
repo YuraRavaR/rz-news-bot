@@ -4,8 +4,8 @@
 
 A pipeline that scrapes local news, scores each article with Gemini AI for relevance, and publishes only the most useful ones to a Telegram channel — translated into Ukrainian.
 
-**Sources:** [rzeszow24.info](https://rzeszow24.info) · [rzeszow-news.pl](https://rzeszow-news.pl)  
-**Published in:** Ukrainian  
+**Sources:** [rzeszow24.info](https://rzeszow24.info) · [rzeszow-news.pl](https://rzeszow-news.pl)
+**Published in:** Ukrainian
 **Schedule:** every 3 hours, 06:00–21:00 CET (GitHub Actions cron)
 
 > **Content disclaimer:** This project aggregates publicly available news headlines and URLs from third-party websites. All original content belongs to the respective publishers. This bot does not reproduce full article text — it links back to the original source. Provided for educational and informational purposes only.
@@ -187,7 +187,7 @@ uv run ruff format src/ tests/
 uv run mypy src/rz_flow/
 ```
 
-Install the pre-commit hooks once so lint and type errors are caught before they reach CI:
+Install the pre-commit hooks once so lint, formatting and type errors are caught before they reach CI. The hooks run ruff and mypy through `uv run`, so they use the versions pinned in `uv.lock`, and `.python-version` pins Python 3.12 to match CI:
 
 ```bash
 uv run pre-commit install
@@ -209,7 +209,7 @@ A failure means the parser needs updating — refresh the fixtures in `tests/fix
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `ci.yml` | push (non-`main`), PR | ruff, mypy, pytest on Python 3.12 |
+| `ci.yml` | push (non-`main`), PR | ruff check, ruff format --check, mypy, pytest on Python 3.12 |
 | `publish.yml` | schedule + manual | The actual bot run |
 | `canary.yml` | daily + manual | Live scrape of both sources |
 
@@ -236,4 +236,3 @@ A failure means the parser needs updating — refresh the fixtures in `tests/fix
 **Dead-man's switch.** When `HEALTHCHECK_URL` is set, production Runs that are not dry runs ping healthchecks.io: `/start` first, the bare URL on success, `/fail` when any step fails. Staging and dry-run Runs never ping. A failed ping never fails the Run. Set the check up once by hand: cron schedule identical to `publish.yml` (`23 4,7,10,13,16,19 * * *`), timezone UTC, grace period 3 h, and the Telegram integration pointed at the admin chat (email if the free plan has no Telegram). healthchecks.io then alerts when a scheduled Run does not happen, hangs, or fails, including failures before the Python code starts.
 
 ---
-

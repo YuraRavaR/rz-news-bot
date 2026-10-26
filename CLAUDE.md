@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Rz-Flow: a scheduled batch job (not a long-running bot) that scrapes Rzeszów local news, has Gemini score/translate each article into Ukrainian, and posts the good ones to a Telegram channel. Runs on GitHub Actions cron (`publish.yml`); state lives in Turso (cloud SQLite). Python 3.12, managed with `uv`.
+Rz-Flow: a scheduled batch job (not a long-running bot) that scrapes Rzeszów local news, has Gemini score/translate each article into Ukrainian, and posts the good ones to a Telegram channel. Runs on GitHub Actions cron (`publish.yml`); state lives in Turso (cloud SQLite). Python 3.12 (pinned in `.python-version`), managed with `uv` (pinned to 0.11.8 in every workflow). Dependabot opens weekly grouped update PRs against `stage`.
 
 ## Commands
 
@@ -14,7 +14,8 @@ uv run pytest                                   # tests (coverage on, live tests
 uv run pytest tests/test_pipeline.py::test_name --no-cov   # single test
 uv run pytest -m live --no-cov                  # canary tests against the real news sites
 uv run ruff check src/ tests/                   # lint (CI runs this)
-uv run ruff format src/ tests/
+uv run ruff format src/ tests/                  # CI runs --check
+uv run pre-commit install                       # hooks run ruff/mypy from uv.lock
 uv run mypy                                     # strict mode, configured in pyproject
 
 uv run rz-flow --dry-run                        # evaluate with Gemini, no Telegram posts, no DB writes
@@ -30,7 +31,7 @@ Free tiers only, no paid services (see `docs/adr/0002-free-tier-only.md`). Check
 
 ## Branching
 
-Work happens on `stage`; changes reach `main` through PRs (`stage` → `main`). `main` is protected and a pre-commit hook (`no-commit-to-branch`) refuses commits to it. CI (`ci.yml`) runs ruff, mypy, pytest on every non-`main` push and on PRs.
+Work happens on `stage`; changes reach `main` through PRs (`stage` → `main`). `main` is protected and a pre-commit hook (`no-commit-to-branch`) refuses commits to it. CI (`ci.yml`) runs ruff check, ruff format --check, mypy, pytest on every non-`main` push and on PRs.
 
 ## Architecture
 

@@ -1,20 +1,28 @@
+# Fixtures are frozen copies of live pages and stay byte-for-byte as fetched.
+exclude: ^tests/fixtures/
+
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.8
+  # ruff and mypy run through uv, so their versions come from uv.lock and always
+  # match CI. `uv run --frozen` never rewrites the lockfile from a hook.
+  - repo: local
     hooks:
       - id: ruff
-        args: [--fix]
+        name: ruff check
+        entry: uv run --frozen ruff check --fix
+        language: system
+        types: [python]
       - id: ruff-format
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.15.0
-    hooks:
+        name: ruff format
+        entry: uv run --frozen ruff format
+        language: system
+        types: [python]
       - id: mypy
-        additional_dependencies:
-          - pydantic>=2.11
-          - pydantic-settings>=2.8
-          - types-beautifulsoup4>=4.12
-        args: [--strict]
+        name: mypy
+        # Checks the whole package as configured in pyproject, not just staged files
+        entry: uv run --frozen mypy
+        language: system
+        types: [python]
+        pass_filenames: false
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

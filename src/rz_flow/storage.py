@@ -10,13 +10,19 @@ is as simple as writing a new class that implements StorageProtocol.
 
 from __future__ import annotations
 
-import contextlib
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 import libsql_client
 
-from rz_flow.models import AIDecision, Article, Decision, PostRecord, UnconfirmedArticle
+from rz_flow.models import (
+    AIDecision,
+    Article,
+    Decision,
+    JudgedArticle,
+    PostRecord,
+    UnconfirmedArticle,
+)
 
 # ── SQL DDL ───────────────────────────────────────────────────────────────────
 _CREATE_TABLE = """
@@ -35,7 +41,8 @@ CREATE TABLE IF NOT EXISTS posts (
     ua_title              TEXT,
     ua_summary            TEXT,
     category_tag          TEXT,
-    error_attempts        INTEGER NOT NULL DEFAULT 0
+    error_attempts        INTEGER NOT NULL DEFAULT 0,
+    repeat_of             TEXT
 );
 """
 
@@ -43,16 +50,17 @@ _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_posts_seen_at ON posts(seen_at DESC);
 """
 
-# Schema migrations — ALTER TABLE statements.
-# SQLite does not support "ADD COLUMN IF NOT EXISTS", so errors are silently suppressed:
-# a "duplicate column name" error means the column already exists and we can move on.
-_SCHEMA_MIGRATIONS = [
-    "ALTER TABLE posts ADD COLUMN ua_title TEXT",
-    "ALTER TABLE posts ADD COLUMN ua_summary TEXT",
-    "ALTER TABLE posts ADD COLUMN category_tag TEXT",
-    "ALTER TABLE posts ADD COLUMN is_event INTEGER",
-    "ALTER TABLE posts ADD COLUMN tg_events_message_id INTEGER",
-    "ALTER TABLE posts ADD COLUMN error_attempts INTEGER NOT NULL DEFAULT 0",
+# Schema migrations: columns added after the first release, as (name, definition).
+# At init the current columns are read with PRAGMA table_info and only the missing
+# ones are added. No error is suppressed: a failing ALTER TABLE stops the Run.
+_COLUMN_MIGRATIONS: list[tuple[str, str]] = [
+    ("ua_title", "TEXT"),
+    ("ua_summary", "TEXT"),
+    ("category_tag", "TEXT"),
+    ("is_event", "INTEGER"),
+    ("tg_events_message_id", "INTEGER"),
+    ("error_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("repeat_of", "TEXT"),
 ]
 
 # Data migrations — one-time UPDATE statements that backfill existing rows.
@@ -65,10 +73,18 @@ _SCHEMA_MIGRATIONS = [
 _DATA_MIGRATIONS = [
     "UPDATE posts SET id = 'rz24/' || id "
     "WHERE url LIKE '%rzeszow24.info%' AND id NOT LIKE 'rz24/%'",
-    "UPDATE posts SET id = 'rzn/' || id "
-    "WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
+    "UPDATE posts SET id = 'rzn/' || id WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
 ]
 
+
+# Outcomes the AI reached for an Article: such Articles are originals for Repeats.
+# Error and Repeat rows never are (the AI never judged them).
+_JUDGED_OUTCOMES = (
+    Decision.POSTED,
+    Decision.SKIPPED,
+    Decision.PUBLISHING,
+    Decision.UNCONFIRMED,
+)
 
 # How many times an article may fail before we stop retrying it. A transient blip
 # (network, malformed AI JSON) must not retire an article permanently, but a genuinely
@@ -93,6 +109,10 @@ class StorageProtocol(Protocol):
         """
         ...
 
+    async def existing_ids(self, article_ids: list[str]) -> set[str]:
+        """IDs that have a record of any outcome, retryable Errors included."""
+        ...
+
     async def save_decision(
         self,
         article: Article,
@@ -100,8 +120,12 @@ class StorageProtocol(Protocol):
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
         tg_events_message_id: int | None = None,
+        repeat_of: str | None = None,
     ) -> None:
-        """Persist the processing result for one article."""
+        """Persist the processing result for one article.
+
+        ``repeat_of`` is the original's ID, set only for a Repeat.
+        """
         ...
 
     async def mark_publishing(self, article: Article) -> Decision | None:
@@ -126,6 +150,12 @@ class StorageProtocol(Protocol):
 
         Runs once at the start of every non-dry Run, before scraping. Safe only
         because production Runs never overlap.
+        """
+        ...
+
+    async def recent_judged_articles(self, since: datetime) -> list[JudgedArticle]:
+        """AI-judged Articles (Published, Skipped, Publishing, Unconfirmed) whose
+        last write is at or after ``since``, oldest first.
         """
         ...
 
@@ -176,10 +206,12 @@ class TursoStorage:
         await self._migrate(client)
 
     async def _migrate(self, client: libsql_client.Client) -> None:
-        """Apply schema and data migrations for existing databases."""
-        for sql in _SCHEMA_MIGRATIONS:
-            with contextlib.suppress(Exception):  # column already exists — ignore
-                await client.execute(sql)
+        """Add missing columns, then apply data migrations, for existing databases."""
+        result = await client.execute("PRAGMA table_info(posts)")
+        existing = {row[1] for row in result.rows}
+        for name, definition in _COLUMN_MIGRATIONS:
+            if name not in existing:
+                await client.execute(f"ALTER TABLE posts ADD COLUMN {name} {definition}")
         for sql in _DATA_MIGRATIONS:
             await client.execute(sql)  # must succeed — no suppression
 
@@ -189,7 +221,7 @@ class TursoStorage:
 
         client = self._get_client()
         placeholders = ", ".join("?" * len(article_ids))
-        # "Settled" = posted, skipped, publishing, unconfirmed, or errored past the
+        # "Settled" = posted, skipped, repeat, publishing, unconfirmed, or errored past the
         # retry budget. Anything else in this batch still needs work, including rows
         # we are about to retry.
         result = await client.execute(
@@ -203,6 +235,15 @@ class TursoStorage:
         settled_ids = {row[0] for row in result.rows}
         return [aid for aid in article_ids if aid not in settled_ids]
 
+    async def existing_ids(self, article_ids: list[str]) -> set[str]:
+        if not article_ids:
+            return set()
+        placeholders = ", ".join("?" * len(article_ids))
+        result = await self._get_client().execute(
+            f"SELECT id FROM posts WHERE id IN ({placeholders})", article_ids
+        )
+        return {row[0] for row in result.rows}
+
     async def save_decision(
         self,
         article: Article,
@@ -210,6 +251,7 @@ class TursoStorage:
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
         tg_events_message_id: int | None = None,
+        repeat_of: str | None = None,
     ) -> None:
         client = self._get_client()
         is_error = decision == Decision.ERROR
@@ -220,8 +262,8 @@ class TursoStorage:
             INSERT INTO posts
               (id, url, category, title_pl, seen_at, decision,
                ai_score, ai_reason, is_event, tg_message_id, tg_events_message_id,
-               ua_title, ua_summary, category_tag, error_attempts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ua_title, ua_summary, category_tag, error_attempts, repeat_of)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 url                  = excluded.url,
                 category             = excluded.category,
@@ -236,6 +278,7 @@ class TursoStorage:
                 ua_title             = excluded.ua_title,
                 ua_summary           = excluded.ua_summary,
                 category_tag         = excluded.category_tag,
+                repeat_of            = excluded.repeat_of,
                 error_attempts       = CASE
                     WHEN excluded.decision = ?
                     THEN COALESCE(posts.error_attempts, 0) + 1
@@ -258,6 +301,7 @@ class TursoStorage:
                 ai_decision.ua_summary if ai_decision else None,
                 ai_decision.category_tag.value if ai_decision else None,
                 1 if is_error else 0,
+                repeat_of,
                 Decision.ERROR.value,
             ],
         )
@@ -310,6 +354,24 @@ class TursoStorage:
             )
         return stale
 
+    async def recent_judged_articles(self, since: datetime) -> list[JudgedArticle]:
+        client = self._get_client()
+        placeholders = ", ".join("?" * len(_JUDGED_OUTCOMES))
+        # seen_at is an ISO-8601 UTC string, so string order is time order and the
+        # seen_at index serves the range
+        result = await client.execute(
+            f"""
+            SELECT id, url, title_pl FROM posts
+            WHERE seen_at >= ? AND decision IN ({placeholders})
+            ORDER BY seen_at
+            """,
+            [
+                since.astimezone(UTC).isoformat(timespec="microseconds"),
+                *(d.value for d in _JUDGED_OUTCOMES),
+            ],
+        )
+        return [JudgedArticle(id=r[0], url=r[1], title_pl=r[2]) for r in result.rows]
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
@@ -333,6 +395,9 @@ class InMemoryStorage:
     async def filter_new_ids(self, article_ids: list[str]) -> list[str]:
         return [aid for aid in article_ids if not self._is_settled(aid)]
 
+    async def existing_ids(self, article_ids: list[str]) -> set[str]:
+        return {aid for aid in article_ids if aid in self._records}
+
     def _is_settled(self, article_id: str) -> bool:
         record = self._records.get(article_id)
         if record is None:
@@ -348,6 +413,7 @@ class InMemoryStorage:
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
         tg_events_message_id: int | None = None,
+        repeat_of: str | None = None,
     ) -> None:
         previous = self._records.get(article.id)
         prior_attempts = previous.error_attempts if previous else 0
@@ -366,6 +432,7 @@ class InMemoryStorage:
             ua_summary=ai_decision.ua_summary if ai_decision else None,
             category_tag=ai_decision.category_tag.value if ai_decision else None,
             error_attempts=prior_attempts + 1 if decision == Decision.ERROR else 0,
+            repeat_of=repeat_of,
         )
 
     async def mark_publishing(self, article: Article) -> Decision | None:
@@ -397,10 +464,17 @@ class InMemoryStorage:
         stale = [r for r in self._records.values() if r.decision == Decision.PUBLISHING]
         stale.sort(key=lambda r: r.seen_at)
         for record in stale:
-            self._records[record.id] = record.model_copy(
-                update={"decision": Decision.UNCONFIRMED}
-            )
+            self._records[record.id] = record.model_copy(update={"decision": Decision.UNCONFIRMED})
         return [UnconfirmedArticle(id=r.id, url=r.url, title_pl=r.title_pl) for r in stale]
+
+    async def recent_judged_articles(self, since: datetime) -> list[JudgedArticle]:
+        judged = [
+            r
+            for r in self._records.values()
+            if r.decision in _JUDGED_OUTCOMES and r.seen_at >= since
+        ]
+        judged.sort(key=lambda r: r.seen_at)
+        return [JudgedArticle(id=r.id, url=r.url, title_pl=r.title_pl) for r in judged]
 
     async def close(self) -> None:
         pass

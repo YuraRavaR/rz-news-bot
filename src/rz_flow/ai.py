@@ -255,9 +255,7 @@ def _build_response_schema(min_score: float) -> dict[str, object]:
         "properties": {
             "is_interesting": {
                 "type": "boolean",
-                "description": (
-                    f"True if score >= {threshold} and article should be published"
-                ),
+                "description": (f"True if score >= {threshold} and article should be published"),
             },
             "is_event": {
                 "type": "boolean",

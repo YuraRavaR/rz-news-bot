@@ -40,7 +40,8 @@ def _make_article(article_id: str, category: Category = Category.IMPREZY) -> Art
         id=article_id,
         url=f"https://rzeszow24.info/imprezy/{article_id}",
         category=category,
-        title_pl="Festiwal w Rzeszowie",
+        # A title of its own, so distinct Articles are never Repeats of each other
+        title_pl=f"Festiwal w Rzeszowie {article_id}",
         summary_pl="Opis festiwalu.",
     )
 
@@ -79,6 +80,7 @@ def _make_flow_config(max_posts_per_run: int = 10) -> FlowConfig:
             )
         ],
         pipeline=PipelineConfig(
+            gemini_model="gemini-test-model",
             max_posts_per_run=max_posts_per_run,
             # Zero delays so tests run at full speed (production uses 5s/2s for rate limiting)
             inter_ai_delay_seconds=0.0,
@@ -335,7 +337,6 @@ class TestPipelineRunBasic:
         assert stats.new_articles == 0
         mock_ai.evaluate.assert_not_called()
 
-
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")
     @patch("rz_flow.pipeline.TelegramPublisher")
@@ -542,9 +543,7 @@ class TestPipelineBranchCoverage:
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
-        mock_ai.evaluate = AsyncMock(
-            side_effect=[server_err, _make_interesting_decision()]
-        )
+        mock_ai.evaluate = AsyncMock(side_effect=[server_err, _make_interesting_decision()])
 
         mock_tg = MagicMock()
         mock_tg_cls.return_value = mock_tg
@@ -588,6 +587,7 @@ class TestPipelineBranchCoverage:
         broken_storage = MagicMock()
         broken_storage.resolve_stale_publishing = AsyncMock(return_value=[])
         broken_storage.filter_new_ids = AsyncMock(return_value=[article.id])
+        broken_storage.recent_judged_articles = AsyncMock(return_value=[])
         broken_storage.save_decision = AsyncMock(side_effect=RuntimeError("DB connection lost"))
 
         pipeline = Pipeline(
@@ -946,7 +946,9 @@ class TestSourceHealthAlerts:
                     ),
                 ],
                 pipeline=PipelineConfig(
-                    inter_ai_delay_seconds=0.0, inter_post_delay_seconds=0.0
+                    gemini_model="gemini-test-model",
+                    inter_ai_delay_seconds=0.0,
+                    inter_post_delay_seconds=0.0,
                 ),
             ),
         )

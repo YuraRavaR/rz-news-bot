@@ -2,12 +2,11 @@
 
 rzeszow24.info
 --------------
-  parse_najnowsze_page(html)      — /najnowsze unified feed (active)
-  parse_category_page(html, cat)  — /imprezy/ or /wiadomosci/ pages (archived)
+  parse_najnowsze_page(html)      — /najnowsze unified feed
 
 rzeszow-news.pl
 ---------------
-  parse_rzeszow_news_page(html)   — homepage td_module_10 cards (active)
+  parse_rzeszow_news_page(html)   — homepage td_module_10 cards
 """
 
 import re
@@ -20,17 +19,6 @@ from rz_flow.models import Article, Category
 # Regex to extract the unique article ID from the URL tail
 # URL pattern: https://rzeszow24.info/{category}/{slug}/{ID}
 _ID_RE: Final = re.compile(r"/([A-Za-z0-9_-]{15,30})/?$")
-
-# Category badge text → Category enum (the site uses Polish names)
-_BADGE_MAP: Final[dict[str, Category]] = {
-    "imprezy": Category.IMPREZY,
-    "wiadomości": Category.WIADOMOSCI,
-    "wiadomosci": Category.WIADOMOSCI,
-    "sport": Category.WIADOMOSCI,  # sport is grouped with news for AI scoring
-    "podkarpacie": Category.WIADOMOSCI,
-    "praca rzeszów": Category.WIADOMOSCI,
-    "polska i świat": Category.WIADOMOSCI,
-}
 
 
 def _extract_id(url: str) -> str | None:
@@ -64,7 +52,7 @@ def _category_from_url(href: str) -> Category | None:
         return Category.IMPREZY
     if "/wiadomosci/" in href:
         return Category.WIADOMOSCI
-    # /najnowsze mixes in sport articles; same grouping as _BADGE_MAP["sport"]
+    # /najnowsze mixes in sport articles, grouped with news for AI scoring
     if "/sport/" in href:
         return Category.WIADOMOSCI
     return None
@@ -145,94 +133,6 @@ def parse_najnowsze_page(html: str) -> list[Article]:
 
         title_el.extract()
         lead = text_block.get_text(strip=True).lstrip(".,: ").strip()
-        lead = re.sub(r"\s*\(\.{3}\)\s*$", "", lead).strip()
-
-        articles[article_id] = Article(
-            id=article_id,
-            url=href,
-            category=category,
-            title_pl=title,
-            summary_pl=lead,
-        )
-
-    return list(articles.values())
-
-
-def parse_category_page(html: str, category: Category) -> list[Article]:
-    """Parse a category listing page and return unique Article objects.
-
-    Works on both /imprezy/ and /wiadomosci/ page HTML.
-    Deduplicates by article ID. Ignores sponsored content.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    articles: dict[str, Article] = {}
-
-    # ── 1. Image tile cards (featured, top section) ──────────────────────────
-    for link in soup.find_all("a", href=True):
-        href = link.get("href", "")
-        if f"/{category.value}/" not in href:
-            continue
-        if _is_sponsored(link):
-            continue
-
-        tile = link.find(class_="image-tile-overlay")
-        if not tile:
-            continue
-
-        article_id = _extract_id(href)
-        if not article_id or article_id in articles:
-            continue
-
-        title_el = tile.find("h3", class_="image-tile-overlay__title")
-        if not title_el:
-            # Fall back to mobile title
-            mobile = link.find(class_="image-tile-overlay-mobile")
-            title_el = mobile.find("p") if mobile else None
-
-        if not title_el:
-            continue
-
-        title = _clean_title(title_el.get_text(strip=True))
-        if not title:
-            continue
-
-        articles[article_id] = Article(
-            id=article_id,
-            url=href,
-            category=category,
-            title_pl=title,
-            summary_pl="",
-        )
-
-    # ── 2. Text listing items (regular list, has lead paragraph) ─────────────
-    for link in soup.find_all("a", href=True):
-        href = link.get("href", "")
-        if f"/{category.value}/" not in href:
-            continue
-        if _is_sponsored(link):
-            continue
-
-        text_block = link.find(class_="news-listing-item__text")
-        if not text_block:
-            continue
-
-        article_id = _extract_id(href)
-        if not article_id or article_id in articles:
-            continue
-
-        # Title is in the <strong> tag; summary is the surrounding text
-        title_el = text_block.find("strong")
-        if not title_el:
-            continue
-
-        title = title_el.get_text(strip=True)
-        if not title:
-            continue
-
-        # Extract lead text: everything after </strong> in the paragraph
-        title_el.extract()
-        lead = text_block.get_text(strip=True).lstrip(".,: ").strip()
-        # Remove trailing ellipsis marker "(…)" or "(...)"
         lead = re.sub(r"\s*\(\.{3}\)\s*$", "", lead).strip()
 
         articles[article_id] = Article(

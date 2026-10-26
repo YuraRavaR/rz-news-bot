@@ -5,6 +5,9 @@ This tests our message formatting, API call structure, retry logic,
 and rate-limit handling.
 """
 
+import html
+import json
+import re
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -59,6 +62,9 @@ class TestHtmlEscape:
 
     def test_escapes_less_than(self) -> None:
         assert _html_escape("<tag>") == "&lt;tag&gt;"
+
+    def test_escapes_double_quote(self) -> None:
+        assert _html_escape('say "hi"') == "say &quot;hi&quot;"
 
     def test_leaves_normal_text_unchanged(self) -> None:
         assert _html_escape("Normal text 2026") == "Normal text 2026"
@@ -448,6 +454,67 @@ class TestBuildRunReport:
 
 
 # ── Integration tests with mocked HTTP ───────────────────────────────────────
+class TestPostLinks:
+    """The "details" link opens the right Article whatever its URL contains."""
+
+    @respx.mock
+    async def test_url_with_ampersand_and_quote_is_escaped_and_resolves(self) -> None:
+        url = 'https://rzeszow-news.pl/a-b/?x=1&y="2"'
+        article = _make_article().model_copy(update={"url": url})
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 1}})
+        )
+
+        await TelegramPublisher(bot_token="fake-token", channel_id="-1").publish(
+            article, _make_decision()
+        )
+
+        text = json.loads(route.calls[0].request.content)["text"]
+        hrefs = re.findall(r'<a href="([^"]*)">', text)
+        assert hrefs == ["https://rzeszow-news.pl/a-b/?x=1&amp;y=&quot;2&quot;"]
+        assert html.unescape(hrefs[0]) == url
+
+    def test_title_and_summary_quotes_are_escaped(self) -> None:
+        decision = _make_decision('Фестиваль "Жешів"').model_copy(
+            update={"ua_summary": 'Гурт "Океан" & друзі'}
+        )
+
+        msg = _build_message(_make_article(), decision)
+
+        assert "Фестиваль &quot;Жешів&quot;" in msg
+        assert "Гурт &quot;Океан&quot; &amp; друзі" in msg
+
+    @respx.mock
+    @pytest.mark.parametrize("single_attempt", [False, True], ids=["main", "events"])
+    async def test_channel_post_requests_a_preview_of_the_article(
+        self, single_attempt: bool
+    ) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 1}})
+        )
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-1")
+        article = _make_article()
+
+        send = publisher.publish_once if single_attempt else publisher.publish
+        await send(article, _make_decision())
+
+        data = json.loads(route.calls[0].request.content)
+        assert data["link_preview_options"] == {"is_disabled": False, "url": article.url}
+        assert "disable_web_page_preview" not in data
+
+    @respx.mock
+    async def test_alerts_never_send_the_deprecated_preview_parameter(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": True, "result": {"message_id": 1}})
+        )
+
+        await TelegramPublisher(
+            bot_token="fake-token", channel_id="-1", admin_chat_id="2"
+        ).send_alert("x")
+
+        assert "disable_web_page_preview" not in json.loads(route.calls[0].request.content)
+
+
 class TestTelegramPublisher:
     @respx.mock
     async def test_successful_publish_returns_result(self) -> None:
@@ -521,9 +588,7 @@ class TestTelegramPublisher:
 
     @respx.mock
     async def test_read_timeout_is_delivery_unknown_and_not_retried(self) -> None:
-        route = respx.post(_tg_url("sendMessage")).mock(
-            side_effect=httpx.ReadTimeout("timed out")
-        )
+        route = respx.post(_tg_url("sendMessage")).mock(side_effect=httpx.ReadTimeout("timed out"))
 
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
         with pytest.raises(TelegramDeliveryUnknownError):
@@ -532,9 +597,7 @@ class TestTelegramPublisher:
 
     @patch("rz_flow.telegram._sleep", new_callable=AsyncMock)
     @respx.mock
-    async def test_publish_respects_retry_after_header_on_429(
-        self, mock_sleep: AsyncMock
-    ) -> None:
+    async def test_publish_respects_retry_after_header_on_429(self, mock_sleep: AsyncMock) -> None:
         """429 response: waits once for the Retry-After value, then retries once."""
         call_count = 0
 
@@ -752,7 +815,8 @@ class TestSendRunReportRespx:
         data = json.loads(route.calls[0].request.content)
         assert data["chat_id"] == "777admin"
         assert data["parse_mode"] == "HTML"
-        assert data["disable_web_page_preview"] is True
+        assert data["link_preview_options"] == {"is_disabled": True}
+        assert "disable_web_page_preview" not in data
 
     @respx.mock
     async def test_send_run_report_splits_long_html_into_multiple_messages(self) -> None:

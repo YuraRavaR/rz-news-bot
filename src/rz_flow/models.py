@@ -6,7 +6,6 @@ They are intentionally simple for MVP — extend via subclassing, not editing.
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -65,6 +64,9 @@ class Decision(StrEnum):
     PUBLISHING = "publishing"
     # A Publishing record that a later Run found unresolved. Final.
     UNCONFIRMED = "unconfirmed"
+    # Not sent to the AI: it already judged another Article about the same Story.
+    # Final; the record keeps the original's ID.
+    REPEAT = "repeat"
     # Run-report only: a Deferred Article is never written to storage.
     DEFERRED = "deferred"
 
@@ -102,10 +104,22 @@ class PostRecord(BaseModel):
         default=0,
         description="Consecutive failed processing attempts; reset to 0 on success",
     )
+    repeat_of: str | None = Field(
+        default=None,
+        description="For a Repeat, the ID of the original Article",
+    )
 
 
 class UnconfirmedArticle(BaseModel):
     """A Publishing Article turned Unconfirmed at Run start; the admin is told once."""
+
+    id: str
+    url: str
+    title_pl: str
+
+
+class JudgedArticle(BaseModel):
+    """A stored Article the AI judged: a possible original for later Repeats."""
 
     id: str
     url: str
@@ -118,7 +132,3 @@ class PublishResult(BaseModel):
     article_id: str
     message_id: int
     chat_id: str
-
-
-# Type alias used in pipeline for brevity
-ProcessedArticle = tuple[Article, AIDecision | None, Literal["posted", "skipped", "error"]]

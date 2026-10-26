@@ -60,9 +60,7 @@ async def test_source_still_yields_articles(
 
 
 @pytest.mark.parametrize("source", _SOURCES, ids=_SOURCE_IDS)
-async def test_parsed_articles_are_usable(
-    source: ScraperSource, client: httpx.AsyncClient
-) -> None:
+async def test_parsed_articles_are_usable(source: ScraperSource, client: httpx.AsyncClient) -> None:
     """Parsing can 'succeed' while producing empty titles or broken URLs."""
     articles = await source.fetch(client, max_articles=5)
 

@@ -9,11 +9,30 @@ Two levels:
 
 import pathlib
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from rz_flow import storage as storage_module
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.storage import InMemoryStorage, TursoStorage, create_storage
+
+_HOUR = timedelta(hours=1)
+
+# The original May 2026 schema, before ua_*/is_event/error_attempts existed.
+_LEGACY_POSTS_TABLE = """
+CREATE TABLE posts (
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL,
+    category      TEXT NOT NULL,
+    title_pl      TEXT NOT NULL,
+    seen_at       TEXT NOT NULL,
+    decision      TEXT NOT NULL,
+    ai_score      REAL,
+    ai_reason     TEXT,
+    tg_message_id INTEGER
+)
+"""
 
 
 def _make_article(article_id: str = "TESTID123456789") -> Article:
@@ -353,9 +372,7 @@ class TestTursoStorageSql:
         await turso.save_decision(article, Decision.POSTED, _make_ai_decision())
 
         client = turso._get_client()
-        result = await client.execute(
-            "SELECT COUNT(*) FROM posts WHERE id = ?", [article.id]
-        )
+        result = await client.execute("SELECT COUNT(*) FROM posts WHERE id = ?", [article.id])
         assert result.rows[0][0] == 1
 
     async def test_error_attempts_increment_in_sql(self, turso: TursoStorage) -> None:
@@ -400,23 +417,7 @@ class TestTursoStorageMigrations:
     async def test_adds_columns_to_legacy_table(self, tmp_path: pathlib.Path) -> None:
         db_path = f"file:{tmp_path / 'legacy.db'}"
         storage = TursoStorage(database_url=db_path, auth_token="")
-        client = storage._get_client()
-        # The original May 2026 schema, before ua_*/is_event/error_attempts existed.
-        await client.execute(
-            """
-            CREATE TABLE posts (
-                id            TEXT PRIMARY KEY,
-                url           TEXT NOT NULL,
-                category      TEXT NOT NULL,
-                title_pl      TEXT NOT NULL,
-                seen_at       TEXT NOT NULL,
-                decision      TEXT NOT NULL,
-                ai_score      REAL,
-                ai_reason     TEXT,
-                tg_message_id INTEGER
-            )
-            """
-        )
+        await storage._get_client().execute(_LEGACY_POSTS_TABLE)
 
         await storage.init()
 
@@ -429,9 +430,89 @@ class TestTursoStorageMigrations:
         assert row["error_attempts"] == 0
         await storage.close()
 
-    async def test_backfills_source_prefix_on_legacy_ids(
-        self, tmp_path: pathlib.Path
+    async def test_legacy_rows_survive_the_upgrade(self, tmp_path: pathlib.Path) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'legacy.db'}", auth_token="")
+        client = storage._get_client()
+        await client.execute(_LEGACY_POSTS_TABLE)
+        await client.execute(
+            "INSERT INTO posts (id, url, category, title_pl, seen_at, decision) "
+            "VALUES ('rz24/OLD', 'https://rzeszow24.info/x/OLD', 'wiadomosci', 'Stary', "
+            "'2026-05-01T00:00:00+00:00', 'posted')"
+        )
+
+        await storage.init()
+
+        row = await _fetch_row(storage, "rz24/OLD")
+        assert row["title_pl"] == "Stary"
+        assert row["decision"] == "posted"
+        assert row["error_attempts"] == 0
+        assert await storage.filter_new_ids(["rz24/OLD"]) == []
+        await storage.close()
+
+    async def test_second_init_runs_no_alter_table(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'current.db'}", auth_token="")
+        await storage.init()
+        client = storage._get_client()
+        executed: list[str] = []
+        real_execute = client.execute
+
+        async def _spy(sql: str, *args: object) -> object:
+            executed.append(sql)
+            return await real_execute(sql, *args)
+
+        monkeypatch.setattr(client, "execute", _spy)
+
+        await storage.init()
+
+        assert not [sql for sql in executed if "ALTER TABLE" in sql.upper()]
+        await storage.close()
+
+    async def test_a_failing_migration_raises(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'broken.db'}", auth_token="")
+        await storage.init()
+        # SQLite never lets ALTER TABLE add a PRIMARY KEY column.
+        monkeypatch.setattr(
+            storage_module,
+            "_COLUMN_MIGRATIONS",
+            [*storage_module._COLUMN_MIGRATIONS, ("broken", "INTEGER PRIMARY KEY")],
+        )
+
+        with pytest.raises(Exception, match="PRIMARY KEY"):
+            await storage.init()
+        await storage.close()
+
+    async def test_fresh_database_gets_the_full_schema(self, tmp_path: pathlib.Path) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'fresh.db'}", auth_token="")
+        await storage.init()
+
+        result = await storage._get_client().execute("PRAGMA table_info(posts)")
+        columns = {row[1] for row in result.rows}
+
+        assert columns == {
+            "id",
+            "url",
+            "category",
+            "title_pl",
+            "seen_at",
+            "decision",
+            "ai_score",
+            "ai_reason",
+            "is_event",
+            "tg_message_id",
+            "tg_events_message_id",
+            "ua_title",
+            "ua_summary",
+            "category_tag",
+            "error_attempts",
+            "repeat_of",
+        }
+        await storage.close()
+
+    async def test_backfills_source_prefix_on_legacy_ids(self, tmp_path: pathlib.Path) -> None:
         """QW-2 data migration: un-prefixed IDs get their source prefix."""
         db_path = f"file:{tmp_path / 'prefix.db'}"
         storage = TursoStorage(database_url=db_path, auth_token="")
@@ -540,9 +621,7 @@ class TestPublishingContract:
         assert previous is Decision.ERROR
         assert await _outcome(any_storage, article.id) == (Decision.PUBLISHING, 2)
 
-    async def test_publishing_is_settled(
-        self, any_storage: InMemoryStorage | TursoStorage
-    ) -> None:
+    async def test_publishing_is_settled(self, any_storage: InMemoryStorage | TursoStorage) -> None:
         article = _make_article("PUB_SETTLED_12345")
         await any_storage.mark_publishing(article)
 
@@ -622,3 +701,101 @@ class TestPublishingContract:
         await any_storage.save_decision(article, Decision.ERROR, _make_ai_decision())
 
         assert await _outcome(any_storage, article.id) == (Decision.ERROR, 2)
+
+
+class TestRepeatContract:
+    async def test_repeat_is_settled_and_keeps_its_original(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("REPEAT_123456789")
+
+        await any_storage.save_decision(article, Decision.REPEAT, repeat_of="ORIGINAL_1234567")
+
+        assert await any_storage.filter_new_ids([article.id]) == []
+        assert await _outcome(any_storage, article.id) == (Decision.REPEAT, 0)
+        assert await _repeat_of(any_storage, article.id) == "ORIGINAL_1234567"
+
+
+async def _repeat_of(storage: InMemoryStorage | TursoStorage, article_id: str) -> str | None:
+    if isinstance(storage, InMemoryStorage):
+        record = storage.get_record(article_id)
+        return record.repeat_of if record else None
+    result = await storage._get_client().execute(
+        "SELECT repeat_of FROM posts WHERE id = ?", [article_id]
+    )
+    return result.rows[0][0] if result.rows else None
+
+
+async def _set_last_write(
+    storage: InMemoryStorage | TursoStorage, article_id: str, when: datetime
+) -> None:
+    """Backdate one record's last write."""
+    if isinstance(storage, InMemoryStorage):
+        record = storage.get_record(article_id)
+        assert record is not None
+        storage._records[article_id] = record.model_copy(update={"seen_at": when})
+        return
+    await storage._get_client().execute(
+        "UPDATE posts SET seen_at = ? WHERE id = ?", [when.isoformat(), article_id]
+    )
+
+
+class TestRecentJudgedArticlesContract:
+    """The AI-judged rows of the last 72 hours: the originals a new Article may repeat."""
+
+    async def test_returns_judged_outcomes_and_never_error_or_repeat(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.save_decision(_make_article("J_POSTED"), Decision.POSTED)
+        await any_storage.save_decision(_make_article("J_SKIPPED"), Decision.SKIPPED)
+        await any_storage.save_decision(_make_article("J_ERROR"), Decision.ERROR)
+        await any_storage.save_decision(
+            _make_article("J_REPEAT"), Decision.REPEAT, repeat_of="J_POSTED"
+        )
+        await any_storage.mark_publishing(_make_article("J_UNCONFIRMED"))
+        await any_storage.resolve_stale_publishing()
+        await any_storage.mark_publishing(_make_article("J_PUBLISHING"))
+
+        rows = await any_storage.recent_judged_articles(since=datetime.now(UTC) - _HOUR)
+
+        assert {r.id for r in rows} == {"J_POSTED", "J_SKIPPED", "J_UNCONFIRMED", "J_PUBLISHING"}
+        posted = next(r for r in rows if r.id == "J_POSTED")
+        assert posted.url == _make_article("J_POSTED").url
+        assert posted.title_pl == _make_article("J_POSTED").title_pl
+
+    async def test_window_includes_its_boundary_and_nothing_older(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        since = datetime(2026, 10, 23, 12, 0, 0, 500000, tzinfo=UTC)
+        for article_id, when in [
+            ("W_AT_BOUNDARY", since),
+            ("W_INSIDE", since + _HOUR),
+            ("W_JUST_OUTSIDE", since - timedelta(microseconds=1)),
+            ("W_OLD", since - 24 * _HOUR),
+        ]:
+            await any_storage.save_decision(_make_article(article_id), Decision.POSTED)
+            await _set_last_write(any_storage, article_id, when)
+
+        rows = await any_storage.recent_judged_articles(since=since)
+
+        assert {r.id for r in rows} == {"W_AT_BOUNDARY", "W_INSIDE"}
+        # Oldest first, so the earliest Article about a Story is its original
+        assert [r.id for r in rows] == ["W_AT_BOUNDARY", "W_INSIDE"]
+
+
+class TestExistingIdsContract:
+    async def test_returns_ids_with_any_record_including_retryable_errors(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.save_decision(_make_article("E_POSTED"), Decision.POSTED)
+        await any_storage.save_decision(_make_article("E_ERROR"), Decision.ERROR)
+        await any_storage.mark_publishing(_make_article("E_PUBLISHING"))
+
+        found = await any_storage.existing_ids(["E_POSTED", "E_ERROR", "E_PUBLISHING", "E_NEW"])
+
+        assert found == {"E_POSTED", "E_ERROR", "E_PUBLISHING"}
+
+    async def test_empty_input_returns_nothing(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        assert await any_storage.existing_ids([]) == set()

@@ -34,9 +34,7 @@ _GREEN = "\033[32m"
 _CYAN = "\033[36m"
 
 
-def _drop_ai_evaluated(
-    logger: WrappedLogger, method: str, event_dict: EventDict
-) -> EventDict:
+def _drop_ai_evaluated(logger: WrappedLogger, method: str, event_dict: EventDict) -> EventDict:
     """Drop ai_evaluated — its data surfaces in the published/skipped line."""
     if event_dict.get("event") == "ai_evaluated":
         raise structlog.DropEvent()
@@ -181,9 +179,7 @@ class _PrettyRenderer:
                 error = ctx.get("error", "")
                 first_line = error.split("\n")[0]
                 rest = "\n".join(
-                    f"           {_DIM}{ln}{_R}"
-                    for ln in error.split("\n")[1:]
-                    if ln.strip()
+                    f"           {_DIM}{ln}{_R}" for ln in error.split("\n")[1:] if ln.strip()
                 )
                 detail = f"\n{rest}" if rest else ""
                 return (

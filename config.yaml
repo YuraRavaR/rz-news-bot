@@ -7,6 +7,8 @@
 #   enabled       - set to false to disable without deleting the entry
 #
 # pipeline:
+#   gemini_model             - Gemini model for every evaluation (required). It sets the
+#                              free-tier daily quota, so change it only in review
 #   inter_ai_delay_seconds   - pause between consecutive Gemini API calls
 #                              (free tier: 15 RPM = 4 s minimum; 5 s recommended)
 #   inter_post_delay_seconds - extra pause after each successful Telegram post
@@ -28,6 +30,7 @@ sources:
     enabled: true
 
 pipeline:
+  gemini_model: gemini-3.5-flash-lite
   inter_ai_delay_seconds: 5.0
   inter_post_delay_seconds: 2.0
   max_posts_per_run: 10

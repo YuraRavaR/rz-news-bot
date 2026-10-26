@@ -133,6 +133,7 @@ def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
         return collapsed
     return collapsed[: max_len - 1] + "…"
 
+
 # Template for a channel post — {hashtag} is empty string when category is "inne"
 _POST_TEMPLATE = """\
 <b>{title}</b>
@@ -154,18 +155,18 @@ _CATEGORY_HASHTAGS: dict[str, str] = {
 
 # Prepended to every channel post when running with --staging (HTML, Telegram-safe)
 _STAGING_POST_BANNER = (
-    "<b>🧪 STAGING</b>\n"
-    "<i>Чернетковий канал — це не продакшен-публікація.</i>\n\n"
+    "<b>🧪 STAGING</b>\n<i>Чернетковий канал — це не продакшен-публікація.</i>\n\n"
 )
 
 
 def _build_message(article: Article, decision: AIDecision, *, staging: bool = False) -> str:
     """Render the Telegram HTML message from article + AI decision."""
-    # HTML-escape any stray < > & in user content (titles from the site)
+    # HTML-escape any stray < > & " in user content (titles from the site)
     title = _html_escape(decision.ua_title)
     summary = _html_escape(decision.ua_summary)
-    url = article.url
-    domain = urlparse(url).netloc  # e.g. "rzeszow24.info" or "rzeszow-news.pl"
+    # Escaped too: a raw & or " in the URL breaks the href attribute
+    url = _html_escape(article.url)
+    domain = _html_escape(urlparse(article.url).netloc)  # e.g. "rzeszow24.info"
 
     raw_hashtag = _CATEGORY_HASHTAGS.get(decision.category_tag.value, "")
     hashtag = f"\n\n{raw_hashtag}" if raw_hashtag else ""
@@ -189,8 +190,10 @@ def _build_message(article: Article, decision: AIDecision, *, staging: bool = Fa
 
 
 def _html_escape(text: str) -> str:
-    """Minimal HTML escaping for Telegram HTML parse mode."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """Minimal HTML escaping for Telegram HTML parse mode, safe inside attributes."""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
 
 
 def _truncate_telegram_html(text: str, max_len: int = _MAX_MESSAGE_LEN - 8) -> str:
@@ -240,7 +243,7 @@ def _truncate_telegram_html(text: str, max_len: int = _MAX_MESSAGE_LEN - 8) -> s
 def format_run_report_clock(now_utc: datetime, display_timezone: str | None) -> str:
     """Wall clock for the admin run-report header (UTC or a configured IANA zone)."""
     if not display_timezone:
-        return f'{now_utc.strftime("%d.%m %H:%M")} UTC'
+        return f"{now_utc.strftime('%d.%m %H:%M')} UTC"
     local = now_utc.astimezone(ZoneInfo(display_timezone))
     abbr = local.tzname()
     if not abbr:
@@ -271,6 +274,7 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
             "error": "❌",
             "deferred": "🔄",
             "publishing": "❔",
+            "repeat": "🔁",
         }
         icon = decision_icons.get(entry.decision.value, "❓")
         if entry.decision.value == "posted" and entry.posted_to_events:
@@ -283,12 +287,23 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     url = (entry.article_url or "").strip()
     if url:
         href = _html_escape(url)
-        head = f"  {icon} {score_str} · <a href=\"{href}\">{title_esc}</a>"
+        head = f'  {icon} {score_str} · <a href="{href}">{title_esc}</a>'
     else:
         head = f"  {icon} {score_str} · {title_esc}"
     if entry.error_msg:
         err = _html_escape(entry.error_msg)
         head += f" (<i>{err}</i>)"
+    if entry.original is not None:
+        # Always next to its original, so the admin can spot a wrong match
+        original_href = _html_escape(entry.original.url)
+        original_title = _html_escape(entry.original.title_pl)
+        head += f' (повтор: <a href="{original_href}">{original_title}</a>)'
+    if entry.near_match is not None:
+        near_href = _html_escape(entry.near_match.original.url)
+        near_title = _html_escape(entry.near_match.original.title_pl)
+        head += (
+            f' (схожа: <a href="{near_href}">{near_title}</a>, {entry.near_match.similarity:.2f})'
+        )
     out: list[str] = [head]
     detail_lines: list[str] = []
     if entry.decision.value == "posted":
@@ -351,7 +366,9 @@ def _collect_run_report_segments(
         meta_inner.append(f"min score {min_esc}")
     meta_inner.append(
         f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
-        f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
+        f"posted {stats.posted} · skipped {stats.skipped} · "
+        + (f"repeats {stats.repeats} · " if stats.repeats else "")
+        + f"errors {stats.errors}"
         + (f" · deferred {stats.deferred}" if stats.deferred else "")
     )
     rq_n = len(stats.remaining_queued)
@@ -366,6 +383,12 @@ def _collect_run_report_segments(
             scraped = stats.source_scraped.get(name, 0)
             new = stats.source_new.get(name, 0)
             tail = f": {new} new of {scraped}"
+            window = stats.source_window_full.get(name)
+            if window is not None:
+                tail += (
+                    f" ⚠️ вікно max_articles={window} заповнене лише новими статтями: "
+                    "старіші могли не потрапити, варто його збільшити"
+                )
             url = stats.source_urls.get(name, "").strip()
             if url:
                 safe_href = _html_escape(url)
@@ -436,13 +459,14 @@ def _collect_run_report_segments(
             src_bit = f"{_html_escape(b.source_name.strip())} · " if b.source_name.strip() else ""
             if url:
                 href = _html_escape(url)
-                segments.append(f"  ⏳ {src_bit}<a href=\"{href}\">{title_esc}</a>")
+                segments.append(f'  ⏳ {src_bit}<a href="{href}">{title_esc}</a>')
             else:
                 segments.append(f"  ⏳ {src_bit}{title_esc}")
 
     summary_bits = [
         f"posted={stats.posted}",
         f"skipped={stats.skipped}",
+        *([f"repeats={stats.repeats}"] if stats.repeats else []),
         f"errors={stats.errors}",
     ]
     if stats.deferred:
@@ -592,7 +616,9 @@ class TelegramPublisher:
                         "chat_id": self._channel_id,
                         "text": text,
                         "parse_mode": "HTML",
-                        "disable_web_page_preview": False,
+                        # The Post shows the Article's card, even if the text ever
+                        # gains another link
+                        "link_preview_options": {"is_disabled": False, "url": article.url},
                     },
                 )
             except _CONNECT_ERRORS as exc:
@@ -629,9 +655,7 @@ class TelegramPublisher:
                     chat_id=self._channel_id,
                 )
                 if response.is_server_error:
-                    raise TelegramDeliveryUnknownError(
-                        f"HTTP {response.status_code}: {tg_error}"
-                    )
+                    raise TelegramDeliveryUnknownError(f"HTTP {response.status_code}: {tg_error}")
                 raise TelegramRejectedError(f"HTTP {response.status_code}: {tg_error}")
 
         data = response.json()
@@ -732,7 +756,7 @@ class TelegramPublisher:
                             "chat_id": self._alert_chat_id,
                             "text": text,
                             "parse_mode": "HTML",
-                            "disable_web_page_preview": True,
+                            "link_preview_options": {"is_disabled": True},
                         },
                     )
                     try:
@@ -761,9 +785,7 @@ class TelegramPublisher:
                             dry_run=dry_run,
                             chunk_index=i,
                             tg_description=(
-                                str(data.get("description", ""))
-                                if isinstance(data, dict)
-                                else ""
+                                str(data.get("description", "")) if isinstance(data, dict) else ""
                             ),
                         )
                         return

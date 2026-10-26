@@ -8,14 +8,17 @@ runs end to end.
 """
 
 import json
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 import respx
 
+from rz_flow.ai import GeminiUnavailableError
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision, StopSignal
@@ -45,16 +48,30 @@ def _settings() -> Settings:
     )
 
 
-def _flow_config() -> FlowConfig:
-    return FlowConfig(
-        sources=[
+_RZ24 = "rzeszow24/najnowsze"
+_RZN = "rzeszow-news.pl"
+
+
+def _flow_config(rz24_window: int = 5, rzn_window: int | None = None) -> FlowConfig:
+    sources = [
+        SourceConfig(
+            scraper="NajnowszeScraper",
+            base_url="https://rzeszow24.info/najnowsze",
+            max_articles=rz24_window,
+        )
+    ]
+    if rzn_window is not None:
+        sources.append(
             SourceConfig(
-                scraper="NajnowszeScraper",
-                base_url="https://rzeszow24.info/najnowsze",
-                max_articles=5,
+                scraper="RzeszowNewsScraper",
+                base_url="https://rzeszow-news.pl/",
+                max_articles=rzn_window,
             )
-        ],
+        )
+    return FlowConfig(
+        sources=sources,
         pipeline=PipelineConfig(
+            gemini_model="gemini-test-model",
             max_posts_per_run=10,
             inter_ai_delay_seconds=0.0,
             inter_post_delay_seconds=0.0,
@@ -62,15 +79,32 @@ def _flow_config() -> FlowConfig:
     )
 
 
-def _article(article_id: str) -> Article:
+def _article(article_id: str, title: str | None = None) -> Article:
+    """A rzeszow24 Article; each ID gets its own title unless one is given."""
     return Article(
         id=article_id,
-        url=f"https://rzeszow24.info/imprezy/{article_id}",
+        url=f"https://rzeszow24.info/imprezy/{title_slug(title or article_id)}/{article_id}",
         category=Category.IMPREZY,
-        title_pl="Koncert w Rzeszowie",
+        title_pl=title or f"Koncert w Rzeszowie {article_id}",
         summary_pl="Opis koncertu.",
-        source_name="rzeszow24/najnowsze",
+        source_name=_RZ24,
     )
+
+
+def _rzn_article(slug: str, title: str | None = None) -> Article:
+    """A rzeszow-news.pl Article, whose ID is its slug."""
+    return Article(
+        id=f"rzn/{slug}",
+        url=f"https://rzeszow-news.pl/{slug}/",
+        category=Category.WIADOMOSCI,
+        title_pl=title or f"Wiadomość {slug}",
+        summary_pl="Opis.",
+        source_name=_RZN,
+    )
+
+
+def title_slug(title: str) -> str:
+    return "-".join(title.lower().split())
 
 
 def _event_decision(is_event: bool = True) -> AIDecision:
@@ -126,20 +160,28 @@ def storage() -> InMemoryStorage:
 async def _run(
     storage: InMemoryStorage,
     articles: list[Article],
-    decision: AIDecision,
+    decision: AIDecision | None = None,
     *,
     dry_run: bool = False,
+    evaluate: AsyncMock | None = None,
+    flow_config: FlowConfig | None = None,
 ) -> PipelineStats:
-    """One Run over ``articles`` on shared storage, every Article judged ``decision``."""
+    """One Run over ``articles`` on shared storage.
+
+    Every Article is judged ``decision`` unless an ``evaluate`` mock is given, which
+    also lets a test count how often Gemini was asked.
+    """
     with (
         patch("rz_flow.pipeline.fetch_articles", new_callable=AsyncMock) as fetch,
         patch("rz_flow.pipeline.GeminiAIFilter") as ai_cls,
     ):
-        fetch.return_value = (articles, {"rzeszow24/najnowsze": len(articles)})
+        fetch.return_value = (articles, dict(Counter(a.source_name for a in articles)))
         ai = MagicMock()
-        ai.evaluate = AsyncMock(return_value=decision)
+        ai.evaluate = evaluate or AsyncMock(return_value=decision)
         ai_cls.return_value = ai
-        pipeline = Pipeline(settings=_settings(), storage=storage, flow_config=_flow_config())
+        pipeline = Pipeline(
+            settings=_settings(), storage=storage, flow_config=flow_config or _flow_config()
+        )
         return await pipeline.run(dry_run=dry_run)
 
 
@@ -445,3 +487,404 @@ class TestStorageFailuresNeverDuplicate:
         assert record is not None
         assert record.decision == Decision.UNCONFIRMED
         assert len([a for a in run2.alerts if article.url in a]) == 1
+
+
+class TestGeminiModelFromConfig:
+    async def test_evaluation_and_run_report_use_the_configured_model(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GEMINI_MODEL", "gemini-from-env")
+        with (
+            patch("rz_flow.pipeline.fetch_articles", new_callable=AsyncMock) as fetch,
+            patch("rz_flow.pipeline.GeminiAIFilter") as ai_cls,
+        ):
+            fetch.return_value = ([_article("MODEL_1")], {"rzeszow24/najnowsze": 1})
+            ai_cls.return_value.evaluate = AsyncMock(return_value=_event_decision())
+            pipeline = Pipeline(settings=_settings(), storage=storage, flow_config=_flow_config())
+            stats = await pipeline.run()
+
+        assert ai_cls.call_args.kwargs["model"] == "gemini-test-model"
+        report = _build_run_report(stats, dry_run=False)
+        assert "gemini-test-model" in report
+        assert "gemini-from-env" not in report
+
+
+def _source_line(report: str, source_name: str) -> str:
+    """The run report's line for one Source in the Sources block."""
+    lines = [line for line in report.splitlines() if f">{source_name}</a>" in line]
+    assert len(lines) == 1, f"expected one Sources line for {source_name}"
+    return lines[0]
+
+
+class TestSourceWindowWarning:
+    """A Source whose whole window is new may have had older Articles cut off."""
+
+    async def test_full_window_of_new_articles_is_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"WIN_{i}") for i in range(3)]
+
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        line = _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+        assert "⚠️" in line
+        assert "max_articles=3" in line
+
+    async def test_fewer_articles_than_the_window_are_not_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"FEW_{i}") for i in range(2)]
+
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        assert "⚠️" not in _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+
+    async def test_full_window_with_an_article_already_in_storage_is_not_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        seen = _article("SEEN_0")
+        await _run(storage, [seen], _event_decision(), flow_config=_flow_config(3))
+
+        articles = [seen, _article("SEEN_1"), _article("SEEN_2")]
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        assert "⚠️" not in _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+
+    async def test_full_window_with_an_error_article_being_retried_is_not_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        retried = _article("RETRY_0")
+        await storage.save_decision(retried, Decision.ERROR)
+
+        articles = [retried, _article("RETRY_1"), _article("RETRY_2")]
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        # The Error Article is new again, but it proves the window overlapped a Run
+        assert stats.new_articles == 3
+        assert "⚠️" not in _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+
+    async def test_other_sources_are_unaffected(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"MIX_{i}") for i in range(3)] + [_rzn_article("mix-a")]
+
+        stats = await _run(
+            storage, articles, _event_decision(), flow_config=_flow_config(3, rzn_window=3)
+        )
+
+        report = _build_run_report(stats, dry_run=False)
+        assert "⚠️" in _source_line(report, _RZ24)
+        assert "⚠️" not in _source_line(report, _RZN)
+
+    async def test_dry_run_also_flags_a_full_window(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article(f"DRYWIN_{i}") for i in range(3)]
+
+        stats = await _run(
+            storage, articles, _event_decision(), dry_run=True, flow_config=_flow_config(3)
+        )
+
+        assert "max_articles=3" in _source_line(_build_run_report(stats, dry_run=True), _RZ24)
+        assert storage.count() == 0
+
+
+def _boring_decision() -> AIDecision:
+    return _event_decision(is_event=False).model_copy(
+        update={"is_interesting": False, "score": 2.0}
+    )
+
+
+class TestRepeatInOneRun:
+    """An Article about a Story the AI already judged in this Run skips Gemini."""
+
+    async def test_same_normalised_title_is_judged_once_and_posted_once(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        # Oldest first: the last listed Article is the one judged first.
+        later = _article("TITLE_B", "Koncert, w RZESZOWIE!")
+        earlier = _article("TITLE_A", "Koncert w Rzeszowie")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 1
+        assert bot_api.posts == [_MAIN]
+        assert stats.posted == 1
+        assert stats.repeats == 1
+        record = storage.get_record(later.id)
+        assert record is not None
+        assert record.decision == Decision.REPEAT
+        assert record.repeat_of == earlier.id
+
+    async def test_run_report_links_each_repeat_to_its_original_and_counts_it_apart(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("REP_B", "Utrudnienia na Podkarpackiej")
+        earlier = _article("REP_A", "Utrudnienia na Podkarpackiej")
+
+        stats = await _run(storage, [later, earlier], _event_decision(is_event=False))
+
+        assert stats.skipped == 0
+        report = _build_run_report(stats, dry_run=False)
+        repeat_lines = [line for line in report.splitlines() if "🔁" in line]
+        assert len(repeat_lines) == 1
+        assert f'href="{later.url}"' in repeat_lines[0]
+        assert f'href="{earlier.url}"' in repeat_lines[0]
+        assert "repeats 1" in report
+        assert "skipped 0" in report
+
+    async def test_same_rzeszow24_slug_with_a_new_title_is_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        slug = "remont-mostu-zamkowego"
+        later = _article("SLUG_B").model_copy(
+            update={"url": f"https://rzeszow24.info/wiadomosci/{slug}/SLUG_B"}
+        )
+        earlier = _article("SLUG_A").model_copy(
+            update={"url": f"https://rzeszow24.info/wiadomosci/{slug}/SLUG_A"}
+        )
+        assert later.title_pl != earlier.title_pl
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 1
+        assert bot_api.posts == [_MAIN]
+        record = storage.get_record(later.id)
+        assert record is not None
+        assert record.decision == Decision.REPEAT
+        assert record.repeat_of == earlier.id
+        assert stats.repeats == 1
+
+    async def test_same_slug_on_two_sources_is_not_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        slug = "dni-rzeszowa"
+        rz24 = _article("CROSS_1").model_copy(
+            update={"url": f"https://rzeszow24.info/imprezy/{slug}/CROSS_1"}
+        )
+        rzn = _rzn_article(slug)
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage, [rz24, rzn], evaluate=evaluate, flow_config=_flow_config(rzn_window=5)
+        )
+
+        assert evaluate.await_count == 2
+        assert stats.repeats == 0
+        assert stats.posted == 2
+
+    async def test_title_match_works_across_sources(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        rz24 = _article("XSRC_1", "Pożar hali przy Lubelskiej")
+        rzn = _rzn_article("pozar-hali", "Pożar hali przy Lubelskiej")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage, [rz24, rzn], evaluate=evaluate, flow_config=_flow_config(rzn_window=5)
+        )
+
+        assert evaluate.await_count == 1
+        assert stats.repeats == 1
+        assert bot_api.posts == [_MAIN]
+
+    async def test_skipped_original_still_produces_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("SKIP_B", "Kradzież roweru")
+        earlier = _article("SKIP_A", "Kradzież roweru")
+        evaluate = AsyncMock(return_value=_boring_decision())
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 1
+        assert stats.skipped == 1
+        assert stats.repeats == 1
+        assert bot_api.posts == []
+
+    @pytest.mark.parametrize(
+        "first_failure",
+        [RuntimeError("broken"), GeminiUnavailableError("503")],
+        ids=["error", "deferred"],
+    )
+    async def test_failed_original_is_never_an_original(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage, first_failure: Exception
+    ) -> None:
+        later = _article("FAIL_B", "Koncert Dżemu")
+        earlier = _article("FAIL_A", "Koncert Dżemu")
+        evaluate = AsyncMock(side_effect=[first_failure, _event_decision(is_event=False)])
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 2
+        assert stats.repeats == 0
+        assert stats.posted == 1
+        record = storage.get_record(later.id)
+        assert record is not None
+        assert record.decision == Decision.POSTED
+
+    async def test_repeat_is_settled_on_the_next_run(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article("SET_B", "Mecz Resovii"), _article("SET_A", "Mecz Resovii")]
+        await _run(storage, articles, _event_decision(is_event=False))
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        run2 = await _run(storage, articles, evaluate=evaluate)
+
+        assert run2.new_articles == 0
+        assert evaluate.await_count == 0
+        assert bot_api.posts == [_MAIN]
+
+    async def test_dry_run_reports_repeats_and_writes_nothing(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("DRYREP_B", "Festyn na Baranówce")
+        earlier = _article("DRYREP_A", "Festyn na Baranówce")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate, dry_run=True)
+
+        assert evaluate.await_count == 1
+        assert stats.repeats == 1
+        assert "🔁" in _build_run_report(stats, dry_run=True)
+        assert storage.count() == 0
+        assert bot_api.posts == []
+
+
+class TestRepeatAcrossRuns:
+    """Originals also include AI-judged Articles from the last 72 hours."""
+
+    async def test_story_judged_in_an_earlier_run_is_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        first = _article("ACROSS_A", "Nowe rondo na Krakowskiej")
+        await _run(storage, [first], _event_decision(is_event=False))
+        republished = _article("ACROSS_B", "Nowe rondo na Krakowskiej")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [first, republished], evaluate=evaluate)
+
+        assert evaluate.await_count == 0
+        assert bot_api.posts == [_MAIN]
+        assert stats.repeats == 1
+        assert stats.article_log[0].original is not None
+        assert stats.article_log[0].original.article_id == first.id
+        record = storage.get_record(republished.id)
+        assert record is not None
+        assert record.repeat_of == first.id
+
+    async def test_original_older_than_72_hours_is_not_matched(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        first = _article("OLD_A", "Nowe rondo na Krakowskiej")
+        await _run(storage, [first], _event_decision(is_event=False))
+        record = storage.get_record(first.id)
+        assert record is not None
+        storage._records[first.id] = record.model_copy(
+            update={"seen_at": datetime.now(UTC) - timedelta(hours=73)}
+        )
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage, [_article("OLD_B", "Nowe rondo na Krakowskiej")], evaluate=evaluate
+        )
+
+        assert evaluate.await_count == 1
+        assert stats.repeats == 0
+
+    async def test_dry_run_matches_stored_originals_too(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        first = _article("DRYX_A", "Nowe rondo na Krakowskiej")
+        await _run(storage, [first], _event_decision(is_event=False))
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage,
+            [_article("DRYX_B", "Nowe rondo na Krakowskiej")],
+            evaluate=evaluate,
+            dry_run=True,
+        )
+
+        assert evaluate.await_count == 0
+        assert stats.repeats == 1
+        assert storage.get_record("DRYX_B") is None
+
+    async def test_no_storage_read_without_new_articles(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        article = _article("NOREAD_A")
+        await _run(storage, [article], _event_decision(is_event=False))
+        read = AsyncMock(wraps=storage.recent_judged_articles)
+
+        with patch.object(storage, "recent_judged_articles", read):
+            stats = await _run(storage, [article], _event_decision(is_event=False))
+
+        assert stats.new_articles == 0
+        read.assert_not_awaited()
+
+
+class TestNearMatchHint:
+    """A similar title never blocks an Article but leaves a hint for the admin."""
+
+    async def test_similar_title_goes_to_gemini_and_carries_a_hint(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("NEAR_B", "Nowe rondo na Krakowskiej otwarte")
+        earlier = _article("NEAR_A", "Nowe rondo na ulicy Krakowskiej")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 2
+        assert stats.posted == 2
+        assert stats.repeats == 0
+        report = _build_run_report(stats, dry_run=False)
+        hint_lines = [line for line in report.splitlines() if "схожа" in line]
+        assert len(hint_lines) == 1
+        assert f'href="{later.url}"' in hint_lines[0]
+        assert f'href="{earlier.url}"' in hint_lines[0]
+        assert "0.67" in hint_lines[0]
+
+    async def test_title_below_the_threshold_gets_no_hint(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [
+            _article("FAR_B", "Mecz Resovii w hali Podpromie"),
+            _article("FAR_A", "Koncert w filharmonii"),
+        ]
+
+        stats = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert "схожа" not in _build_run_report(stats, dry_run=False)
+
+    async def test_exact_match_is_a_repeat_without_a_hint(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article("EXACT_B", "Koncert Dżemu"), _article("EXACT_A", "Koncert Dżemu")]
+
+        stats = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert stats.repeats == 1
+        assert "схожа" not in _build_run_report(stats, dry_run=False)
+
+    async def test_hint_also_points_at_stored_articles_in_a_dry_run(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        stored = _article("NEARDRY_A", "Nowe rondo na ulicy Krakowskiej")
+        await _run(storage, [stored], _event_decision(is_event=False))
+        records_before = storage.all_records()
+
+        stats = await _run(
+            storage,
+            [_article("NEARDRY_B", "Nowe rondo na Krakowskiej otwarte")],
+            _event_decision(is_event=False),
+            dry_run=True,
+        )
+
+        report = _build_run_report(stats, dry_run=True)
+        assert [line for line in report.splitlines() if "схожа" in line and stored.url in line]
+        assert storage.all_records() == records_before

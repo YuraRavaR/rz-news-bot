@@ -21,7 +21,7 @@ import structlog
 
 from rz_flow.ai import GeminiAIFilter
 from rz_flow.config import Settings
-from rz_flow.dedup import Original, SlugOf, StoryIndex
+from rz_flow.dedup import NearMatch, Original, SlugOf, StoryIndex
 from rz_flow.errors import DeferralError, PublishingRecordError
 from rz_flow.flow_config import FlowConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Decision, StopSignal
@@ -134,6 +134,8 @@ class ArticleRunEntry:
     events_error: str | None = None
     # For a Repeat: the Article the AI already judged about the same Story
     original: Original | None = None
+    # Not a Repeat, but its title is similar to an original's (report-only hint)
+    near_match: NearMatch | None = None
 
 
 @dataclass
@@ -317,7 +319,9 @@ class Pipeline:
                 await self._record_repeat(article, original, stats, dry_run)
                 continue
 
-            stop_signal = await self._process_article(article, stats, dry_run, stories)
+            stop_signal = await self._process_article(
+                article, stats, dry_run, stories, stories.near_match(article)
+            )
 
             if stop_signal is not StopSignal.CONTINUE:
                 self._stop_early(stats, stop_signal, new_articles[i + 1 :], log)
@@ -469,6 +473,7 @@ class Pipeline:
         stats: PipelineStats,
         dry_run: bool,
         stories: StoryIndex,
+        near_match: NearMatch | None,
     ) -> StopSignal:
         """Process a single article: AI evaluate → maybe publish → save.
 
@@ -610,6 +615,7 @@ class Pipeline:
                     article_url=article.url,
                     ai_reason=ai_decision.reason if ai_decision else None,
                     ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
+                    near_match=near_match,
                 )
             )
             return exc.stop_signal
@@ -631,6 +637,7 @@ class Pipeline:
                     article_url=article.url,
                     ai_reason=ai_decision.reason if ai_decision else None,
                     ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
+                    near_match=near_match,
                 )
             )
             return StopSignal.PUBLISHING_BLOCKED
@@ -661,6 +668,7 @@ class Pipeline:
                 ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
                 posted_to_events=posted_to_events,
                 events_error=events_error,
+                near_match=near_match,
             )
         )
 

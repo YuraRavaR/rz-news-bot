@@ -812,3 +812,66 @@ class TestRepeatAcrossRuns:
 
         assert stats.new_articles == 0
         read.assert_not_awaited()
+
+
+class TestNearMatchHint:
+    """A similar title never blocks an Article but leaves a hint for the admin."""
+
+    async def test_similar_title_goes_to_gemini_and_carries_a_hint(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("NEAR_B", "Nowe rondo na Krakowskiej otwarte")
+        earlier = _article("NEAR_A", "Nowe rondo na ulicy Krakowskiej")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 2
+        assert stats.posted == 2
+        assert stats.repeats == 0
+        report = _build_run_report(stats, dry_run=False)
+        hint_lines = [line for line in report.splitlines() if "схожа" in line]
+        assert len(hint_lines) == 1
+        assert f'href="{later.url}"' in hint_lines[0]
+        assert f'href="{earlier.url}"' in hint_lines[0]
+        assert "0.67" in hint_lines[0]
+
+    async def test_title_below_the_threshold_gets_no_hint(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [
+            _article("FAR_B", "Mecz Resovii w hali Podpromie"),
+            _article("FAR_A", "Koncert w filharmonii"),
+        ]
+
+        stats = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert "схожа" not in _build_run_report(stats, dry_run=False)
+
+    async def test_exact_match_is_a_repeat_without_a_hint(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article("EXACT_B", "Koncert Dżemu"), _article("EXACT_A", "Koncert Dżemu")]
+
+        stats = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert stats.repeats == 1
+        assert "схожа" not in _build_run_report(stats, dry_run=False)
+
+    async def test_hint_also_points_at_stored_articles_in_a_dry_run(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        stored = _article("NEARDRY_A", "Nowe rondo na ulicy Krakowskiej")
+        await _run(storage, [stored], _event_decision(is_event=False))
+        records_before = storage.all_records()
+
+        stats = await _run(
+            storage,
+            [_article("NEARDRY_B", "Nowe rondo na Krakowskiej otwarte")],
+            _event_decision(is_event=False),
+            dry_run=True,
+        )
+
+        report = _build_run_report(stats, dry_run=True)
+        assert [line for line in report.splitlines() if "схожа" in line and stored.url in line]
+        assert storage.all_records() == records_before

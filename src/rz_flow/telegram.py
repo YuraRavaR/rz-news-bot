@@ -298,6 +298,12 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
         original_href = _html_escape(entry.original.url)
         original_title = _html_escape(entry.original.title_pl)
         head += f' (повтор: <a href="{original_href}">{original_title}</a>)'
+    if entry.near_match is not None:
+        near_href = _html_escape(entry.near_match.original.url)
+        near_title = _html_escape(entry.near_match.original.title_pl)
+        head += (
+            f' (схожа: <a href="{near_href}">{near_title}</a>, {entry.near_match.similarity:.2f})'
+        )
     out: list[str] = [head]
     detail_lines: list[str] = []
     if entry.decision.value == "posted":

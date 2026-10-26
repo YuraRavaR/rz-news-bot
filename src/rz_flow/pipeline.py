@@ -62,9 +62,7 @@ def _order_new_articles_round_robin_oldest_first(articles: list[Article]) -> lis
             by_key[key] = []
             order_keys.append(key)
         by_key[key].append(a)
-    queues: dict[str, deque[Article]] = {
-        k: deque(reversed(v)) for k, v in by_key.items()
-    }
+    queues: dict[str, deque[Article]] = {k: deque(reversed(v)) for k, v in by_key.items()}
     out: list[Article] = []
     while True:
         took_any = False
@@ -425,8 +423,7 @@ class Pipeline:
 
             # Stage 3b: Apply threshold and publish
             should_publish = (
-                ai_decision.is_interesting
-                and ai_decision.score >= self.settings.ai_min_score
+                ai_decision.is_interesting and ai_decision.score >= self.settings.ai_min_score
             )
             route_to_events = (
                 should_publish and ai_decision.is_event and self.events_publisher is not None

@@ -353,9 +353,7 @@ class TestTursoStorageSql:
         await turso.save_decision(article, Decision.POSTED, _make_ai_decision())
 
         client = turso._get_client()
-        result = await client.execute(
-            "SELECT COUNT(*) FROM posts WHERE id = ?", [article.id]
-        )
+        result = await client.execute("SELECT COUNT(*) FROM posts WHERE id = ?", [article.id])
         assert result.rows[0][0] == 1
 
     async def test_error_attempts_increment_in_sql(self, turso: TursoStorage) -> None:
@@ -429,9 +427,7 @@ class TestTursoStorageMigrations:
         assert row["error_attempts"] == 0
         await storage.close()
 
-    async def test_backfills_source_prefix_on_legacy_ids(
-        self, tmp_path: pathlib.Path
-    ) -> None:
+    async def test_backfills_source_prefix_on_legacy_ids(self, tmp_path: pathlib.Path) -> None:
         """QW-2 data migration: un-prefixed IDs get their source prefix."""
         db_path = f"file:{tmp_path / 'prefix.db'}"
         storage = TursoStorage(database_url=db_path, auth_token="")
@@ -540,9 +536,7 @@ class TestPublishingContract:
         assert previous is Decision.ERROR
         assert await _outcome(any_storage, article.id) == (Decision.PUBLISHING, 2)
 
-    async def test_publishing_is_settled(
-        self, any_storage: InMemoryStorage | TursoStorage
-    ) -> None:
+    async def test_publishing_is_settled(self, any_storage: InMemoryStorage | TursoStorage) -> None:
         article = _make_article("PUB_SETTLED_12345")
         await any_storage.mark_publishing(article)
 

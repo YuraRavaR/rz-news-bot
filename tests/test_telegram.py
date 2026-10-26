@@ -521,9 +521,7 @@ class TestTelegramPublisher:
 
     @respx.mock
     async def test_read_timeout_is_delivery_unknown_and_not_retried(self) -> None:
-        route = respx.post(_tg_url("sendMessage")).mock(
-            side_effect=httpx.ReadTimeout("timed out")
-        )
+        route = respx.post(_tg_url("sendMessage")).mock(side_effect=httpx.ReadTimeout("timed out"))
 
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
         with pytest.raises(TelegramDeliveryUnknownError):
@@ -532,9 +530,7 @@ class TestTelegramPublisher:
 
     @patch("rz_flow.telegram._sleep", new_callable=AsyncMock)
     @respx.mock
-    async def test_publish_respects_retry_after_header_on_429(
-        self, mock_sleep: AsyncMock
-    ) -> None:
+    async def test_publish_respects_retry_after_header_on_429(self, mock_sleep: AsyncMock) -> None:
         """429 response: waits once for the Retry-After value, then retries once."""
         call_count = 0
 

@@ -335,7 +335,6 @@ class TestPipelineRunBasic:
         assert stats.new_articles == 0
         mock_ai.evaluate.assert_not_called()
 
-
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")
     @patch("rz_flow.pipeline.TelegramPublisher")
@@ -542,9 +541,7 @@ class TestPipelineBranchCoverage:
 
         mock_ai = MagicMock()
         mock_ai_cls.return_value = mock_ai
-        mock_ai.evaluate = AsyncMock(
-            side_effect=[server_err, _make_interesting_decision()]
-        )
+        mock_ai.evaluate = AsyncMock(side_effect=[server_err, _make_interesting_decision()])
 
         mock_tg = MagicMock()
         mock_tg_cls.return_value = mock_tg
@@ -945,9 +942,7 @@ class TestSourceHealthAlerts:
                         max_articles=5,
                     ),
                 ],
-                pipeline=PipelineConfig(
-                    inter_ai_delay_seconds=0.0, inter_post_delay_seconds=0.0
-                ),
+                pipeline=PipelineConfig(inter_ai_delay_seconds=0.0, inter_post_delay_seconds=0.0),
             ),
         )
         stats = await pipeline.run()

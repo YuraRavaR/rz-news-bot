@@ -142,7 +142,9 @@ class TestPrettyRenderer:
         assert "2" in result
 
     def test_scrape_source_start_shows_name(self) -> None:
-        result = self._call("scrape_source_start", name="rzeszow24/najnowsze", url="https://rzeszow24.info")
+        result = self._call(
+            "scrape_source_start", name="rzeszow24/najnowsze", url="https://rzeszow24.info"
+        )
         assert "rzeszow24/najnowsze" in result
 
     def test_scrape_source_done_shows_found_count(self) -> None:
@@ -237,24 +239,18 @@ class TestPrettyRenderer:
     # ── pipeline_complete ─────────────────────────────────────────────────────
 
     def test_pipeline_complete_shows_all_counters(self) -> None:
-        result = self._call(
-            "pipeline_complete", posted=5, skipped=2, errors=0, elapsed_s=30
-        )
+        result = self._call("pipeline_complete", posted=5, skipped=2, errors=0, elapsed_s=30)
         assert "posted=5" in result
         assert "skipped=2" in result
         assert "errors=0" in result
 
     def test_pipeline_complete_shows_elapsed_time(self) -> None:
-        result = self._call(
-            "pipeline_complete", posted=1, skipped=0, errors=0, elapsed_s=75
-        )
+        result = self._call("pipeline_complete", posted=1, skipped=0, errors=0, elapsed_s=75)
         # 75s = 1m 15s
         assert "1m" in result
 
     def test_pipeline_complete_elapsed_seconds_only_for_under_minute(self) -> None:
-        result = self._call(
-            "pipeline_complete", posted=1, skipped=0, errors=0, elapsed_s=45
-        )
+        result = self._call("pipeline_complete", posted=1, skipped=0, errors=0, elapsed_s=45)
         assert "45s" in result
 
     # ── gemini_unavailable_skipping ───────────────────────────────────────────

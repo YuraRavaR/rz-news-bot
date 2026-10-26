@@ -157,9 +157,7 @@ class TestGeminiAIFilterEvaluate:
         assert article.title_pl in contents_arg
 
     @patch("rz_flow.ai.genai.Client")
-    async def test_retries_on_per_minute_rate_limit(
-        self, mock_client_cls: MagicMock
-    ) -> None:
+    async def test_retries_on_per_minute_rate_limit(self, mock_client_cls: MagicMock) -> None:
         """GeminiRateLimitError (per-minute 429) is retried automatically."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
@@ -181,9 +179,7 @@ class TestGeminiAIFilterEvaluate:
         assert mock_client.aio.models.generate_content.call_count == 2
 
     @patch("rz_flow.ai.genai.Client")
-    async def test_raises_quota_exhausted_for_daily_limit(
-        self, mock_client_cls: MagicMock
-    ) -> None:
+    async def test_raises_quota_exhausted_for_daily_limit(self, mock_client_cls: MagicMock) -> None:
         """Daily quota exhaustion raises GeminiQuotaExhaustedError — NOT retried."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
@@ -233,9 +229,7 @@ class TestGeminiAIFilterEvaluate:
         assert mock_client.aio.models.generate_content.call_count == 3
 
     @patch("rz_flow.ai.genai.Client")
-    async def test_raises_after_max_retries_on_rate_limit(
-        self, mock_client_cls: MagicMock
-    ) -> None:
+    async def test_raises_after_max_retries_on_rate_limit(self, mock_client_cls: MagicMock) -> None:
         """After 3 per-minute rate limit attempts, GeminiRateLimitError is re-raised."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
@@ -253,9 +247,7 @@ class TestGeminiAIFilterEvaluate:
         assert mock_client.aio.models.generate_content.call_count == 3
 
     @patch("rz_flow.ai.genai.Client")
-    async def test_reraises_non_rate_limit_client_error(
-        self, mock_client_cls: MagicMock
-    ) -> None:
+    async def test_reraises_non_rate_limit_client_error(self, mock_client_cls: MagicMock) -> None:
         """4xx errors other than 429 (e.g. 400 invalid request) are re-raised as-is."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
@@ -311,9 +303,7 @@ class TestGeminiHelpers:
                     "details": [
                         {
                             "violations": [
-                                {
-                                    "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
-                                }
+                                {"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}
                             ]
                         }
                     ],
@@ -351,11 +341,7 @@ class TestGeminiHelpers:
                 "error": {
                     "code": 429,
                     "details": [
-                        {
-                            "violations": [
-                                {"quotaId": "GenerateRequestsPerDayPerProjectPerModel"}
-                            ]
-                        }
+                        {"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel"}]}
                     ],
                 }
             },

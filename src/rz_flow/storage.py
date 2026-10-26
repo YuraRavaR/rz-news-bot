@@ -65,8 +65,7 @@ _SCHEMA_MIGRATIONS = [
 _DATA_MIGRATIONS = [
     "UPDATE posts SET id = 'rz24/' || id "
     "WHERE url LIKE '%rzeszow24.info%' AND id NOT LIKE 'rz24/%'",
-    "UPDATE posts SET id = 'rzn/' || id "
-    "WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
+    "UPDATE posts SET id = 'rzn/' || id WHERE url LIKE '%rzeszow-news.pl%' AND id NOT LIKE 'rzn/%'",
 ]
 
 
@@ -397,9 +396,7 @@ class InMemoryStorage:
         stale = [r for r in self._records.values() if r.decision == Decision.PUBLISHING]
         stale.sort(key=lambda r: r.seen_at)
         for record in stale:
-            self._records[record.id] = record.model_copy(
-                update={"decision": Decision.UNCONFIRMED}
-            )
+            self._records[record.id] = record.model_copy(update={"decision": Decision.UNCONFIRMED})
         return [UnconfirmedArticle(id=r.id, url=r.url, title_pl=r.title_pl) for r in stale]
 
     async def close(self) -> None:

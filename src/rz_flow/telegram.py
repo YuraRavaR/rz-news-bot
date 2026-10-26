@@ -133,6 +133,7 @@ def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
         return collapsed
     return collapsed[: max_len - 1] + "…"
 
+
 # Template for a channel post — {hashtag} is empty string when category is "inne"
 _POST_TEMPLATE = """\
 <b>{title}</b>
@@ -154,8 +155,7 @@ _CATEGORY_HASHTAGS: dict[str, str] = {
 
 # Prepended to every channel post when running with --staging (HTML, Telegram-safe)
 _STAGING_POST_BANNER = (
-    "<b>🧪 STAGING</b>\n"
-    "<i>Чернетковий канал — це не продакшен-публікація.</i>\n\n"
+    "<b>🧪 STAGING</b>\n<i>Чернетковий канал — це не продакшен-публікація.</i>\n\n"
 )
 
 
@@ -240,7 +240,7 @@ def _truncate_telegram_html(text: str, max_len: int = _MAX_MESSAGE_LEN - 8) -> s
 def format_run_report_clock(now_utc: datetime, display_timezone: str | None) -> str:
     """Wall clock for the admin run-report header (UTC or a configured IANA zone)."""
     if not display_timezone:
-        return f'{now_utc.strftime("%d.%m %H:%M")} UTC'
+        return f"{now_utc.strftime('%d.%m %H:%M')} UTC"
     local = now_utc.astimezone(ZoneInfo(display_timezone))
     abbr = local.tzname()
     if not abbr:
@@ -283,7 +283,7 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     url = (entry.article_url or "").strip()
     if url:
         href = _html_escape(url)
-        head = f"  {icon} {score_str} · <a href=\"{href}\">{title_esc}</a>"
+        head = f'  {icon} {score_str} · <a href="{href}">{title_esc}</a>'
     else:
         head = f"  {icon} {score_str} · {title_esc}"
     if entry.error_msg:
@@ -436,7 +436,7 @@ def _collect_run_report_segments(
             src_bit = f"{_html_escape(b.source_name.strip())} · " if b.source_name.strip() else ""
             if url:
                 href = _html_escape(url)
-                segments.append(f"  ⏳ {src_bit}<a href=\"{href}\">{title_esc}</a>")
+                segments.append(f'  ⏳ {src_bit}<a href="{href}">{title_esc}</a>')
             else:
                 segments.append(f"  ⏳ {src_bit}{title_esc}")
 
@@ -629,9 +629,7 @@ class TelegramPublisher:
                     chat_id=self._channel_id,
                 )
                 if response.is_server_error:
-                    raise TelegramDeliveryUnknownError(
-                        f"HTTP {response.status_code}: {tg_error}"
-                    )
+                    raise TelegramDeliveryUnknownError(f"HTTP {response.status_code}: {tg_error}")
                 raise TelegramRejectedError(f"HTTP {response.status_code}: {tg_error}")
 
         data = response.json()
@@ -761,9 +759,7 @@ class TelegramPublisher:
                             dry_run=dry_run,
                             chunk_index=i,
                             tg_description=(
-                                str(data.get("description", ""))
-                                if isinstance(data, dict)
-                                else ""
+                                str(data.get("description", "")) if isinstance(data, dict) else ""
                             ),
                         )
                         return

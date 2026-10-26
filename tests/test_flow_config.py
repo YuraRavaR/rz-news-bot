@@ -192,9 +192,7 @@ async def test_category_page_scraper_fetch() -> None:
 
     imprezy_html = (FIXTURES_DIR / "imprezy_sample.html").read_text(encoding="utf-8")
     wiadomosci_html = (FIXTURES_DIR / "wiadomosci_sample.html").read_text(encoding="utf-8")
-    respx.get("https://rzeszow24.info/imprezy/").mock(
-        return_value=Response(200, text=imprezy_html)
-    )
+    respx.get("https://rzeszow24.info/imprezy/").mock(return_value=Response(200, text=imprezy_html))
     respx.get("https://rzeszow24.info/wiadomosci/").mock(
         return_value=Response(200, text=wiadomosci_html)
     )

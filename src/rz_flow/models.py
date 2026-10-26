@@ -6,7 +6,6 @@ They are intentionally simple for MVP — extend via subclassing, not editing.
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -118,7 +117,3 @@ class PublishResult(BaseModel):
     article_id: str
     message_id: int
     chat_id: str
-
-
-# Type alias used in pipeline for brevity
-ProcessedArticle = tuple[Article, AIDecision | None, Literal["posted", "skipped", "error"]]

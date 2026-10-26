@@ -54,15 +54,7 @@ class Settings(BaseSettings):
     )
 
     # ── Scraper ───────────────────────────────────────────────────────────────
-    scraper_base_url: str = Field(
-        default="https://rzeszow24.info",
-        description="Base URL of the news site",
-    )
     scraper_timeout: float = Field(default=15.0, description="HTTP request timeout in seconds")
-    scraper_max_articles: int = Field(
-        default=5,
-        description="Max articles to fetch per category per run",
-    )
 
     # ── AI filtering ──────────────────────────────────────────────────────────
     ai_min_score: float = Field(

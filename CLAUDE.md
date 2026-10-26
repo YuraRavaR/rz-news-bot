@@ -56,17 +56,15 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 
 ### Configuration split
 
-- `config.py` (`Settings`, pydantic-settings): secrets and env vars (`AI_MIN_SCORE`, `SCRAPER_TIMEOUT`, `APP_ENV`, …). `scraper_base_url` and `scraper_max_articles` are legacy fields that nothing reads.
+- `config.py` (`Settings`, pydantic-settings): secrets and env vars (`AI_MIN_SCORE`, `SCRAPER_TIMEOUT`, `APP_ENV`, …).
 - `flow_config.py`: loads `config.yaml`, which defines the sources list (scraper class name, URL, `max_articles`, `enabled`) and pipeline pacing and caps. The same committed file is used in CI.
 
 ### Adding a news source
 
 1. Create `sources/<site>.py` with a class that satisfies the `ScraperSource` protocol (`name`, `url`, `async fetch(client, max_articles)`), with the HTML parsing in `parser.py`.
 2. Give it a unique `ID_PREFIX`. Article IDs are stored as `<prefix>/<id>` (`rz24/…`, `rzn/…`) and serve as the dedup key, so changing a prefix re-posts everything from that source.
-3. Register it in `_SCRAPER_REGISTRY` in `sources/__init__.py`. The docstrings that mention `ACTIVE_SOURCES` are stale.
+3. Register it in `_SCRAPER_REGISTRY` in `sources/__init__.py`.
 4. Add an entry to `config.yaml`.
-
-`CategoryPageScraper` and `parse_category_page` are archived (not registered) but still have tests and fixtures.
 
 ### Gemini (`ai.py`)
 

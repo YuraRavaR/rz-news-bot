@@ -5,7 +5,8 @@ The protocol is intentionally thin: a name for logging and a fetch() method.
 
 To add a new source:
   1. Create src/rz_flow/sources/<site>.py implementing ScraperSource.
-  2. Add an instance to ACTIVE_SOURCES in src/rz_flow/sources/__init__.py.
+  2. Register its class in ``_SCRAPER_REGISTRY`` in src/rz_flow/sources/__init__.py.
+  3. Add an entry in config.yaml.
 """
 
 from __future__ import annotations

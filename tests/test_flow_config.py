@@ -4,8 +4,6 @@ import pathlib
 import textwrap
 
 import pytest
-import respx
-from httpx import Response
 
 from rz_flow.flow_config import (
     FlowConfig,
@@ -13,7 +11,6 @@ from rz_flow.flow_config import (
     load_flow_config,
 )
 from rz_flow.sources import get_active_sources
-from rz_flow.sources.rzeszow24 import CategoryPageScraper
 
 FIXTURES_DIR = pathlib.Path(__file__).parent / "fixtures"
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -179,26 +176,3 @@ def test_get_active_sources_unknown_scraper_raises() -> None:
     )
     with pytest.raises(ValueError, match="NonExistentScraper"):
         get_active_sources(config)
-
-
-# ── CategoryPageScraper (archived) ────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_category_page_scraper_fetch() -> None:
-    """CategoryPageScraper fetches /imprezy/ and /wiadomosci/ and returns articles."""
-    import httpx
-
-    imprezy_html = (FIXTURES_DIR / "imprezy_sample.html").read_text(encoding="utf-8")
-    wiadomosci_html = (FIXTURES_DIR / "wiadomosci_sample.html").read_text(encoding="utf-8")
-    respx.get("https://rzeszow24.info/imprezy/").mock(return_value=Response(200, text=imprezy_html))
-    respx.get("https://rzeszow24.info/wiadomosci/").mock(
-        return_value=Response(200, text=wiadomosci_html)
-    )
-
-    scraper = CategoryPageScraper(base_url="https://rzeszow24.info")
-    async with httpx.AsyncClient() as client:
-        articles = await scraper.fetch(client, max_articles=5)
-
-    assert isinstance(articles, list)

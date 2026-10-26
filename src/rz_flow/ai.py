@@ -139,7 +139,7 @@ def _classify_gemini_error(exc: Exception) -> Exception:
 # Upper bound on a single backoff wait, so one hostile Retry-After cannot stall the run.
 _MAX_RETRY_WAIT_S = 60.0
 
-_base_wait = wait_exponential_jitter(initial=5, max=_MAX_RETRY_WAIT_S, jitter=2)
+_base_wait = wait_exponential_jitter(multiplier=5, max=_MAX_RETRY_WAIT_S, jitter=2)
 
 
 def _gemini_retry_wait(retry_state: RetryCallState) -> float:

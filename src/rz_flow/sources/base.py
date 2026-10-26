@@ -29,6 +29,13 @@ class ScraperSource(Protocol):
     url: str
     """Actual URL the scraper fetches."""
 
+    def slug(self, url: str) -> str | None:
+        """The slug of one of this Source's Article URLs, or None for any other URL.
+
+        Two Articles from the same Source with equal slugs are about the same Story.
+        """
+        ...
+
     async def fetch(
         self,
         client: httpx.AsyncClient,

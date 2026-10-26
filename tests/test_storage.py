@@ -505,6 +505,7 @@ class TestTursoStorageMigrations:
             "ua_summary",
             "category_tag",
             "error_attempts",
+            "repeat_of",
         }
         await storage.close()
 
@@ -697,3 +698,26 @@ class TestPublishingContract:
         await any_storage.save_decision(article, Decision.ERROR, _make_ai_decision())
 
         assert await _outcome(any_storage, article.id) == (Decision.ERROR, 2)
+
+
+class TestRepeatContract:
+    async def test_repeat_is_settled_and_keeps_its_original(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("REPEAT_123456789")
+
+        await any_storage.save_decision(article, Decision.REPEAT, repeat_of="ORIGINAL_1234567")
+
+        assert await any_storage.filter_new_ids([article.id]) == []
+        assert await _outcome(any_storage, article.id) == (Decision.REPEAT, 0)
+        assert await _repeat_of(any_storage, article.id) == "ORIGINAL_1234567"
+
+
+async def _repeat_of(storage: InMemoryStorage | TursoStorage, article_id: str) -> str | None:
+    if isinstance(storage, InMemoryStorage):
+        record = storage.get_record(article_id)
+        return record.repeat_of if record else None
+    result = await storage._get_client().execute(
+        "SELECT repeat_of FROM posts WHERE id = ?", [article_id]
+    )
+    return result.rows[0][0] if result.rows else None

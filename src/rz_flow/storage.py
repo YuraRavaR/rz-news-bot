@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS posts (
     ua_title              TEXT,
     ua_summary            TEXT,
     category_tag          TEXT,
-    error_attempts        INTEGER NOT NULL DEFAULT 0
+    error_attempts        INTEGER NOT NULL DEFAULT 0,
+    repeat_of             TEXT
 );
 """
 
@@ -52,6 +53,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str]] = [
     ("is_event", "INTEGER"),
     ("tg_events_message_id", "INTEGER"),
     ("error_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("repeat_of", "TEXT"),
 ]
 
 # Data migrations — one-time UPDATE statements that backfill existing rows.
@@ -98,8 +100,12 @@ class StorageProtocol(Protocol):
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
         tg_events_message_id: int | None = None,
+        repeat_of: str | None = None,
     ) -> None:
-        """Persist the processing result for one article."""
+        """Persist the processing result for one article.
+
+        ``repeat_of`` is the original's ID, set only for a Repeat.
+        """
         ...
 
     async def mark_publishing(self, article: Article) -> Decision | None:
@@ -189,7 +195,7 @@ class TursoStorage:
 
         client = self._get_client()
         placeholders = ", ".join("?" * len(article_ids))
-        # "Settled" = posted, skipped, publishing, unconfirmed, or errored past the
+        # "Settled" = posted, skipped, repeat, publishing, unconfirmed, or errored past the
         # retry budget. Anything else in this batch still needs work, including rows
         # we are about to retry.
         result = await client.execute(
@@ -210,6 +216,7 @@ class TursoStorage:
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
         tg_events_message_id: int | None = None,
+        repeat_of: str | None = None,
     ) -> None:
         client = self._get_client()
         is_error = decision == Decision.ERROR
@@ -220,8 +227,8 @@ class TursoStorage:
             INSERT INTO posts
               (id, url, category, title_pl, seen_at, decision,
                ai_score, ai_reason, is_event, tg_message_id, tg_events_message_id,
-               ua_title, ua_summary, category_tag, error_attempts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ua_title, ua_summary, category_tag, error_attempts, repeat_of)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 url                  = excluded.url,
                 category             = excluded.category,
@@ -236,6 +243,7 @@ class TursoStorage:
                 ua_title             = excluded.ua_title,
                 ua_summary           = excluded.ua_summary,
                 category_tag         = excluded.category_tag,
+                repeat_of            = excluded.repeat_of,
                 error_attempts       = CASE
                     WHEN excluded.decision = ?
                     THEN COALESCE(posts.error_attempts, 0) + 1
@@ -258,6 +266,7 @@ class TursoStorage:
                 ai_decision.ua_summary if ai_decision else None,
                 ai_decision.category_tag.value if ai_decision else None,
                 1 if is_error else 0,
+                repeat_of,
                 Decision.ERROR.value,
             ],
         )
@@ -348,6 +357,7 @@ class InMemoryStorage:
         ai_decision: AIDecision | None = None,
         tg_message_id: int | None = None,
         tg_events_message_id: int | None = None,
+        repeat_of: str | None = None,
     ) -> None:
         previous = self._records.get(article.id)
         prior_attempts = previous.error_attempts if previous else 0
@@ -366,6 +376,7 @@ class InMemoryStorage:
             ua_summary=ai_decision.ua_summary if ai_decision else None,
             category_tag=ai_decision.category_tag.value if ai_decision else None,
             error_attempts=prior_attempts + 1 if decision == Decision.ERROR else 0,
+            repeat_of=repeat_of,
         )
 
     async def mark_publishing(self, article: Article) -> Decision | None:

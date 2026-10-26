@@ -17,6 +17,7 @@ import httpx
 import pytest
 import respx
 
+from rz_flow.ai import GeminiUnavailableError
 from rz_flow.config import Settings
 from rz_flow.flow_config import FlowConfig, PipelineConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision, StopSignal
@@ -572,3 +573,168 @@ class TestSourceWindowWarning:
 
         assert "max_articles=3" in _source_line(_build_run_report(stats, dry_run=True), _RZ24)
         assert storage.count() == 0
+
+
+def _boring_decision() -> AIDecision:
+    return _event_decision(is_event=False).model_copy(
+        update={"is_interesting": False, "score": 2.0}
+    )
+
+
+class TestRepeatInOneRun:
+    """An Article about a Story the AI already judged in this Run skips Gemini."""
+
+    async def test_same_normalised_title_is_judged_once_and_posted_once(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        # Oldest first: the last listed Article is the one judged first.
+        later = _article("TITLE_B", "Koncert, w RZESZOWIE!")
+        earlier = _article("TITLE_A", "Koncert w Rzeszowie")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 1
+        assert bot_api.posts == [_MAIN]
+        assert stats.posted == 1
+        assert stats.repeats == 1
+        record = storage.get_record(later.id)
+        assert record is not None
+        assert record.decision == Decision.REPEAT
+        assert record.repeat_of == earlier.id
+
+    async def test_run_report_links_each_repeat_to_its_original_and_counts_it_apart(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("REP_B", "Utrudnienia na Podkarpackiej")
+        earlier = _article("REP_A", "Utrudnienia na Podkarpackiej")
+
+        stats = await _run(storage, [later, earlier], _event_decision(is_event=False))
+
+        assert stats.skipped == 0
+        report = _build_run_report(stats, dry_run=False)
+        repeat_lines = [line for line in report.splitlines() if "🔁" in line]
+        assert len(repeat_lines) == 1
+        assert f'href="{later.url}"' in repeat_lines[0]
+        assert f'href="{earlier.url}"' in repeat_lines[0]
+        assert "repeats 1" in report
+        assert "skipped 0" in report
+
+    async def test_same_rzeszow24_slug_with_a_new_title_is_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        slug = "remont-mostu-zamkowego"
+        later = _article("SLUG_B").model_copy(
+            update={"url": f"https://rzeszow24.info/wiadomosci/{slug}/SLUG_B"}
+        )
+        earlier = _article("SLUG_A").model_copy(
+            update={"url": f"https://rzeszow24.info/wiadomosci/{slug}/SLUG_A"}
+        )
+        assert later.title_pl != earlier.title_pl
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 1
+        assert bot_api.posts == [_MAIN]
+        record = storage.get_record(later.id)
+        assert record is not None
+        assert record.decision == Decision.REPEAT
+        assert record.repeat_of == earlier.id
+        assert stats.repeats == 1
+
+    async def test_same_slug_on_two_sources_is_not_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        slug = "dni-rzeszowa"
+        rz24 = _article("CROSS_1").model_copy(
+            update={"url": f"https://rzeszow24.info/imprezy/{slug}/CROSS_1"}
+        )
+        rzn = _rzn_article(slug)
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage, [rz24, rzn], evaluate=evaluate, flow_config=_flow_config(rzn_window=5)
+        )
+
+        assert evaluate.await_count == 2
+        assert stats.repeats == 0
+        assert stats.posted == 2
+
+    async def test_title_match_works_across_sources(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        rz24 = _article("XSRC_1", "Pożar hali przy Lubelskiej")
+        rzn = _rzn_article("pozar-hali", "Pożar hali przy Lubelskiej")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(
+            storage, [rz24, rzn], evaluate=evaluate, flow_config=_flow_config(rzn_window=5)
+        )
+
+        assert evaluate.await_count == 1
+        assert stats.repeats == 1
+        assert bot_api.posts == [_MAIN]
+
+    async def test_skipped_original_still_produces_a_repeat(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("SKIP_B", "Kradzież roweru")
+        earlier = _article("SKIP_A", "Kradzież roweru")
+        evaluate = AsyncMock(return_value=_boring_decision())
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 1
+        assert stats.skipped == 1
+        assert stats.repeats == 1
+        assert bot_api.posts == []
+
+    @pytest.mark.parametrize(
+        "first_failure",
+        [RuntimeError("broken"), GeminiUnavailableError("503")],
+        ids=["error", "deferred"],
+    )
+    async def test_failed_original_is_never_an_original(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage, first_failure: Exception
+    ) -> None:
+        later = _article("FAIL_B", "Koncert Dżemu")
+        earlier = _article("FAIL_A", "Koncert Dżemu")
+        evaluate = AsyncMock(side_effect=[first_failure, _event_decision(is_event=False)])
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate)
+
+        assert evaluate.await_count == 2
+        assert stats.repeats == 0
+        assert stats.posted == 1
+        record = storage.get_record(later.id)
+        assert record is not None
+        assert record.decision == Decision.POSTED
+
+    async def test_repeat_is_settled_on_the_next_run(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article("SET_B", "Mecz Resovii"), _article("SET_A", "Mecz Resovii")]
+        await _run(storage, articles, _event_decision(is_event=False))
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        run2 = await _run(storage, articles, evaluate=evaluate)
+
+        assert run2.new_articles == 0
+        assert evaluate.await_count == 0
+        assert bot_api.posts == [_MAIN]
+
+    async def test_dry_run_reports_repeats_and_writes_nothing(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        later = _article("DRYREP_B", "Festyn na Baranówce")
+        earlier = _article("DRYREP_A", "Festyn na Baranówce")
+        evaluate = AsyncMock(return_value=_event_decision(is_event=False))
+
+        stats = await _run(storage, [later, earlier], evaluate=evaluate, dry_run=True)
+
+        assert evaluate.await_count == 1
+        assert stats.repeats == 1
+        assert "🔁" in _build_run_report(stats, dry_run=True)
+        assert storage.count() == 0
+        assert bot_api.posts == []

@@ -40,7 +40,8 @@ def _make_article(article_id: str, category: Category = Category.IMPREZY) -> Art
         id=article_id,
         url=f"https://rzeszow24.info/imprezy/{article_id}",
         category=category,
-        title_pl="Festiwal w Rzeszowie",
+        # A title of its own, so distinct Articles are never Repeats of each other
+        title_pl=f"Festiwal w Rzeszowie {article_id}",
         summary_pl="Opis festiwalu.",
     )
 

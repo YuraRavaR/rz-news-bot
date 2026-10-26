@@ -20,6 +20,7 @@ import structlog
 
 from rz_flow.ai import GeminiAIFilter
 from rz_flow.config import Settings
+from rz_flow.dedup import Original, SlugOf, StoryIndex
 from rz_flow.errors import DeferralError, PublishingRecordError
 from rz_flow.flow_config import FlowConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Decision, StopSignal
@@ -76,6 +77,23 @@ def _order_new_articles_round_robin_oldest_first(articles: list[Article]) -> lis
     return out
 
 
+def _original(article: Article) -> Original:
+    return Original(article_id=article.id, url=article.url, title_pl=article.title_pl)
+
+
+def _slug_finder(sources: list[ScraperSource]) -> SlugOf:
+    """url → (Source name, slug) from the first Source that recognises the URL."""
+
+    def slug_of(url: str) -> tuple[str, str] | None:
+        for source in sources:
+            slug = source.slug(url)
+            if slug:
+                return source.name, slug
+        return None
+
+    return slug_of
+
+
 @dataclass(frozen=True)
 class RemainingArticleBrief:
     """New article not started in this run (queue behind post-cap / quota stop)."""
@@ -110,6 +128,8 @@ class ArticleRunEntry:
     posted_to_events: bool = False
     # Set when the main channel Post went out but the events channel Post failed
     events_error: str | None = None
+    # For a Repeat: the Article the AI already judged about the same Story
+    original: Original | None = None
 
 
 @dataclass
@@ -121,6 +141,8 @@ class PipelineStats:
     posted: int = 0
     skipped: int = 0
     errors: int = 0
+    # Articles not sent to Gemini because it already judged their Story
+    repeats: int = 0
     dry_run: bool = False
     quota_exhausted: bool = False  # True if Gemini daily quota was hit
     post_cap_reached: bool = False  # True if max_posts_per_run was hit
@@ -160,6 +182,7 @@ class PipelineStats:
             f"new={self.new_articles}, "
             f"posted={self.posted}, "
             f"skipped={self.skipped}, "
+            f"repeats={self.repeats}, "
             f"errors={self.errors}, "
             f"deferred={self.deferred}"
         )
@@ -276,9 +299,17 @@ class Pipeline:
             _stamp_elapsed()
             return stats
 
-        # ── Stage 3: AI evaluate + publish ────────────────────────────────────
+        # ── Stage 3: Repeat check + AI evaluate + publish ─────────────────────
+        # Originals are Articles the AI judged earlier in this Run, so of two
+        # Articles about one Story the earlier one in Run order is the original.
+        stories = StoryIndex(_slug_finder([s for s, _ in source_pairs]))
         for i, article in enumerate(new_articles):
-            stop_signal = await self._process_article(article, stats, dry_run)
+            original = stories.find_original(article)
+            if original is not None:
+                await self._record_repeat(article, original, stats, dry_run)
+                continue
+
+            stop_signal = await self._process_article(article, stats, dry_run, stories)
 
             if stop_signal is not StopSignal.CONTINUE:
                 self._stop_early(stats, stop_signal, new_articles[i + 1 :], log)
@@ -296,6 +327,7 @@ class Pipeline:
             "pipeline_complete",
             posted=stats.posted,
             skipped=stats.skipped,
+            repeats=stats.repeats,
             errors=stats.errors,
             elapsed_s=stats.elapsed_s,
         )
@@ -388,11 +420,47 @@ class Pipeline:
         if stats.source_window_full:
             log.warning("source_window_full", sources=stats.source_window_full)
 
+    async def _record_repeat(
+        self,
+        article: Article,
+        original: Original,
+        stats: PipelineStats,
+        dry_run: bool,
+    ) -> None:
+        """Settle an Article whose Story the AI already judged, without asking it again."""
+        log = logger.bind(article_id=article.id, category=article.category.value)
+        log.info("repeat", title=article.title_pl, original_id=original.article_id)
+        stats.repeats += 1
+        stats.article_log.append(
+            ArticleRunEntry(
+                article_id=article.id,
+                title_pl=article.title_pl,
+                ua_title=None,
+                score=None,
+                decision=Decision.REPEAT,
+                source_name=article.source_name,
+                article_url=article.url,
+                original=original,
+            )
+        )
+        if not dry_run:
+            await self._save_decision_with_retry(
+                article=article,
+                decision=Decision.REPEAT,
+                ai_decision=None,
+                tg_message_id=None,
+                tg_events_message_id=None,
+                stats=stats,
+                log=log,
+                repeat_of=original.article_id,
+            )
+
     async def _process_article(
         self,
         article: Article,
         stats: PipelineStats,
         dry_run: bool,
+        stories: StoryIndex,
     ) -> StopSignal:
         """Process a single article: AI evaluate → maybe publish → save.
 
@@ -542,6 +610,7 @@ class Pipeline:
             # The Post may be in the Main channel: leave the record Publishing, never
             # send again, and stop — an unhealthy Telegram would only pile up more.
             log.error("main_channel_delivery_unknown", error=str(exc))
+            stories.add(_original(article))
             stats.article_log.append(
                 ArticleRunEntry(
                     article_id=article.id,
@@ -563,6 +632,11 @@ class Pipeline:
             stats.errors += 1
             decision = Decision.ERROR
             error_msg = f"{type(exc).__name__}: {exc}"
+
+        # The AI judged it: later Articles about the same Story are Repeats. An Error
+        # is never an original, so its Story is not lost if the Article failed.
+        if decision in (Decision.POSTED, Decision.SKIPPED):
+            stories.add(_original(article))
 
         # Append to the per-run article log for the admin run report
         stats.article_log.append(
@@ -627,6 +701,7 @@ class Pipeline:
         tg_events_message_id: int | None,
         stats: PipelineStats,
         log: structlog.stdlib.BoundLogger,
+        repeat_of: str | None = None,
     ) -> None:
         """Persist the outcome, retrying transient storage failures.
 
@@ -643,6 +718,7 @@ class Pipeline:
                     ai_decision=ai_decision,
                     tg_message_id=tg_message_id,
                     tg_events_message_id=tg_events_message_id,
+                    repeat_of=repeat_of,
                 )
                 return
             except Exception as save_exc:

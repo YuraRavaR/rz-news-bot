@@ -274,6 +274,7 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
             "error": "❌",
             "deferred": "🔄",
             "publishing": "❔",
+            "repeat": "🔁",
         }
         icon = decision_icons.get(entry.decision.value, "❓")
         if entry.decision.value == "posted" and entry.posted_to_events:
@@ -292,6 +293,11 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     if entry.error_msg:
         err = _html_escape(entry.error_msg)
         head += f" (<i>{err}</i>)"
+    if entry.original is not None:
+        # Always next to its original, so the admin can spot a wrong match
+        original_href = _html_escape(entry.original.url)
+        original_title = _html_escape(entry.original.title_pl)
+        head += f' (повтор: <a href="{original_href}">{original_title}</a>)'
     out: list[str] = [head]
     detail_lines: list[str] = []
     if entry.decision.value == "posted":
@@ -354,7 +360,9 @@ def _collect_run_report_segments(
         meta_inner.append(f"min score {min_esc}")
     meta_inner.append(
         f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
-        f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
+        f"posted {stats.posted} · skipped {stats.skipped} · "
+        + (f"repeats {stats.repeats} · " if stats.repeats else "")
+        + f"errors {stats.errors}"
         + (f" · deferred {stats.deferred}" if stats.deferred else "")
     )
     rq_n = len(stats.remaining_queued)
@@ -452,6 +460,7 @@ def _collect_run_report_segments(
     summary_bits = [
         f"posted={stats.posted}",
         f"skipped={stats.skipped}",
+        *([f"repeats={stats.repeats}"] if stats.repeats else []),
         f"errors={stats.errors}",
     ]
     if stats.deferred:

@@ -40,8 +40,8 @@ Flow: `main.py` → `Pipeline.run()` in `pipeline.py`, which goes through these 
 0. **Resolve stale Publishing** (non-dry Runs only): `resolve_stale_publishing` turns Publishing rows left by an earlier Run into Unconfirmed and alerts the admin once per Article.
 
 1. **Scrape** (`scraper.py`): `fetch_articles` runs every enabled source from `config.yaml` one after another, sharing one client with browser-like headers over HTTP/2. A failing source is isolated and the others continue. `Pipeline._check_source_health` raises an admin alert when an enabled source returns 0 articles, because a markup change otherwise looks just like a quiet news day.
-2. **Dedup**: `storage.filter_new_ids` returns IDs not yet settled. Articles are then reordered round-robin across sources, oldest first.
-3. **Evaluate + publish**, one article at a time: `GeminiAIFilter.evaluate` (structured output → `AIDecision`), then `mark_publishing` and `TelegramPublisher.publish` to the main channel (that failure is fatal for the article). Event articles then go to the events channel with a single attempt (`publish_once`); that failure is non-fatal, shown in the run report and never retried. If `mark_publishing` fails, nothing is sent and the Run stops. Any `StopSignal` other than `CONTINUE` (post cap, Gemini quota, publishing blocked, Telegram rate limited) stops the loop through `Pipeline._stop_early`.
+2. **Dedup**: `storage.filter_new_ids` returns IDs not yet settled. Articles are then reordered round-robin across sources, oldest first. `Pipeline._check_source_windows` flags (in the run report) every Source that returned its full `max_articles` window with every Article new.
+3. **Repeat check + evaluate + publish**, one article at a time. First `StoryIndex.find_original` (`dedup.py`) looks for an original: an Article the AI judged earlier in this Run (Published, Skipped or Publishing; never Error or Deferred) with the same normalised title (any Source) or the same slug from the same Source (`ScraperSource.slug`). A match is a Repeat: no Gemini call, no Post, saved as `REPEAT` with `repeat_of` = the original's ID, listed in the run report next to its original. Otherwise `GeminiAIFilter.evaluate` (structured output → `AIDecision`), then `mark_publishing` and `TelegramPublisher.publish` to the main channel (that failure is fatal for the article). Event articles then go to the events channel with a single attempt (`publish_once`); that failure is non-fatal, shown in the run report and never retried. If `mark_publishing` fails, nothing is sent and the Run stops. Any `StopSignal` other than `CONTINUE` (post cap, Gemini quota, publishing blocked, Telegram rate limited) stops the loop through `Pipeline._stop_early`.
 4. **Persist**: `save_decision` with in-process retries. If a post is published but never saved, the row stays Publishing (the next Run makes it Unconfirmed) and an admin alert says no Duplicate will follow.
 
 After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMIN_CHAT_ID` and writes a GitHub step summary.
@@ -61,7 +61,7 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 
 ### Adding a news source
 
-1. Create `sources/<site>.py` with a class that satisfies the `ScraperSource` protocol (`name`, `url`, `async fetch(client, max_articles)`), with the HTML parsing in `parser.py`.
+1. Create `sources/<site>.py` with a class that satisfies the `ScraperSource` protocol (`name`, `url`, `slug(url)`, `async fetch(client, max_articles)`), with the HTML parsing in `parser.py`.
 2. Give it a unique `ID_PREFIX`. Article IDs are stored as `<prefix>/<id>` (`rz24/…`, `rzn/…`) and serve as the dedup key, so changing a prefix re-posts everything from that source.
 3. Register it in `_SCRAPER_REGISTRY` in `sources/__init__.py`.
 4. Add an entry to `config.yaml`.

@@ -64,6 +64,9 @@ class Decision(StrEnum):
     PUBLISHING = "publishing"
     # A Publishing record that a later Run found unresolved. Final.
     UNCONFIRMED = "unconfirmed"
+    # Not sent to the AI: it already judged another Article about the same Story.
+    # Final; the record keeps the original's ID.
+    REPEAT = "repeat"
     # Run-report only: a Deferred Article is never written to storage.
     DEFERRED = "deferred"
 
@@ -100,6 +103,10 @@ class PostRecord(BaseModel):
     error_attempts: int = Field(
         default=0,
         description="Consecutive failed processing attempts; reset to 0 on success",
+    )
+    repeat_of: str | None = Field(
+        default=None,
+        description="For a Repeat, the ID of the original Article",
     )
 
 

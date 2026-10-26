@@ -22,6 +22,8 @@ def _make_settings(**overrides: object) -> Settings:
         "telegram_staging_channel_id": None,
         "turso_staging_database_url": None,
         "turso_staging_auth_token": None,
+        "telegram_events_channel_id": None,
+        "telegram_staging_events_channel_id": None,
         # Optional fields — set explicitly to avoid .env overriding them
         "gemini_model": "gemini-3.5-flash-lite",
         "ai_min_score": 7.0,
@@ -102,6 +104,34 @@ class TestPublishTelegramChatId:
         s = _make_settings(telegram_staging_channel_id="   ")
         with pytest.raises(ValueError, match="TELEGRAM_STAGING_CHANNEL_ID"):
             s.publish_telegram_chat_id(staging=True)
+
+
+class TestEventsTelegramChatId:
+    def test_production_uses_events_channel(self) -> None:
+        s = _make_settings(telegram_events_channel_id="-100333")
+        assert s.events_telegram_chat_id(staging=False) == "-100333"
+
+    def test_production_none_when_unset(self) -> None:
+        s = _make_settings(telegram_staging_events_channel_id="-100444")
+        assert s.events_telegram_chat_id(staging=False) is None
+
+    def test_staging_uses_staging_events_channel_when_set(self) -> None:
+        s = _make_settings(
+            telegram_events_channel_id="-100333",
+            telegram_staging_events_channel_id="-100444",
+        )
+        assert s.events_telegram_chat_id(staging=True) == "-100444"
+
+    def test_staging_never_falls_back_to_production_events_channel(self) -> None:
+        s = _make_settings(telegram_events_channel_id="-100333")
+        assert s.events_telegram_chat_id(staging=True) is None
+
+    def test_staging_blank_events_channel_is_none(self) -> None:
+        s = _make_settings(
+            telegram_events_channel_id="-100333",
+            telegram_staging_events_channel_id="   ",
+        )
+        assert s.events_telegram_chat_id(staging=True) is None
 
 
 class TestStagingTursoCredentials:

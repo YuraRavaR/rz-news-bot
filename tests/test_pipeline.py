@@ -632,6 +632,25 @@ class TestPipelineStagingChannel:
         assert p.publisher._channel_id == "-100111"
         assert p.publisher._mark_channel_posts_staging is False
 
+    def test_staging_without_staging_events_channel_has_no_events_publisher(self) -> None:
+        s = Settings(
+            telegram_bot_token="t",
+            telegram_channel_id="-100111",
+            telegram_staging_channel_id="-100222",
+            telegram_events_channel_id="-100333",
+            telegram_staging_events_channel_id=None,
+            gemini_api_key="k",
+            turso_database_url="libsql://x.turso.io",
+            turso_auth_token="tok",
+        )
+        p = Pipeline(
+            settings=s,
+            storage=InMemoryStorage(),
+            flow_config=_make_flow_config(),
+            use_staging_channel=True,
+        )
+        assert p.events_publisher is None
+
 
 class TestTransientErrorRetrySemantics:
     """A one-off failure must not retire an article; a persistent one eventually must.

@@ -92,18 +92,15 @@ class Settings(BaseSettings):
     def events_telegram_chat_id(self, *, staging: bool) -> str | None:
         """Chat ID for the events channel, or None if not configured.
 
-        In staging mode, prefers TELEGRAM_STAGING_EVENTS_CHANNEL_ID; falls back to
-        the production events channel ID so staging runs still exercise dual-channel
-        logic even without a dedicated staging events channel.
-        Returns None when no events channel is configured at all — callers treat this
-        as "post to main channel only".
+        In staging mode, only TELEGRAM_STAGING_EVENTS_CHANNEL_ID is used; there is no
+        fallback to the production events channel, so staging never posts to a
+        public channel.
+        Returns None when no events channel is configured for the mode — callers treat
+        this as "post to main channel only".
         """
         if staging:
-            sid = (self.telegram_staging_events_channel_id or "").strip()
-            if sid:
-                return sid
-        prod = (self.telegram_events_channel_id or "").strip()
-        return prod or None
+            return (self.telegram_staging_events_channel_id or "").strip() or None
+        return (self.telegram_events_channel_id or "").strip() or None
 
     def staging_turso_credentials(self) -> tuple[str, str]:
         """Return (database_url, auth_token) for staging Turso; raises if incomplete."""

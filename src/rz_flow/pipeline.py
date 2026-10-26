@@ -187,6 +187,8 @@ class Pipeline:
                 mark_channel_posts_staging=self.use_staging_channel,
             )
             logger.info("events_channel_configured", events_channel_id=events_id)
+        elif self.use_staging_channel:
+            logger.warning("staging_events_channel_not_configured")
         else:
             logger.info("events_channel_not_configured")
 

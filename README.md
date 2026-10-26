@@ -87,7 +87,7 @@ cp .env.example .env
 | `TURSO_DATABASE_URL` | `turso db show rz-flow --url` |
 | `TURSO_AUTH_TOKEN` | `turso db tokens create rz-flow` |
 | `TELEGRAM_STAGING_CHANNEL_ID` | (Optional) Second channel for `uv run rz-flow --staging` |
-| `TELEGRAM_STAGING_EVENTS_CHANNEL_ID` | (Optional) Staging variant of `TELEGRAM_EVENTS_CHANNEL_ID`; falls back to the production events channel if unset |
+| `TELEGRAM_STAGING_EVENTS_CHANNEL_ID` | (Optional) Staging variant of `TELEGRAM_EVENTS_CHANNEL_ID`; when unset, staging posts event articles to the staging channel only (never to the production events channel) |
 | `TURSO_STAGING_DATABASE_URL` | (Optional) Separate DB URL — **required** with staging flag |
 | `TURSO_STAGING_AUTH_TOKEN` | (Optional) Token for staging DB |
 

@@ -231,6 +231,9 @@ A failure means the parser needs updating — refresh the fixtures in `tests/fix
 | `TELEGRAM_STAGING_EVENTS_CHANNEL_ID` | Staging events channel ID (optional) |
 | `TURSO_STAGING_DATABASE_URL` | Staging Turso DB URL — required only for `staging: true` |
 | `TURSO_STAGING_AUTH_TOKEN` | Staging Turso auth token — required only for `staging: true` |
+| `HEALTHCHECK_URL` | healthchecks.io ping URL (optional) — dead-man's switch for production Runs, see below |
+
+**Dead-man's switch.** When `HEALTHCHECK_URL` is set, production Runs that are not dry runs ping healthchecks.io: `/start` first, the bare URL on success, `/fail` when any step fails. Staging and dry-run Runs never ping. A failed ping never fails the Run. Set the check up once by hand: cron schedule identical to `publish.yml` (`23 4,7,10,13,16,19 * * *`), timezone UTC, grace period 3 h, and the Telegram integration pointed at the admin chat (email if the free plan has no Telegram). healthchecks.io then alerts when a scheduled Run does not happen, hangs, or fails, including failures before the Python code starts.
 
 ---
 

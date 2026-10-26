@@ -22,6 +22,7 @@ from rz_flow.ai import (
     GeminiQuotaExhaustedError,
     GeminiRateLimitError,
     GeminiResponseIncompleteError,
+    GeminiUnavailableError,
     _build_response_schema,
     _build_system_prompt,
     _classify_gemini_error,
@@ -30,7 +31,8 @@ from rz_flow.ai import (
     _is_truncated,
     _parse_retry_after,
 )
-from rz_flow.models import Article, Category, CategoryTag
+from rz_flow.errors import DeferralError
+from rz_flow.models import Article, Category, CategoryTag, StopSignal
 
 
 def _make_article(
@@ -209,6 +211,26 @@ class TestGeminiAIFilterEvaluate:
 
         # Must NOT retry — only one API call attempt
         assert mock_client.aio.models.generate_content.call_count == 1
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_server_error_retried_then_raises_unavailable(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """A 5xx that outlives the retries becomes GeminiUnavailableError (Deferred)."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        server_err = genai_errors.ServerError(
+            503, {"error": {"code": 503, "message": "Service Unavailable"}}
+        )
+        mock_client.aio.models.generate_content = AsyncMock(side_effect=server_err)
+
+        ai = GeminiAIFilter(api_key="fake-key")
+        with pytest.raises(GeminiUnavailableError) as exc_info:
+            await ai.evaluate(_make_article())
+
+        assert isinstance(exc_info.value, DeferralError)
+        assert exc_info.value.stop_signal is StopSignal.CONTINUE
+        assert mock_client.aio.models.generate_content.call_count == 3
 
     @patch("rz_flow.ai.genai.Client")
     async def test_raises_after_max_retries_on_rate_limit(

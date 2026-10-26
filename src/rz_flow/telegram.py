@@ -7,8 +7,12 @@ Uses httpx directly (no python-telegram-bot library) because:
 
 Handles:
   - HTML parse mode (bold titles, links)
-  - Rate limit (HTTP 429) with Retry-After header respect
-  - General retry with exponential backoff
+  - Channel Post failures, sorted by one question: could the Post already be in
+    the channel? Only failures where it could not are retried:
+      - 429: wait once for Telegram's retry_after (≤ 60 s), retry once
+      - connection could not be set up: a few retries with exponential backoff
+      - timeout after sending, or 5xx: delivery unknown, never retried
+      - any other 4xx: rejected, never retried (the Article becomes an Error)
 """
 
 import asyncio
@@ -28,7 +32,8 @@ from tenacity import (
     wait_exponential,
 )
 
-from rz_flow.models import AIDecision, Article, PublishResult
+from rz_flow.errors import DeferralError
+from rz_flow.models import AIDecision, Article, PublishResult, StopSignal
 
 if TYPE_CHECKING:
     from rz_flow.pipeline import ArticleRunEntry, PipelineStats
@@ -43,6 +48,82 @@ _MAX_MESSAGE_LEN = 4096
 
 # Per-field cap for AI snippets in the admin HTML report (many articles × long text)
 _MAX_ADMIN_AI_SNIPPET = 420
+
+# Failures after the request may have reached Telegram: the Post may be in the channel.
+_DELIVERY_UNKNOWN_ERRORS = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.ProtocolError,
+)
+
+
+# Failures before the request was sent: the Post definitely did not go out.
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+# A 429 asking for a longer wait than this Defers the Article instead of waiting.
+_MAX_RATE_LIMIT_WAIT_S = 60.0
+_DEFAULT_RATE_LIMIT_WAIT_S = 5.0
+
+# The 429 wait, as a module attribute so tests can patch it without patching every
+# asyncio.sleep in the process.
+_sleep = asyncio.sleep
+
+
+class TelegramRateLimitedError(DeferralError):
+    """429 that asks for more than ``_MAX_RATE_LIMIT_WAIT_S``, or a second 429 in a row."""
+
+    report_icon = "⏸"
+    stop_signal = StopSignal.TELEGRAM_RATE_LIMITED
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+    @property
+    def report_message(self) -> str:
+        return f"Telegram rate limit (retry_after={self.retry_after:g}s) — will retry next run"
+
+
+class TelegramUnreachableError(DeferralError):
+    """The connection to Telegram could not be set up, so nothing was sent."""
+
+    report_icon = "📡"
+    stop_signal = StopSignal.PUBLISHING_BLOCKED
+
+    @property
+    def report_message(self) -> str:
+        return f"Telegram unreachable ({self}) — will retry next run"
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """Telegram's requested wait: JSON ``parameters.retry_after``, then the header."""
+    try:
+        value = response.json().get("parameters", {}).get("retry_after")
+        if value is not None:
+            return float(value)
+    except (ValueError, AttributeError):
+        pass
+    try:
+        return float(response.headers["Retry-After"])
+    except (KeyError, ValueError):
+        return _DEFAULT_RATE_LIMIT_WAIT_S
+
+
+class TelegramRejectedError(Exception):
+    """Telegram refused the Post as invalid (a 4xx other than 429).
+
+    Retrying cannot help, so it is raised at once and the Article becomes an Error.
+    """
+
+
+class TelegramDeliveryUnknownError(Exception):
+    """The Post may or may not be in the channel (timeout after sending, or a 5xx).
+
+    Never retried: a second send could produce a Duplicate. The Article stays
+    Publishing and a later Run turns it Unconfirmed.
+    """
 
 
 def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
@@ -184,10 +265,18 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     if entry.report_icon:
         icon = entry.report_icon
     else:
-        decision_icons = {"posted": "✅", "skipped": "⏭", "error": "❌"}
+        decision_icons = {
+            "posted": "✅",
+            "skipped": "⏭",
+            "error": "❌",
+            "deferred": "🔄",
+            "publishing": "❔",
+        }
         icon = decision_icons.get(entry.decision.value, "❓")
         if entry.decision.value == "posted" and entry.posted_to_events:
             icon = "✅📅"
+        elif entry.decision.value == "posted" and entry.events_error:
+            icon = "✅⚠️"
     score_str = f"{entry.score:.1f}" if entry.score is not None else "-"
     title_plain = entry.ua_title or entry.title_pl
     title_esc = _html_escape(title_plain)
@@ -205,6 +294,9 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     if entry.decision.value == "posted":
         channel_label = "новини + події" if entry.posted_to_events else "новини"
         detail_lines.append(f"<b>Канал</b>: {channel_label}")
+        if entry.events_error:
+            events_err = _html_escape(_admin_snippet(entry.events_error))
+            detail_lines.append(f"<b>Канал подій</b>: не вдалося ({events_err})")
     if entry.ai_reason:
         detail_lines.append(f"<b>AI</b>: {_html_escape(_admin_snippet(entry.ai_reason))}")
     if entry.ai_ua_summary:
@@ -242,6 +334,10 @@ def _collect_run_report_segments(
         flags += " ⚠️ QUOTA"
     if stats.post_cap_reached:
         flags += " 🔒 CAP"
+    if stats.stop_signal.value == "publishing_blocked":
+        flags += " ⛔ PUBLISHING BLOCKED"
+    if stats.stop_signal.value == "telegram_rate_limited":
+        flags += " ⏸ TELEGRAM 429"
 
     head_lines: list[str] = [f"<b>📊 Rz-Flow{mode}{flags}</b> - {now_line}"]
 
@@ -256,6 +352,7 @@ def _collect_run_report_segments(
     meta_inner.append(
         f"{stats.total_scraped} scraped -> {stats.new_articles} new -> "
         f"posted {stats.posted} · skipped {stats.skipped} · errors {stats.errors}"
+        + (f" · deferred {stats.deferred}" if stats.deferred else "")
     )
     rq_n = len(stats.remaining_queued)
     if rq_n:
@@ -318,6 +415,17 @@ def _collect_run_report_segments(
                 "Gemini quota exhausted; below are the next articles in the list that did not "
                 "start in this run (they will be retried on the next run)."
             )
+        elif reason == "telegram_rate_limited":
+            intro = (
+                "Telegram rate limit; below are articles not reached in this run (they will "
+                "be retried on the next run)."
+            )
+        elif reason == "publishing_blocked":
+            intro = (
+                "Publishing stopped (Telegram unreachable or delivery uncertain, or storage "
+                "unavailable); below are articles not reached in this run (they will be "
+                "retried on the next run)."
+            )
         else:
             intro = "Not processed in this run:"
         segments.append("<b>Pending evaluation</b>")
@@ -337,6 +445,8 @@ def _collect_run_report_segments(
         f"skipped={stats.skipped}",
         f"errors={stats.errors}",
     ]
+    if stats.deferred:
+        summary_bits.append(f"deferred={stats.deferred}")
     n_queued = len(stats.remaining_queued)
     if n_queued:
         summary_bits.append(f"not_evaluated_this_run={n_queued}")
@@ -398,6 +508,15 @@ def _build_run_report(
     return "\n".join(segments)
 
 
+def _tg_description(response: httpx.Response) -> str:
+    """Telegram's error description; gateways in front of it may answer with HTML."""
+    try:
+        description = response.json().get("description")
+    except ValueError:
+        description = None
+    return str(description) if description else response.text[:200]
+
+
 class TelegramPublisher:
     """Publishes messages to a Telegram channel via Bot API."""
 
@@ -417,17 +536,47 @@ class TelegramPublisher:
         self._report_display_timezone = report_display_timezone
         self._mark_channel_posts_staging = mark_channel_posts_staging
 
+    async def publish(self, article: Article, decision: AIDecision) -> PublishResult:
+        """Send a message to the Telegram channel, retrying only what cannot duplicate.
+
+        Returns PublishResult with the message_id assigned by Telegram.
+
+        Raises:
+            TelegramRateLimitedError: a 429 asking for more than 60 s, or a second 429
+                after waiting once (Deferred).
+            TelegramUnreachableError: no connection after a few attempts (Deferred).
+            TelegramDeliveryUnknownError: the Post may have gone out; never retried.
+            TelegramRejectedError: any other 4xx; never retried.
+        """
+        try:
+            return await self._publish_reaching_telegram(article, decision)
+        except TelegramRateLimitedError as exc:
+            if exc.retry_after > _MAX_RATE_LIMIT_WAIT_S:
+                raise
+            # Wait exactly once, as Telegram asked, with no backoff stacked on top.
+            logger.warning("rate_limited", retry_after=exc.retry_after)
+            await _sleep(exc.retry_after)
+            return await self._publish_reaching_telegram(article, decision)
+
     @retry(
-        retry=retry_if_exception_type(httpx.HTTPStatusError),
+        retry=retry_if_exception_type(TelegramUnreachableError),
         wait=wait_exponential(multiplier=2, min=2, max=30),
         stop=stop_after_attempt(4),
         reraise=True,
     )
-    async def publish(self, article: Article, decision: AIDecision) -> PublishResult:
-        """Send a message to the Telegram channel.
+    async def _publish_reaching_telegram(
+        self, article: Article, decision: AIDecision
+    ) -> PublishResult:
+        """``publish_once``, retried while the connection cannot be set up."""
+        return await self.publish_once(article, decision)
 
-        Returns PublishResult with the message_id assigned by Telegram.
-        Raises httpx.HTTPStatusError on persistent failures.
+    async def publish_once(self, article: Article, decision: AIDecision) -> PublishResult:
+        """Send a message to the Telegram channel with a single attempt.
+
+        Used directly for the events channel, whose Post is never retried.
+        Raises TelegramRateLimitedError on a 429, TelegramUnreachableError when no
+        request was sent, TelegramDeliveryUnknownError when the Post may have gone
+        out, and TelegramRejectedError on any other 4xx.
         """
         text = _build_message(
             article,
@@ -436,33 +585,54 @@ class TelegramPublisher:
         )
 
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                f"{self._base_url}/sendMessage",
-                json={
-                    "chat_id": self._channel_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": False,
-                },
-            )
+            try:
+                response = await client.post(
+                    f"{self._base_url}/sendMessage",
+                    json={
+                        "chat_id": self._channel_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": False,
+                    },
+                )
+            except _CONNECT_ERRORS as exc:
+                logger.warning(
+                    "telegram_unreachable",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    chat_id=self._channel_id,
+                )
+                raise TelegramUnreachableError(f"{type(exc).__name__}: {exc}") from exc
+            except _DELIVERY_UNKNOWN_ERRORS as exc:
+                logger.error(
+                    "telegram_delivery_unknown",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    chat_id=self._channel_id,
+                )
+                raise TelegramDeliveryUnknownError(f"{type(exc).__name__}: {exc}") from exc
 
-            # Handle rate limiting: respect Retry-After header
+            # Rate limited: nothing was posted; the caller decides whether to wait
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", "5"))
-                logger.warning("rate_limited", retry_after=retry_after)
-                await asyncio.sleep(retry_after)
-                response.raise_for_status()  # trigger retry via tenacity
+                retry_after = _retry_after_seconds(response)
+                raise TelegramRateLimitedError(
+                    f"Telegram 429, retry_after={retry_after:g}s", retry_after=retry_after
+                )
 
             if not response.is_success:
                 # Log Telegram's actual error description before raising
-                tg_error = response.json().get("description", response.text)
+                tg_error = _tg_description(response)
                 logger.error(
                     "telegram_api_error",
                     status_code=response.status_code,
                     tg_description=tg_error,
                     chat_id=self._channel_id,
                 )
-                response.raise_for_status()
+                if response.is_server_error:
+                    raise TelegramDeliveryUnknownError(
+                        f"HTTP {response.status_code}: {tg_error}"
+                    )
+                raise TelegramRejectedError(f"HTTP {response.status_code}: {tg_error}")
 
         data = response.json()
         message_id: int = data["result"]["message_id"]

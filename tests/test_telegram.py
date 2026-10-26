@@ -14,7 +14,11 @@ from httpx import Response
 
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.telegram import (
+    TelegramDeliveryUnknownError,
     TelegramPublisher,
+    TelegramRateLimitedError,
+    TelegramRejectedError,
+    TelegramUnreachableError,
     _build_message,
     _html_escape,
     format_run_report_clock,
@@ -494,23 +498,44 @@ class TestTelegramPublisher:
         assert "🧪 STAGING" in data["text"]
         assert "Чернетковий канал" in data["text"]
 
-    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
     @respx.mock
-    async def test_raises_on_persistent_http_error(self, _mock_sleep: AsyncMock) -> None:
-        respx.post(_tg_url("sendMessage")).mock(
+    async def test_5xx_is_delivery_unknown_and_not_retried(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
             return_value=Response(500, json={"ok": False, "description": "Internal Server Error"})
         )
 
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(TelegramDeliveryUnknownError):
+            await publisher.publish(_make_article(), _make_decision())
+        assert route.call_count == 1
+
+    @respx.mock
+    async def test_5xx_with_html_body_is_delivery_unknown(self) -> None:
+        respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(502, text="<html>Bad Gateway</html>")
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramDeliveryUnknownError, match="502"):
             await publisher.publish(_make_article(), _make_decision())
 
-    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
+    @respx.mock
+    async def test_read_timeout_is_delivery_unknown_and_not_retried(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            side_effect=httpx.ReadTimeout("timed out")
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramDeliveryUnknownError):
+            await publisher.publish(_make_article(), _make_decision())
+        assert route.call_count == 1
+
+    @patch("rz_flow.telegram._sleep", new_callable=AsyncMock)
     @respx.mock
     async def test_publish_respects_retry_after_header_on_429(
         self, mock_sleep: AsyncMock
     ) -> None:
-        """429 response: asyncio.sleep is called with the Retry-After value, then retried."""
+        """429 response: waits once for the Retry-After value, then retries once."""
         call_count = 0
 
         def side_effect(request: httpx.Request) -> Response:
@@ -526,24 +551,113 @@ class TestTelegramPublisher:
         result = await publisher.publish(_make_article(), _make_decision())
 
         assert result.message_id == 77
-        mock_sleep.assert_any_call(3)
+        mock_sleep.assert_awaited_once_with(3.0)
 
-    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
+    @patch("rz_flow.telegram._sleep", new_callable=AsyncMock)
     @respx.mock
-    async def test_publish_logs_and_raises_on_json_error_response(
-        self, _mock_sleep: AsyncMock
+    async def test_429_retry_after_from_json_body_wins_over_header(
+        self, mock_sleep: AsyncMock
     ) -> None:
-        """Non-success response with JSON body: error is logged and HTTPStatusError raised."""
-        respx.post(_tg_url("sendMessage")).mock(
+        responses = iter(
+            [
+                Response(
+                    429,
+                    headers={"Retry-After": "30"},
+                    json={"ok": False, "parameters": {"retry_after": 7}},
+                ),
+                Response(200, json={"ok": True, "result": {"message_id": 1}}),
+            ]
+        )
+        respx.post(_tg_url("sendMessage")).mock(side_effect=lambda _req: next(responses))
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        await publisher.publish(_make_article(), _make_decision())
+
+        mock_sleep.assert_awaited_once_with(7.0)
+
+    @patch("rz_flow.telegram._sleep", new_callable=AsyncMock)
+    @respx.mock
+    async def test_429_without_retry_after_waits_default(self, mock_sleep: AsyncMock) -> None:
+        responses = iter(
+            [Response(429), Response(200, json={"ok": True, "result": {"message_id": 1}})]
+        )
+        respx.post(_tg_url("sendMessage")).mock(side_effect=lambda _req: next(responses))
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        await publisher.publish(_make_article(), _make_decision())
+
+        mock_sleep.assert_awaited_once_with(5.0)
+
+    @patch("rz_flow.telegram._sleep", new_callable=AsyncMock)
+    @respx.mock
+    async def test_429_over_60s_raises_rate_limited_without_waiting(
+        self, mock_sleep: AsyncMock
+    ) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(429, json={"ok": False, "parameters": {"retry_after": 61}})
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramRateLimitedError):
+            await publisher.publish(_make_article(), _make_decision())
+
+        mock_sleep.assert_not_awaited()
+        assert route.call_count == 1
+
+    @patch("rz_flow.telegram._sleep", new_callable=AsyncMock)
+    @respx.mock
+    async def test_second_429_raises_rate_limited_after_one_wait(
+        self, mock_sleep: AsyncMock
+    ) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(429, json={"ok": False, "parameters": {"retry_after": 2}})
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramRateLimitedError):
+            await publisher.publish(_make_article(), _make_decision())
+
+        mock_sleep.assert_awaited_once_with(2.0)
+        assert route.call_count == 2
+
+    @respx.mock
+    async def test_connect_error_is_retried_then_unreachable(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramUnreachableError):
+            await publisher.publish(_make_article(), _make_decision())
+
+        assert route.call_count == 4
+
+    @respx.mock
+    async def test_publish_once_does_not_retry_connect_error(self) -> None:
+        route = respx.post(_tg_url("sendMessage")).mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+        with pytest.raises(TelegramUnreachableError):
+            await publisher.publish_once(_make_article(), _make_decision())
+
+        assert route.call_count == 1
+
+    @respx.mock
+    async def test_4xx_is_rejected_at_once_with_telegram_description(self) -> None:
+        """A 4xx other than 429 cannot succeed on retry: one request, then raise."""
+        route = respx.post(_tg_url("sendMessage")).mock(
             return_value=Response(
                 400,
-                json={"ok": False, "description": "Bad Request: chat not found"},
+                json={"ok": False, "description": "Bad Request: can't parse entities"},
             )
         )
 
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(TelegramRejectedError, match="can't parse entities"):
             await publisher.publish(_make_article(), _make_decision())
+        assert route.call_count == 1
 
     @respx.mock
     async def test_send_alert_swallows_network_exception(self) -> None:

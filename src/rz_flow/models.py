@@ -61,6 +61,12 @@ class Decision(StrEnum):
     POSTED = "posted"
     SKIPPED = "skipped"
     ERROR = "error"
+    # Written before the Main channel Post; stays when delivery is uncertain.
+    PUBLISHING = "publishing"
+    # A Publishing record that a later Run found unresolved. Final.
+    UNCONFIRMED = "unconfirmed"
+    # Run-report only: a Deferred Article is never written to storage.
+    DEFERRED = "deferred"
 
 
 class StopSignal(StrEnum):
@@ -69,6 +75,10 @@ class StopSignal(StrEnum):
     CONTINUE = "continue"
     QUOTA_EXHAUSTED = "quota_exhausted"
     CAP_REACHED = "cap_reached"
+    # Telegram unreachable, delivery uncertain, or the Publishing record unwritable
+    PUBLISHING_BLOCKED = "publishing_blocked"
+    # Telegram asked to wait longer than we are willing to, or rate limited us twice
+    TELEGRAM_RATE_LIMITED = "telegram_rate_limited"
 
 
 class PostRecord(BaseModel):
@@ -92,6 +102,14 @@ class PostRecord(BaseModel):
         default=0,
         description="Consecutive failed processing attempts; reset to 0 on success",
     )
+
+
+class UnconfirmedArticle(BaseModel):
+    """A Publishing Article turned Unconfirmed at Run start; the admin is told once."""
+
+    id: str
+    url: str
+    title_pl: str
 
 
 class PublishResult(BaseModel):

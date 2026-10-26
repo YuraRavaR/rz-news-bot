@@ -16,7 +16,7 @@ from typing import Protocol, runtime_checkable
 
 import libsql_client
 
-from rz_flow.models import AIDecision, Article, Decision, PostRecord
+from rz_flow.models import AIDecision, Article, Decision, PostRecord, UnconfirmedArticle
 
 # ── SQL DDL ───────────────────────────────────────────────────────────────────
 _CREATE_TABLE = """
@@ -104,6 +104,31 @@ class StorageProtocol(Protocol):
         """Persist the processing result for one article."""
         ...
 
+    async def mark_publishing(self, article: Article) -> Decision | None:
+        """Record the Article as Publishing before its Main channel Post.
+
+        With no row, inserts a minimal one. Over an Error row, changes only the
+        outcome: the attempt count and every other column stay untouched.
+        Returns the previous outcome (None or ERROR).
+        """
+        ...
+
+    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+        """Undo ``mark_publishing`` after a Post that definitely did not go out.
+
+        ``previous`` is what ``mark_publishing`` returned: with None the row is
+        deleted, with ERROR it goes back to Error with its attempt count unchanged.
+        """
+        ...
+
+    async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
+        """Turn every Publishing row into Unconfirmed and return those Articles.
+
+        Runs once at the start of every non-dry Run, before scraping. Safe only
+        because production Runs never overlap.
+        """
+        ...
+
     async def close(self) -> None:
         """Release resources (connection pool, etc.)."""
         ...
@@ -164,8 +189,9 @@ class TursoStorage:
 
         client = self._get_client()
         placeholders = ", ".join("?" * len(article_ids))
-        # "Settled" = posted, skipped, or errored past the retry budget. Anything else
-        # in this batch still needs work, including rows we are about to retry.
+        # "Settled" = posted, skipped, publishing, unconfirmed, or errored past the
+        # retry budget. Anything else in this batch still needs work, including rows
+        # we are about to retry.
         result = await client.execute(
             f"""
             SELECT id FROM posts
@@ -236,6 +262,54 @@ class TursoStorage:
             ],
         )
 
+    async def mark_publishing(self, article: Article) -> Decision | None:
+        client = self._get_client()
+        result = await client.execute("SELECT decision FROM posts WHERE id = ?", [article.id])
+        previous = Decision(result.rows[0][0]) if result.rows else None
+        await client.execute(
+            """
+            INSERT INTO posts (id, url, category, title_pl, seen_at, decision, error_attempts)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(id) DO UPDATE SET decision = excluded.decision
+            """,
+            [
+                article.id,
+                article.url,
+                article.category.value,
+                article.title_pl,
+                datetime.now(UTC).isoformat(),
+                Decision.PUBLISHING.value,
+            ],
+        )
+        return previous
+
+    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+        client = self._get_client()
+        if previous is None:
+            await client.execute(
+                "DELETE FROM posts WHERE id = ? AND decision = ?",
+                [article_id, Decision.PUBLISHING.value],
+            )
+        else:
+            await client.execute(
+                "UPDATE posts SET decision = ? WHERE id = ? AND decision = ?",
+                [previous.value, article_id, Decision.PUBLISHING.value],
+            )
+
+    async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
+        client = self._get_client()
+        result = await client.execute(
+            "SELECT id, url, title_pl FROM posts WHERE decision = ? ORDER BY seen_at",
+            [Decision.PUBLISHING.value],
+        )
+        stale = [UnconfirmedArticle(id=r[0], url=r[1], title_pl=r[2]) for r in result.rows]
+        if stale:
+            await client.execute(
+                "UPDATE posts SET decision = ? WHERE decision = ?",
+                [Decision.UNCONFIRMED.value, Decision.PUBLISHING.value],
+            )
+        return stale
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
@@ -293,6 +367,40 @@ class InMemoryStorage:
             category_tag=ai_decision.category_tag.value if ai_decision else None,
             error_attempts=prior_attempts + 1 if decision == Decision.ERROR else 0,
         )
+
+    async def mark_publishing(self, article: Article) -> Decision | None:
+        previous = self._records.get(article.id)
+        if previous is not None:
+            self._records[article.id] = previous.model_copy(
+                update={"decision": Decision.PUBLISHING}
+            )
+            return previous.decision
+        self._records[article.id] = PostRecord(
+            id=article.id,
+            url=article.url,
+            category=article.category,
+            title_pl=article.title_pl,
+            decision=Decision.PUBLISHING,
+        )
+        return None
+
+    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+        record = self._records.get(article_id)
+        if record is None or record.decision != Decision.PUBLISHING:
+            return
+        if previous is None:
+            del self._records[article_id]
+        else:
+            self._records[article_id] = record.model_copy(update={"decision": previous})
+
+    async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
+        stale = [r for r in self._records.values() if r.decision == Decision.PUBLISHING]
+        stale.sort(key=lambda r: r.seen_at)
+        for record in stale:
+            self._records[record.id] = record.model_copy(
+                update={"decision": Decision.UNCONFIRMED}
+            )
+        return [UnconfirmedArticle(id=r.id, url=r.url, title_pl=r.title_pl) for r in stale]
 
     async def close(self) -> None:
         pass

@@ -17,20 +17,16 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 
 import structlog
-from google.genai.errors import ServerError as GeminiServerError
 
-from rz_flow.ai import (
-    GeminiAIFilter,
-    GeminiQuotaExhaustedError,
-    GeminiResponseIncompleteError,
-)
+from rz_flow.ai import GeminiAIFilter
 from rz_flow.config import Settings
+from rz_flow.errors import DeferralError, PublishingRecordError
 from rz_flow.flow_config import FlowConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Decision, StopSignal
 from rz_flow.scraper import fetch_articles
 from rz_flow.sources import ScraperSource, get_active_sources
 from rz_flow.storage import StorageProtocol
-from rz_flow.telegram import TelegramPublisher
+from rz_flow.telegram import TelegramDeliveryUnknownError, TelegramPublisher
 
 logger = structlog.get_logger(__name__)
 
@@ -38,6 +34,15 @@ logger = structlog.get_logger(__name__)
 # duplicate post on the next run, so it is worth a few seconds.
 _SAVE_MAX_ATTEMPTS = 3
 _SAVE_RETRY_DELAY_S = 1.0
+
+# Early stops of the Run → the reason recorded for the "not reached" list in the
+# run report. A new stop reason needs an entry here and wording in the report.
+_REMAINING_STOP_REASONS: dict[StopSignal, str] = {
+    StopSignal.QUOTA_EXHAUSTED: "quota",
+    StopSignal.CAP_REACHED: "post_cap",
+    StopSignal.PUBLISHING_BLOCKED: "publishing_blocked",
+    StopSignal.TELEGRAM_RATE_LIMITED: "telegram_rate_limited",
+}
 
 
 def _order_new_articles_round_robin_oldest_first(articles: list[Article]) -> list[Article]:
@@ -105,6 +110,8 @@ class ArticleRunEntry:
     ai_ua_summary: str | None = None
     # True when the article was also published to the events channel
     posted_to_events: bool = False
+    # Set when the main channel Post went out but the events channel Post failed
+    events_error: str | None = None
 
 
 @dataclass
@@ -119,9 +126,11 @@ class PipelineStats:
     dry_run: bool = False
     quota_exhausted: bool = False  # True if Gemini daily quota was hit
     post_cap_reached: bool = False  # True if max_posts_per_run was hit
+    # Why the Run stopped early; CONTINUE when it went through every new Article
+    stop_signal: StopSignal = StopSignal.CONTINUE
     # New articles never started this run (indices after the stop); empty if none
     remaining_queued: list[RemainingArticleBrief] = field(default_factory=list)
-    # Why the queue tail was skipped: "" | "post_cap" | "quota"
+    # Why the queue tail was skipped: "" | "post_cap" | "quota" | "publishing_blocked"
     remaining_stop_reason: str = ""
     # Per-source counts for admin reporting
     source_scraped: dict[str, int] = field(default_factory=dict)
@@ -130,6 +139,8 @@ class PipelineStats:
     source_urls: dict[str, str] = field(default_factory=dict)
     # Per-article log for admin run report
     article_log: list[ArticleRunEntry] = field(default_factory=list)
+    # Articles left for the next Run by a failure that was not their fault
+    deferred: int = 0
     # Operational warnings worth pushing to the admin chat immediately, separate from
     # the run report (e.g. a source that went silent, a post that may have duplicated).
     alerts: list[str] = field(default_factory=list)
@@ -148,7 +159,8 @@ class PipelineStats:
             f"new={self.new_articles}, "
             f"posted={self.posted}, "
             f"skipped={self.skipped}, "
-            f"errors={self.errors}"
+            f"errors={self.errors}, "
+            f"deferred={self.deferred}"
         )
 
 
@@ -187,6 +199,8 @@ class Pipeline:
                 mark_channel_posts_staging=self.use_staging_channel,
             )
             logger.info("events_channel_configured", events_channel_id=events_id)
+        elif self.use_staging_channel:
+            logger.warning("staging_events_channel_not_configured")
         else:
             logger.info("events_channel_not_configured")
 
@@ -223,6 +237,11 @@ class Pipeline:
             model=self.settings.gemini_model,
             min_score=self.settings.ai_min_score,
         )
+        # Before scraping, so a Publishing Article is resolved even after it has
+        # dropped off its Source's listing page.
+        if not dry_run:
+            await self._resolve_stale_publishing(stats, log)
+
         try:
             all_articles, source_scraped = await fetch_articles(self.settings, self.flow_config)
         except Exception as exc:
@@ -259,46 +278,8 @@ class Pipeline:
         for i, article in enumerate(new_articles):
             stop_signal = await self._process_article(article, stats, dry_run)
 
-            if stop_signal is StopSignal.QUOTA_EXHAUSTED:
-                tail = new_articles[i + 1 :]
-                if tail:
-                    stats.remaining_queued = [
-                        RemainingArticleBrief(
-                            article_id=a.id,
-                            title_pl=a.title_pl,
-                            url=a.url,
-                            source_name=a.source_name,
-                        )
-                        for a in tail
-                    ]
-                    stats.remaining_stop_reason = "quota"
-                log.warning(
-                    "quota_exhausted_stopping",
-                    processed=i + 1,
-                    remaining=len(new_articles) - i - 1,
-                )
-                stats.quota_exhausted = True
-                break
-
-            if stop_signal is StopSignal.CAP_REACHED:
-                tail = new_articles[i + 1 :]
-                if tail:
-                    stats.remaining_queued = [
-                        RemainingArticleBrief(
-                            article_id=a.id,
-                            title_pl=a.title_pl,
-                            url=a.url,
-                            source_name=a.source_name,
-                        )
-                        for a in tail
-                    ]
-                    stats.remaining_stop_reason = "post_cap"
-                log.info(
-                    "post_cap_reached",
-                    cap=self.flow_config.pipeline.max_posts_per_run,
-                    remaining=len(new_articles) - i - 1,
-                )
-                stats.post_cap_reached = True
+            if stop_signal is not StopSignal.CONTINUE:
+                self._stop_early(stats, stop_signal, new_articles[i + 1 :], log)
                 break
 
             is_last = i == len(new_articles) - 1
@@ -317,6 +298,53 @@ class Pipeline:
             elapsed_s=stats.elapsed_s,
         )
         return stats
+
+    def _stop_early(
+        self,
+        stats: PipelineStats,
+        stop_signal: StopSignal,
+        tail: list[Article],
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Record why the Run stopped and which new Articles it never reached."""
+        stats.stop_signal = stop_signal
+        if tail:
+            stats.remaining_queued = [
+                RemainingArticleBrief(
+                    article_id=a.id,
+                    title_pl=a.title_pl,
+                    url=a.url,
+                    source_name=a.source_name,
+                )
+                for a in tail
+            ]
+            stats.remaining_stop_reason = _REMAINING_STOP_REASONS[stop_signal]
+        if stop_signal is StopSignal.QUOTA_EXHAUSTED:
+            stats.quota_exhausted = True
+        elif stop_signal is StopSignal.CAP_REACHED:
+            stats.post_cap_reached = True
+        log.warning(
+            "run_stopped_early",
+            reason=stop_signal.value,
+            remaining=len(tail),
+            cap=self.flow_config.pipeline.max_posts_per_run,
+        )
+
+    async def _resolve_stale_publishing(
+        self, stats: PipelineStats, log: structlog.stdlib.BoundLogger
+    ) -> None:
+        """Turn Publishing records left by an earlier Run into Unconfirmed, alerting once.
+
+        Their Post may already be in the Main channel, so they are never posted again;
+        the admin checks the channel by hand.
+        """
+        for article in await self.storage.resolve_stale_publishing():
+            log.warning("publishing_unconfirmed", article_id=article.id, url=article.url)
+            stats.alerts.append(
+                f"Не вдалося підтвердити публікацію статті «{article.title_pl}»: "
+                f"{article.url}. Перевірте основний канал: якщо поста там немає, "
+                "опублікуйте його вручну. Бот більше не публікуватиме цю статтю."
+            )
 
     @staticmethod
     def _check_source_health(
@@ -350,18 +378,22 @@ class Pipeline:
 
         Routing logic:
           - is_interesting + is_event + events_publisher configured
-              → post to events channel first, then post to main channel
+              → post to main channel first, then to events channel
           - is_interesting + (not is_event OR events_publisher not configured)
               → post to main channel only
           - not is_interesting → skip both channels
 
-        Events channel failure is non-fatal: if the events channel post fails,
-        the error is logged and we still proceed to post on the main channel.
-        Main channel failure IS fatal for the article (marked as ERROR).
+        Main channel failure IS fatal for the article (marked as ERROR), and the
+        events channel is never called, so the next attempt starts clean.
+        Events channel failure is non-fatal: the article is still Published, the
+        failure goes into the run report, and the events Post is never retried —
+        not in-process (a retry after an unanswered request could duplicate it) and
+        not on later runs (the article is Settled).
 
         Failure modes fall into two groups:
-          - Not the article's fault (quota, 503, truncated output): nothing is written
-            to storage, so the article resurfaces untouched on the next run.
+          - Not the article's fault (any DeferralError): the article is Deferred.
+            Nothing is written to storage, so it resurfaces untouched on the next run;
+            the error's stop signal may end the run early.
           - Everything else: recorded as ERROR with an incremented attempt counter.
             Storage keeps returning it as "new" until the retry budget runs out, so a
             one-off network blip cannot retire an article permanently.
@@ -371,7 +403,11 @@ class Pipeline:
         tg_message_id: int | None = None
         tg_events_message_id: int | None = None
         posted_to_events = False
+        events_error: str | None = None
         error_msg: str | None = None
+        # Set once the Publishing record is written: what to restore on a Deferral
+        marked_publishing = False
+        previous_outcome: Decision | None = None
 
         log = logger.bind(article_id=article.id, category=article.category.value)
 
@@ -398,7 +434,7 @@ class Pipeline:
 
             if should_publish:
                 if dry_run:
-                    channels = ["events", "main"] if route_to_events else ["main"]
+                    channels = ["main", "events"] if route_to_events else ["main"]
                     log.info(
                         "dry_run_would_publish",
                         score=ai_decision.score,
@@ -409,11 +445,25 @@ class Pipeline:
                     decision = Decision.POSTED
                     posted_to_events = route_to_events
                 else:
-                    # Events channel first — failure is non-fatal
+                    # Write-ahead record: if delivery turns out uncertain, it stays
+                    # Publishing and the Article is never posted again (ADR 0001).
+                    try:
+                        previous_outcome = await self.storage.mark_publishing(article)
+                    except Exception as exc:
+                        raise PublishingRecordError(f"{type(exc).__name__}: {exc}") from exc
+                    marked_publishing = True
+
+                    # Main channel first — failure IS fatal for the article
+                    result = await self.publisher.publish(article, ai_decision)
+                    tg_message_id = result.message_id
+                    stats.posted += 1
+                    decision = Decision.POSTED
+
+                    # Events channel after it — failure is non-fatal, never retried
                     if route_to_events:
                         assert self.events_publisher is not None  # narrowing for type checker
                         try:
-                            events_result = await self.events_publisher.publish(
+                            events_result = await self.events_publisher.publish_once(
                                 article, ai_decision
                             )
                             tg_events_message_id = events_result.message_id
@@ -423,16 +473,9 @@ class Pipeline:
                                 tg_events_message_id=tg_events_message_id,
                             )
                         except Exception as events_exc:
-                            # Non-fatal: log and continue to publish on the main channel
-                            log.error(
-                                "events_channel_publish_failed",
-                                error=str(events_exc),
-                                article_id=article.id,
-                            )
+                            events_error = f"{type(events_exc).__name__}: {events_exc}"
+                            log.error("events_channel_publish_failed", error=str(events_exc))
 
-                    # Main channel — failure IS fatal for the article
-                    result = await self.publisher.publish(article, ai_decision)
-                    tg_message_id = result.message_id
                     log.info(
                         "published",
                         score=ai_decision.score,
@@ -440,68 +483,61 @@ class Pipeline:
                         ua_title=ai_decision.ua_title,
                         posted_to_events=posted_to_events,
                     )
-                    stats.posted += 1
-                    decision = Decision.POSTED
             else:
                 log.info("skipped", score=ai_decision.score, reason=ai_decision.reason)
                 stats.skipped += 1
                 decision = Decision.SKIPPED
 
-        except GeminiQuotaExhaustedError:
-            # Do NOT save as error — we'll retry this article on the next run
-            # (it won't appear in filter_new_ids since it's not persisted)
+        except DeferralError as exc:
+            # Not the article's fault: do NOT save — it won't be in storage, so
+            # filter_new_ids returns it again on the next run.
+            log.warning(
+                "article_deferred",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                stop_signal=exc.stop_signal.value,
+            )
+            if marked_publishing:
+                # The Post definitely did not go out: storage goes back to exactly
+                # its state before this Run, attempt count included.
+                await self._release_publishing(article, previous_outcome, log)
+            stats.deferred += 1
             stats.article_log.append(
                 ArticleRunEntry(
                     article_id=article.id,
                     title_pl=article.title_pl,
-                    ua_title=None,
-                    score=None,
-                    decision=Decision.SKIPPED,
-                    error_msg="Gemini daily quota exhausted — not saved, will retry on next run",
-                    report_icon="⏸",
+                    ua_title=ai_decision.ua_title if ai_decision else None,
+                    score=ai_decision.score if ai_decision else None,
+                    decision=Decision.DEFERRED,
+                    error_msg=exc.report_message,
+                    report_icon=exc.report_icon,
                     source_name=article.source_name,
                     article_url=article.url,
+                    ai_reason=ai_decision.reason if ai_decision else None,
+                    ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
                 )
             )
-            return StopSignal.QUOTA_EXHAUSTED
+            return exc.stop_signal
 
-        except GeminiServerError as exc:
-            # 503 UNAVAILABLE after retries — transient server overload.
-            # Do NOT save to DB so the article is retried on the next pipeline run.
-            log.warning("gemini_unavailable_skipping", error=str(exc))
+        except TelegramDeliveryUnknownError as exc:
+            # The Post may be in the Main channel: leave the record Publishing, never
+            # send again, and stop — an unhealthy Telegram would only pile up more.
+            log.error("main_channel_delivery_unknown", error=str(exc))
             stats.article_log.append(
                 ArticleRunEntry(
                     article_id=article.id,
                     title_pl=article.title_pl,
-                    ua_title=None,
-                    score=None,
-                    decision=Decision.SKIPPED,
-                    error_msg=f"Gemini temporarily unavailable (503): {exc}",
-                    report_icon="🔄",
+                    ua_title=ai_decision.ua_title if ai_decision else None,
+                    score=ai_decision.score if ai_decision else None,
+                    decision=Decision.PUBLISHING,
+                    error_msg=f"delivery unknown, check the main channel ({exc})",
                     source_name=article.source_name,
                     article_url=article.url,
+                    ai_reason=ai_decision.reason if ai_decision else None,
+                    ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
                 )
             )
-            return StopSignal.CONTINUE
-
-        except GeminiResponseIncompleteError as exc:
-            # Output hit the token ceiling, so the JSON is unparseable. The article is
-            # fine — leave it unsaved and let the next run have another go.
-            log.warning("gemini_truncated_skipping", error=str(exc))
-            stats.article_log.append(
-                ArticleRunEntry(
-                    article_id=article.id,
-                    title_pl=article.title_pl,
-                    ua_title=None,
-                    score=None,
-                    decision=Decision.SKIPPED,
-                    error_msg=f"Gemini response truncated: {exc}",
-                    report_icon="✂️",
-                    source_name=article.source_name,
-                    article_url=article.url,
-                )
-            )
-            return StopSignal.CONTINUE
+            return StopSignal.PUBLISHING_BLOCKED
 
         except Exception as exc:
             log.exception("article_error", error=str(exc))
@@ -523,6 +559,7 @@ class Pipeline:
                 ai_reason=ai_decision.reason if ai_decision else None,
                 ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
                 posted_to_events=posted_to_events,
+                events_error=events_error,
             )
         )
 
@@ -545,6 +582,22 @@ class Pipeline:
 
         return StopSignal.CONTINUE
 
+    async def _release_publishing(
+        self,
+        article: Article,
+        previous: Decision | None,
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Undo the Publishing record of a Deferred Article.
+
+        If this fails too, the record stays Publishing and the next Run turns it
+        Unconfirmed: the Article is lost to automation, but never posted twice.
+        """
+        try:
+            await self.storage.release_publishing(article.id, previous)
+        except Exception as exc:
+            log.error("release_publishing_failed", error=str(exc))
+
     async def _save_decision_with_retry(
         self,
         *,
@@ -558,9 +611,9 @@ class Pipeline:
     ) -> None:
         """Persist the outcome, retrying transient storage failures.
 
-        A lost write after a successful post is the expensive case: the article stays
-        absent from storage, so the next run treats it as new and publishes it a second
-        time. Retry first, and if it still fails, tell the admin a duplicate is coming.
+        After a Post the record is Publishing, so even a lost write cannot cause a
+        Duplicate: the next Run turns it Unconfirmed. Retrying still matters, because
+        an Unconfirmed Article needs the admin to check the channel by hand.
         """
         last_exc: Exception | None = None
         for attempt in range(1, _SAVE_MAX_ATTEMPTS + 1):
@@ -582,9 +635,10 @@ class Pipeline:
         log.error("save_failed_permanently", error=str(last_exc), article_id=article.id)
         if decision == Decision.POSTED:
             stats.alerts.append(
-                f"Пост опубліковано, але не збережено в БД: {article.url} "
+                f"Пост опубліковано, але результат не збережено в БД: {article.url} "
                 f"({type(last_exc).__name__}: {last_exc}). "
-                "Наступний запуск, найімовірніше, опублікує цю статтю повторно."
+                "Наступний запуск позначить статтю як непідтверджену. "
+                "Повторної публікації не буде."
             )
         else:
             stats.alerts.append(

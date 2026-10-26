@@ -32,6 +32,13 @@ on:
           - "false"
           - "true"
 
+# Two production Runs must never overlap: both would see the same new Articles
+# and post them twice. Scheduled Runs have no inputs, so the staging input is
+# normalised to prod/staging to put them in the same group as manual prod Runs.
+concurrency:
+  group: publish-${{ github.event.inputs.staging == 'true' && 'staging' || 'prod' }}
+  cancel-in-progress: false
+
 jobs:
   # ── Publish (runs on cron and manual dispatch) ───────────────────────────
   publish:
@@ -40,8 +47,20 @@ jobs:
     # A healthy run takes 2-4 minutes. Without this the GitHub default is 6 hours,
     # so one hung request could burn a large slice of the monthly Actions budget.
     timeout-minutes: 25
+    env:
+      # Dead-man's switch (healthchecks.io): pings only from production Runs that
+      # are not dry runs, and only when the secret is set. Staging and dry-run
+      # pings would hide a missing production Run.
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+      HEALTHCHECK_ENABLED: ${{ github.event.inputs.staging != 'true' && github.event.inputs.dry_run != 'true' }}
 
     steps:
+      # Pings never fail the job: monitoring must not be able to break publishing.
+      - name: Ping healthchecks.io (start)
+        if: env.HEALTHCHECK_URL != '' && env.HEALTHCHECK_ENABLED == 'true'
+        continue-on-error: true
+        run: curl -fsS -m 10 --retry 3 -o /dev/null "$HEALTHCHECK_URL/start" || true
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -107,3 +126,15 @@ jobs:
           echo "- **Dry run**: ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Staging**: ${{ github.event.inputs.staging || 'false' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Time**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Ping healthchecks.io (success)
+        if: success() && env.HEALTHCHECK_URL != '' && env.HEALTHCHECK_ENABLED == 'true'
+        continue-on-error: true
+        run: curl -fsS -m 10 --retry 3 -o /dev/null "$HEALTHCHECK_URL" || true
+
+      # Any failed step above (checkout, dependency install, database init, the Run
+      # itself) or a cancel/timeout lands here.
+      - name: Ping healthchecks.io (fail)
+        if: (failure() || cancelled()) && env.HEALTHCHECK_URL != '' && env.HEALTHCHECK_ENABLED == 'true'
+        continue-on-error: true
+        run: curl -fsS -m 10 --retry 3 -o /dev/null "$HEALTHCHECK_URL/fail" || true

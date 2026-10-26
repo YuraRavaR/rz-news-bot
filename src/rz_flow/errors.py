@@ -23,3 +23,18 @@ class DeferralError(Exception):
     @property
     def report_message(self) -> str:
         return str(self)
+
+
+class PublishingRecordError(DeferralError):
+    """The Publishing record could not be written, so nothing was sent.
+
+    Posting without the write-ahead record could produce a Duplicate, so the Run
+    stops rather than spend Gemini quota on Articles it cannot post.
+    """
+
+    report_icon = "💾"
+    stop_signal = StopSignal.PUBLISHING_BLOCKED
+
+    @property
+    def report_message(self) -> str:
+        return f"storage unavailable, nothing sent ({self}) — will retry next run"

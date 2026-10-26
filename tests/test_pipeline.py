@@ -807,7 +807,7 @@ class TestSaveFailureHandling:
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")
     @patch("rz_flow.pipeline.TelegramPublisher")
-    async def test_permanent_save_failure_after_post_raises_duplicate_alert(
+    async def test_permanent_save_failure_after_post_alerts_no_duplicate(
         self,
         mock_tg_cls: MagicMock,
         mock_ai_cls: MagicMock,
@@ -837,8 +837,11 @@ class TestSaveFailureHandling:
 
         assert stats.posted == 1
         assert len(stats.alerts) == 1
-        assert "повторно" in stats.alerts[0]
+        assert "Повторної публікації не буде" in stats.alerts[0]
         assert article.url in stats.alerts[0]
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.decision == Decision.PUBLISHING
 
     @patch("rz_flow.pipeline.fetch_articles")
     @patch("rz_flow.pipeline.GeminiAIFilter")

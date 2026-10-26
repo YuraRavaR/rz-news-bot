@@ -20,7 +20,7 @@ import structlog
 
 from rz_flow.ai import GeminiAIFilter
 from rz_flow.config import Settings
-from rz_flow.errors import DeferralError
+from rz_flow.errors import DeferralError, PublishingRecordError
 from rz_flow.flow_config import FlowConfig, SourceConfig
 from rz_flow.models import AIDecision, Article, Decision, StopSignal
 from rz_flow.scraper import fetch_articles
@@ -447,7 +447,10 @@ class Pipeline:
                 else:
                     # Write-ahead record: if delivery turns out uncertain, it stays
                     # Publishing and the Article is never posted again (ADR 0001).
-                    previous_outcome = await self.storage.mark_publishing(article)
+                    try:
+                        previous_outcome = await self.storage.mark_publishing(article)
+                    except Exception as exc:
+                        raise PublishingRecordError(f"{type(exc).__name__}: {exc}") from exc
                     marked_publishing = True
 
                     # Main channel first — failure IS fatal for the article
@@ -608,9 +611,9 @@ class Pipeline:
     ) -> None:
         """Persist the outcome, retrying transient storage failures.
 
-        A lost write after a successful post is the expensive case: the article stays
-        absent from storage, so the next run treats it as new and publishes it a second
-        time. Retry first, and if it still fails, tell the admin a duplicate is coming.
+        After a Post the record is Publishing, so even a lost write cannot cause a
+        Duplicate: the next Run turns it Unconfirmed. Retrying still matters, because
+        an Unconfirmed Article needs the admin to check the channel by hand.
         """
         last_exc: Exception | None = None
         for attempt in range(1, _SAVE_MAX_ATTEMPTS + 1):
@@ -632,9 +635,10 @@ class Pipeline:
         log.error("save_failed_permanently", error=str(last_exc), article_id=article.id)
         if decision == Decision.POSTED:
             stats.alerts.append(
-                f"Пост опубліковано, але не збережено в БД: {article.url} "
+                f"Пост опубліковано, але результат не збережено в БД: {article.url} "
                 f"({type(last_exc).__name__}: {last_exc}). "
-                "Наступний запуск, найімовірніше, опублікує цю статтю повторно."
+                "Наступний запуск позначить статтю як непідтверджену. "
+                "Повторної публікації не буде."
             )
         else:
             stats.alerts.append(

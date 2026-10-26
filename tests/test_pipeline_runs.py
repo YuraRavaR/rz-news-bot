@@ -398,3 +398,50 @@ class TestRejectedPostBecomesError:
         assert record.error_attempts == 3
         # Default budget is 3 attempts: the Article is now Settled.
         assert await storage.filter_new_ids([article.id]) == []
+
+
+class TestStorageFailuresNeverDuplicate:
+    async def test_unwritable_publishing_record_sends_nothing_and_stops(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        articles = [_article("DB_1"), _article("DB_2")]
+        with patch.object(
+            storage, "mark_publishing", AsyncMock(side_effect=ConnectionError("turso down"))
+        ):
+            run1 = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert bot_api.posts == []
+        assert run1.stop_signal is StopSignal.PUBLISHING_BLOCKED
+        assert run1.deferred == 1
+        assert run1.article_log[0].decision == Decision.DEFERRED
+        assert [b.article_id for b in run1.remaining_queued] == ["DB_1"]
+
+        run2 = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert run2.posted == 2
+
+    async def test_lost_save_after_post_alerts_and_next_run_marks_unconfirmed(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        article = _article("DB_3")
+        with (
+            patch.object(
+                storage, "save_decision", AsyncMock(side_effect=ConnectionError("turso down"))
+            ),
+            patch("rz_flow.pipeline._SAVE_RETRY_DELAY_S", 0.0),
+        ):
+            run1 = await _run(storage, [article], _event_decision(is_event=False))
+
+        assert bot_api.posts == [_MAIN]
+        assert run1.posted == 1
+        alerts = [a for a in run1.alerts if article.url in a]
+        assert len(alerts) == 1
+        assert "Повторної публікації не буде" in alerts[0]
+
+        run2 = await _run(storage, [article], _event_decision(is_event=False))
+
+        assert bot_api.posts == [_MAIN]
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.decision == Decision.UNCONFIRMED
+        assert len([a for a in run2.alerts if article.url in a]) == 1

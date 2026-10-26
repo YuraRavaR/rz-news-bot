@@ -161,11 +161,12 @@ _STAGING_POST_BANNER = (
 
 def _build_message(article: Article, decision: AIDecision, *, staging: bool = False) -> str:
     """Render the Telegram HTML message from article + AI decision."""
-    # HTML-escape any stray < > & in user content (titles from the site)
+    # HTML-escape any stray < > & " in user content (titles from the site)
     title = _html_escape(decision.ua_title)
     summary = _html_escape(decision.ua_summary)
-    url = article.url
-    domain = urlparse(url).netloc  # e.g. "rzeszow24.info" or "rzeszow-news.pl"
+    # Escaped too: a raw & or " in the URL breaks the href attribute
+    url = _html_escape(article.url)
+    domain = _html_escape(urlparse(article.url).netloc)  # e.g. "rzeszow24.info"
 
     raw_hashtag = _CATEGORY_HASHTAGS.get(decision.category_tag.value, "")
     hashtag = f"\n\n{raw_hashtag}" if raw_hashtag else ""
@@ -189,8 +190,10 @@ def _build_message(article: Article, decision: AIDecision, *, staging: bool = Fa
 
 
 def _html_escape(text: str) -> str:
-    """Minimal HTML escaping for Telegram HTML parse mode."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """Minimal HTML escaping for Telegram HTML parse mode, safe inside attributes."""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
 
 
 def _truncate_telegram_html(text: str, max_len: int = _MAX_MESSAGE_LEN - 8) -> str:
@@ -592,7 +595,9 @@ class TelegramPublisher:
                         "chat_id": self._channel_id,
                         "text": text,
                         "parse_mode": "HTML",
-                        "disable_web_page_preview": False,
+                        # The Post shows the Article's card, even if the text ever
+                        # gains another link
+                        "link_preview_options": {"is_disabled": False, "url": article.url},
                     },
                 )
             except _CONNECT_ERRORS as exc:
@@ -730,7 +735,7 @@ class TelegramPublisher:
                             "chat_id": self._alert_chat_id,
                             "text": text,
                             "parse_mode": "HTML",
-                            "disable_web_page_preview": True,
+                            "link_preview_options": {"is_disabled": True},
                         },
                     )
                     try:

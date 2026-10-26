@@ -41,6 +41,7 @@ _REMAINING_STOP_REASONS: dict[StopSignal, str] = {
     StopSignal.QUOTA_EXHAUSTED: "quota",
     StopSignal.CAP_REACHED: "post_cap",
     StopSignal.PUBLISHING_BLOCKED: "publishing_blocked",
+    StopSignal.TELEGRAM_RATE_LIMITED: "telegram_rate_limited",
 }
 
 
@@ -404,6 +405,9 @@ class Pipeline:
         posted_to_events = False
         events_error: str | None = None
         error_msg: str | None = None
+        # Set once the Publishing record is written: what to restore on a Deferral
+        marked_publishing = False
+        previous_outcome: Decision | None = None
 
         log = logger.bind(article_id=article.id, category=article.category.value)
 
@@ -443,7 +447,8 @@ class Pipeline:
                 else:
                     # Write-ahead record: if delivery turns out uncertain, it stays
                     # Publishing and the Article is never posted again (ADR 0001).
-                    await self.storage.mark_publishing(article)
+                    previous_outcome = await self.storage.mark_publishing(article)
+                    marked_publishing = True
 
                     # Main channel first — failure IS fatal for the article
                     result = await self.publisher.publish(article, ai_decision)
@@ -489,18 +494,24 @@ class Pipeline:
                 error=str(exc),
                 stop_signal=exc.stop_signal.value,
             )
+            if marked_publishing:
+                # The Post definitely did not go out: storage goes back to exactly
+                # its state before this Run, attempt count included.
+                await self._release_publishing(article, previous_outcome, log)
             stats.deferred += 1
             stats.article_log.append(
                 ArticleRunEntry(
                     article_id=article.id,
                     title_pl=article.title_pl,
-                    ua_title=None,
-                    score=None,
+                    ua_title=ai_decision.ua_title if ai_decision else None,
+                    score=ai_decision.score if ai_decision else None,
                     decision=Decision.DEFERRED,
                     error_msg=exc.report_message,
                     report_icon=exc.report_icon,
                     source_name=article.source_name,
                     article_url=article.url,
+                    ai_reason=ai_decision.reason if ai_decision else None,
+                    ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
                 )
             )
             return exc.stop_signal
@@ -567,6 +578,22 @@ class Pipeline:
             return StopSignal.CAP_REACHED
 
         return StopSignal.CONTINUE
+
+    async def _release_publishing(
+        self,
+        article: Article,
+        previous: Decision | None,
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Undo the Publishing record of a Deferred Article.
+
+        If this fails too, the record stays Publishing and the next Run turns it
+        Unconfirmed: the Article is lost to automation, but never posted twice.
+        """
+        try:
+            await self.storage.release_publishing(article.id, previous)
+        except Exception as exc:
+            log.error("release_publishing_failed", error=str(exc))
 
     async def _save_decision_with_retry(
         self,

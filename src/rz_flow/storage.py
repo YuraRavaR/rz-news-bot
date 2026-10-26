@@ -113,6 +113,14 @@ class StorageProtocol(Protocol):
         """
         ...
 
+    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+        """Undo ``mark_publishing`` after a Post that definitely did not go out.
+
+        ``previous`` is what ``mark_publishing`` returned: with None the row is
+        deleted, with ERROR it goes back to Error with its attempt count unchanged.
+        """
+        ...
+
     async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
         """Turn every Publishing row into Unconfirmed and return those Articles.
 
@@ -275,6 +283,19 @@ class TursoStorage:
         )
         return previous
 
+    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+        client = self._get_client()
+        if previous is None:
+            await client.execute(
+                "DELETE FROM posts WHERE id = ? AND decision = ?",
+                [article_id, Decision.PUBLISHING.value],
+            )
+        else:
+            await client.execute(
+                "UPDATE posts SET decision = ? WHERE id = ? AND decision = ?",
+                [previous.value, article_id, Decision.PUBLISHING.value],
+            )
+
     async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
         client = self._get_client()
         result = await client.execute(
@@ -362,6 +383,15 @@ class InMemoryStorage:
             decision=Decision.PUBLISHING,
         )
         return None
+
+    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+        record = self._records.get(article_id)
+        if record is None or record.decision != Decision.PUBLISHING:
+            return
+        if previous is None:
+            del self._records[article_id]
+        else:
+            self._records[article_id] = record.model_copy(update={"decision": previous})
 
     async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
         stale = [r for r in self._records.values() if r.decision == Decision.PUBLISHING]

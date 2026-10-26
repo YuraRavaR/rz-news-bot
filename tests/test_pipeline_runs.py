@@ -92,11 +92,15 @@ class FakeBotApi:
     posts: list[str] = field(default_factory=list)  # chat_id of every sendMessage, in order
     # chat_id → HTTP status to answer with, or a transport exception to raise
     failing: dict[str, int | Exception] = field(default_factory=dict)
+    # chat_id → responses served first, one per request, before ``failing`` applies
+    scripted: dict[str, list[httpx.Response]] = field(default_factory=dict)
     _next_id: int = 1
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         chat_id = json.loads(request.content)["chat_id"]
         self.posts.append(chat_id)
+        if self.scripted.get(chat_id):
+            return self.scripted[chat_id].pop(0)
         failure = self.failing.get(chat_id)
         if isinstance(failure, Exception):
             raise failure
@@ -267,3 +271,90 @@ class TestUncertainDeliveryIsNeverReposted:
         assert stats.posted == 1
         assert storage.get_record("DRY_1") is None
         assert bot_api.posts == []
+
+
+def _rate_limited(retry_after: int) -> httpx.Response:
+    return httpx.Response(
+        429,
+        json={
+            "ok": False,
+            "description": "Too Many Requests",
+            "parameters": {"retry_after": retry_after},
+        },
+    )
+
+
+class TestDefinitelyNotDeliveredIsDeferred:
+    async def test_large_retry_after_defers_stops_and_next_run_posts(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        bot_api.scripted[_MAIN] = [_rate_limited(120)]
+        articles = [_article("RL_1"), _article("RL_2")]
+        with patch("rz_flow.telegram._sleep", new_callable=AsyncMock) as tg_wait:
+            run1 = await _run(storage, articles, _event_decision(is_event=False))
+
+        tg_wait.assert_not_awaited()
+        assert bot_api.posts == [_MAIN]
+        assert run1.stop_signal is StopSignal.TELEGRAM_RATE_LIMITED
+        assert run1.deferred == 1
+        assert run1.article_log[0].decision == Decision.DEFERRED
+        assert storage.get_record("RL_1") is None
+        assert storage.get_record("RL_2") is None
+        assert [b.article_id for b in run1.remaining_queued] == ["RL_1"]
+        assert run1.remaining_stop_reason == "telegram_rate_limited"
+
+        run2 = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert run2.posted == 2
+        assert bot_api.posts == [_MAIN, _MAIN, _MAIN]
+
+    async def test_small_retry_after_waits_once_then_posts_once(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        bot_api.scripted[_MAIN] = [_rate_limited(3)]
+        with patch("rz_flow.telegram._sleep", new_callable=AsyncMock) as tg_wait:
+            stats = await _run(storage, [_article("RL_3")], _event_decision(is_event=False))
+
+        tg_wait.assert_awaited_once_with(3.0)
+        assert bot_api.posts == [_MAIN, _MAIN]
+        assert stats.posted == 1
+        record = storage.get_record("RL_3")
+        assert record is not None
+        assert record.decision == Decision.POSTED
+
+    async def test_connect_error_defers_stops_and_next_run_posts(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        bot_api.failing[_MAIN] = httpx.ConnectError("Connection refused")
+        articles = [_article("CONN_1"), _article("CONN_2")]
+
+        run1 = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert run1.stop_signal is StopSignal.PUBLISHING_BLOCKED
+        assert run1.deferred == 1
+        assert run1.errors == 0
+        assert storage.get_record("CONN_1") is None
+        assert storage.get_record("CONN_2") is None
+        assert [b.article_id for b in run1.remaining_queued] == ["CONN_1"]
+
+        bot_api.failing.clear()
+        posts_before = len(bot_api.posts)
+        run2 = await _run(storage, articles, _event_decision(is_event=False))
+
+        assert run2.posted == 2
+        assert bot_api.posts[posts_before:] == [_MAIN, _MAIN]
+
+    async def test_error_article_deferred_keeps_its_attempt_count(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        article = _article("CONN_ERR")
+        await storage.save_decision(article, Decision.ERROR)
+        bot_api.failing[_MAIN] = httpx.ConnectError("Connection refused")
+
+        stats = await _run(storage, [article], _event_decision(is_event=False))
+
+        assert stats.deferred == 1
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.decision == Decision.ERROR
+        assert record.error_attempts == 1

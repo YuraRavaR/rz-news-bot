@@ -21,7 +21,11 @@ def no_retry_backoff() -> Iterator[None]:
     from rz_flow.scraper import _fetch_one
     from rz_flow.telegram import TelegramPublisher
 
-    retryables = [GeminiAIFilter.evaluate, TelegramPublisher.publish, _fetch_one]
+    retryables = [
+        GeminiAIFilter.evaluate,
+        TelegramPublisher._publish_reaching_telegram,
+        _fetch_one,
+    ]
     original = [fn.retry.wait for fn in retryables]  # type: ignore[attr-defined]
     for fn in retryables:
         fn.retry.wait = wait_none()  # type: ignore[attr-defined]

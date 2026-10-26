@@ -587,3 +587,27 @@ class TestPublishingContract:
         )
 
         assert await _outcome(any_storage, article.id) == (Decision.POSTED, 0)
+
+    async def test_release_publishing_new_article_removes_the_record(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("REL_NEW_123456789")
+        previous = await any_storage.mark_publishing(article)
+
+        await any_storage.release_publishing(article.id, previous)
+
+        assert await _outcome(any_storage, article.id) is None
+        assert await any_storage.filter_new_ids([article.id]) == [article.id]
+
+    async def test_release_publishing_error_article_restores_error_and_attempts(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("REL_ERR_123456789")
+        await any_storage.save_decision(article, Decision.ERROR)
+        await any_storage.save_decision(article, Decision.ERROR)
+        previous = await any_storage.mark_publishing(article)
+
+        await any_storage.release_publishing(article.id, previous)
+
+        assert await _outcome(any_storage, article.id) == (Decision.ERROR, 2)
+        assert await any_storage.filter_new_ids([article.id]) == [article.id]

@@ -77,6 +77,8 @@ class StopSignal(StrEnum):
     CAP_REACHED = "cap_reached"
     # Telegram unreachable, delivery uncertain, or the Publishing record unwritable
     PUBLISHING_BLOCKED = "publishing_blocked"
+    # Telegram asked to wait longer than we are willing to, or rate limited us twice
+    TELEGRAM_RATE_LIMITED = "telegram_rate_limited"
 
 
 class PostRecord(BaseModel):

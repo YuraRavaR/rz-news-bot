@@ -108,6 +108,8 @@ class ArticleRunEntry:
     ai_ua_summary: str | None = None
     # True when the article was also published to the events channel
     posted_to_events: bool = False
+    # Set when the main channel Post went out but the events channel Post failed
+    events_error: str | None = None
 
 
 @dataclass
@@ -350,14 +352,17 @@ class Pipeline:
 
         Routing logic:
           - is_interesting + is_event + events_publisher configured
-              → post to events channel first, then post to main channel
+              → post to main channel first, then to events channel
           - is_interesting + (not is_event OR events_publisher not configured)
               → post to main channel only
           - not is_interesting → skip both channels
 
-        Events channel failure is non-fatal: if the events channel post fails,
-        the error is logged and we still proceed to post on the main channel.
-        Main channel failure IS fatal for the article (marked as ERROR).
+        Main channel failure IS fatal for the article (marked as ERROR), and the
+        events channel is never called, so the next attempt starts clean.
+        Events channel failure is non-fatal: the article is still Published, the
+        failure goes into the run report, and the events Post is never retried —
+        not in-process (a retry after an unanswered request could duplicate it) and
+        not on later runs (the article is Settled).
 
         Failure modes fall into two groups:
           - Not the article's fault (any DeferralError): the article is Deferred.
@@ -372,6 +377,7 @@ class Pipeline:
         tg_message_id: int | None = None
         tg_events_message_id: int | None = None
         posted_to_events = False
+        events_error: str | None = None
         error_msg: str | None = None
 
         log = logger.bind(article_id=article.id, category=article.category.value)
@@ -399,7 +405,7 @@ class Pipeline:
 
             if should_publish:
                 if dry_run:
-                    channels = ["events", "main"] if route_to_events else ["main"]
+                    channels = ["main", "events"] if route_to_events else ["main"]
                     log.info(
                         "dry_run_would_publish",
                         score=ai_decision.score,
@@ -410,11 +416,17 @@ class Pipeline:
                     decision = Decision.POSTED
                     posted_to_events = route_to_events
                 else:
-                    # Events channel first — failure is non-fatal
+                    # Main channel first — failure IS fatal for the article
+                    result = await self.publisher.publish(article, ai_decision)
+                    tg_message_id = result.message_id
+                    stats.posted += 1
+                    decision = Decision.POSTED
+
+                    # Events channel after it — failure is non-fatal, never retried
                     if route_to_events:
                         assert self.events_publisher is not None  # narrowing for type checker
                         try:
-                            events_result = await self.events_publisher.publish(
+                            events_result = await self.events_publisher.publish_once(
                                 article, ai_decision
                             )
                             tg_events_message_id = events_result.message_id
@@ -424,16 +436,9 @@ class Pipeline:
                                 tg_events_message_id=tg_events_message_id,
                             )
                         except Exception as events_exc:
-                            # Non-fatal: log and continue to publish on the main channel
-                            log.error(
-                                "events_channel_publish_failed",
-                                error=str(events_exc),
-                                article_id=article.id,
-                            )
+                            events_error = f"{type(events_exc).__name__}: {events_exc}"
+                            log.error("events_channel_publish_failed", error=str(events_exc))
 
-                    # Main channel — failure IS fatal for the article
-                    result = await self.publisher.publish(article, ai_decision)
-                    tg_message_id = result.message_id
                     log.info(
                         "published",
                         score=ai_decision.score,
@@ -441,8 +446,6 @@ class Pipeline:
                         ua_title=ai_decision.ua_title,
                         posted_to_events=posted_to_events,
                     )
-                    stats.posted += 1
-                    decision = Decision.POSTED
             else:
                 log.info("skipped", score=ai_decision.score, reason=ai_decision.reason)
                 stats.skipped += 1
@@ -493,6 +496,7 @@ class Pipeline:
                 ai_reason=ai_decision.reason if ai_decision else None,
                 ai_ua_summary=ai_decision.ua_summary if ai_decision else None,
                 posted_to_events=posted_to_events,
+                events_error=events_error,
             )
         )
 

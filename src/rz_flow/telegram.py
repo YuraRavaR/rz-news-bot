@@ -188,6 +188,8 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
         icon = decision_icons.get(entry.decision.value, "❓")
         if entry.decision.value == "posted" and entry.posted_to_events:
             icon = "✅📅"
+        elif entry.decision.value == "posted" and entry.events_error:
+            icon = "✅⚠️"
     score_str = f"{entry.score:.1f}" if entry.score is not None else "-"
     title_plain = entry.ua_title or entry.title_pl
     title_esc = _html_escape(title_plain)
@@ -205,6 +207,9 @@ def _article_run_report_lines(entry: "ArticleRunEntry") -> list[str]:
     if entry.decision.value == "posted":
         channel_label = "новини + події" if entry.posted_to_events else "новини"
         detail_lines.append(f"<b>Канал</b>: {channel_label}")
+        if entry.events_error:
+            events_err = _html_escape(_admin_snippet(entry.events_error))
+            detail_lines.append(f"<b>Канал подій</b>: не вдалося ({events_err})")
     if entry.ai_reason:
         detail_lines.append(f"<b>AI</b>: {_html_escape(_admin_snippet(entry.ai_reason))}")
     if entry.ai_ua_summary:
@@ -427,10 +432,18 @@ class TelegramPublisher:
         reraise=True,
     )
     async def publish(self, article: Article, decision: AIDecision) -> PublishResult:
-        """Send a message to the Telegram channel.
+        """Send a message to the Telegram channel, retrying failed attempts.
 
         Returns PublishResult with the message_id assigned by Telegram.
         Raises httpx.HTTPStatusError on persistent failures.
+        """
+        return await self.publish_once(article, decision)
+
+    async def publish_once(self, article: Article, decision: AIDecision) -> PublishResult:
+        """Send a message to the Telegram channel with a single attempt.
+
+        Used for the events channel, whose Post is never retried.
+        Raises httpx.HTTPStatusError on any failure.
         """
         text = _build_message(
             article,

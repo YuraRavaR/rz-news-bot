@@ -24,6 +24,10 @@ uv run rz-flow --init-db [--staging]            # create/migrate tables and exit
 
 Running the CLI needs a filled `.env` (see `.env.example`); set `APP_ENV=development` locally to suppress crash/quota alerts. Coverage must stay ≥ 70% (`fail_under`). Ruff enforces `ANN` (type annotations) in `src/` but not in `tests/`.
 
+## Constraints
+
+Free tiers only, no paid services (see `docs/adr/0002-free-tier-only.md`). Check every change for the quota it spends, Gemini daily requests above all. Domain terms are in `GLOSSARY.md`, decisions in `docs/adr/`.
+
 ## Branching
 
 Work happens on `stage`; changes reach `main` through PRs (`stage` → `main`). `main` is protected and a pre-commit hook (`no-commit-to-branch`) refuses commits to it. CI (`ci.yml`) runs ruff, mypy, pytest on every non-`main` push and on PRs.
@@ -74,3 +78,17 @@ Talks to the Bot API directly through httpx, with no bot library. Messages use H
 - `conftest.py` has an autouse fixture that sets tenacity's wait to zero on `GeminiAIFilter.evaluate`, `TelegramPublisher.publish` and `scraper._fetch_one`. A new `@retry`-decorated function needs adding to that list, or its tests will sleep.
 - Parser tests run against frozen HTML in `tests/fixtures/`. When the daily canary workflow (`canary.yml`, `-m live`) fails, the site's markup changed: update the parser and refresh the fixtures from the live page.
 - User-facing strings (posts, admin alerts) are in Ukrainian; logs and code are in English. Logging goes through structlog (`logger.bind(...)`, snake_case event names), with JSON output in CI and pretty output in a TTY.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live in GitHub Issues for `YuraRavaR/rz-news-bot`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default triage labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

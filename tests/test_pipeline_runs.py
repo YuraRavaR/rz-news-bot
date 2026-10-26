@@ -550,6 +550,19 @@ class TestSourceWindowWarning:
 
         assert "⚠️" not in _source_line(_build_run_report(stats, dry_run=False), _RZ24)
 
+    async def test_full_window_with_an_error_article_being_retried_is_not_flagged(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        retried = _article("RETRY_0")
+        await storage.save_decision(retried, Decision.ERROR)
+
+        articles = [retried, _article("RETRY_1"), _article("RETRY_2")]
+        stats = await _run(storage, articles, _event_decision(), flow_config=_flow_config(3))
+
+        # The Error Article is new again, but it proves the window overlapped a Run
+        assert stats.new_articles == 3
+        assert "⚠️" not in _source_line(_build_run_report(stats, dry_run=False), _RZ24)
+
     async def test_other_sources_are_unaffected(
         self, bot_api: FakeBotApi, storage: InMemoryStorage
     ) -> None:

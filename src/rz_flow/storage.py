@@ -109,6 +109,10 @@ class StorageProtocol(Protocol):
         """
         ...
 
+    async def existing_ids(self, article_ids: list[str]) -> set[str]:
+        """IDs that have a record of any outcome, retryable Errors included."""
+        ...
+
     async def save_decision(
         self,
         article: Article,
@@ -230,6 +234,15 @@ class TursoStorage:
         )
         settled_ids = {row[0] for row in result.rows}
         return [aid for aid in article_ids if aid not in settled_ids]
+
+    async def existing_ids(self, article_ids: list[str]) -> set[str]:
+        if not article_ids:
+            return set()
+        placeholders = ", ".join("?" * len(article_ids))
+        result = await self._get_client().execute(
+            f"SELECT id FROM posts WHERE id IN ({placeholders})", article_ids
+        )
+        return {row[0] for row in result.rows}
 
     async def save_decision(
         self,
@@ -381,6 +394,9 @@ class InMemoryStorage:
 
     async def filter_new_ids(self, article_ids: list[str]) -> list[str]:
         return [aid for aid in article_ids if not self._is_settled(aid)]
+
+    async def existing_ids(self, article_ids: list[str]) -> set[str]:
+        return {aid for aid in article_ids if aid in self._records}
 
     def _is_settled(self, article_id: str) -> bool:
         record = self._records.get(article_id)

@@ -298,7 +298,7 @@ class Pipeline:
         # Per-source new-article counts for the admin run report
         stats.source_new = dict(Counter(a.source_name for a in new_articles))
         log.info("filter_complete", new=stats.new_articles, seen=seen_count)
-        self._check_source_windows(stats, source_pairs, log)
+        await self._check_source_windows(stats, source_pairs, new_articles, log)
 
         if not new_articles:
             log.info("no_new_articles")
@@ -414,21 +414,34 @@ class Pipeline:
             "Ймовірно змінилась верстка сайту або він недоступний — перевірте парсер."
         )
 
-    @staticmethod
-    def _check_source_windows(
+    async def _check_source_windows(
+        self,
         stats: PipelineStats,
         source_pairs: list[tuple[ScraperSource, SourceConfig]],
+        new_articles: list[Article],
         log: structlog.stdlib.BoundLogger,
     ) -> None:
-        """Flag Sources that returned their full window, every Article in it new.
+        """Flag Sources that returned their full window, none of it already in storage.
 
         A listing page shows only its newest ``max_articles`` Articles; if more than
-        that appeared since the last Run, the older ones were never seen.
+        that appeared since the last Run, the older ones were never seen. An Error
+        Article being retried counts as new but proves the window overlapped a Run,
+        so storage is asked once, and only when some window looks all new.
         """
-        for source, src in source_pairs:
-            scraped = stats.source_scraped.get(source.name, 0)
-            if scraped == src.max_articles and stats.source_new.get(source.name, 0) == scraped:
-                stats.source_window_full[source.name] = src.max_articles
+        candidates = {
+            source.name: src.max_articles
+            for source, src in source_pairs
+            if stats.source_scraped.get(source.name, 0) == src.max_articles
+            and stats.source_new.get(source.name, 0) == src.max_articles
+        }
+        if not candidates:
+            return
+        window_ids = [a.id for a in new_articles if a.source_name in candidates]
+        stored = await self.storage.existing_ids(window_ids)
+        seen_sources = {a.source_name for a in new_articles if a.id in stored}
+        stats.source_window_full = {
+            name: size for name, size in candidates.items() if name not in seen_sources
+        }
         if stats.source_window_full:
             log.warning("source_window_full", sources=stats.source_window_full)
 

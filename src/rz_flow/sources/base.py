@@ -1,7 +1,8 @@
 """Base protocol for all scraper sources.
 
 Each source is responsible for fetching and parsing articles from one URL.
-The protocol is intentionally thin: a name for logging and a fetch() method.
+The protocol is intentionally thin: a name for logging, a fetch() method, and
+slug() to tell whether two of its Articles are about the same Story.
 
 To add a new source:
   1. Create src/rz_flow/sources/<site>.py implementing ScraperSource.

@@ -781,3 +781,21 @@ class TestRecentJudgedArticlesContract:
         assert {r.id for r in rows} == {"W_AT_BOUNDARY", "W_INSIDE"}
         # Oldest first, so the earliest Article about a Story is its original
         assert [r.id for r in rows] == ["W_AT_BOUNDARY", "W_INSIDE"]
+
+
+class TestExistingIdsContract:
+    async def test_returns_ids_with_any_record_including_retryable_errors(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.save_decision(_make_article("E_POSTED"), Decision.POSTED)
+        await any_storage.save_decision(_make_article("E_ERROR"), Decision.ERROR)
+        await any_storage.mark_publishing(_make_article("E_PUBLISHING"))
+
+        found = await any_storage.existing_ids(["E_POSTED", "E_ERROR", "E_PUBLISHING", "E_NEW"])
+
+        assert found == {"E_POSTED", "E_ERROR", "E_PUBLISHING"}
+
+    async def test_empty_input_returns_nothing(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        assert await any_storage.existing_ids([]) == set()

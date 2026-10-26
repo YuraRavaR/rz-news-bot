@@ -17,6 +17,7 @@ from rz_flow.telegram import (
     TelegramDeliveryUnknownError,
     TelegramPublisher,
     TelegramRateLimitedError,
+    TelegramRejectedError,
     TelegramUnreachableError,
     _build_message,
     _html_escape,
@@ -643,22 +644,20 @@ class TestTelegramPublisher:
 
         assert route.call_count == 1
 
-    @patch("rz_flow.telegram.asyncio.sleep", new_callable=AsyncMock)
     @respx.mock
-    async def test_publish_logs_and_raises_on_json_error_response(
-        self, _mock_sleep: AsyncMock
-    ) -> None:
-        """Non-success response with JSON body: error is logged and HTTPStatusError raised."""
-        respx.post(_tg_url("sendMessage")).mock(
+    async def test_4xx_is_rejected_at_once_with_telegram_description(self) -> None:
+        """A 4xx other than 429 cannot succeed on retry: one request, then raise."""
+        route = respx.post(_tg_url("sendMessage")).mock(
             return_value=Response(
                 400,
-                json={"ok": False, "description": "Bad Request: chat not found"},
+                json={"ok": False, "description": "Bad Request: can't parse entities"},
             )
         )
 
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(TelegramRejectedError, match="can't parse entities"):
             await publisher.publish(_make_article(), _make_decision())
+        assert route.call_count == 1
 
     @respx.mock
     async def test_send_alert_swallows_network_exception(self) -> None:

@@ -358,3 +358,43 @@ class TestDefinitelyNotDeliveredIsDeferred:
         assert record is not None
         assert record.decision == Decision.ERROR
         assert record.error_attempts == 1
+
+
+class TestRejectedPostBecomesError:
+    async def test_400_sends_once_and_records_error(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        bot_api.failing[_MAIN] = 400
+
+        stats = await _run(storage, [_article("BAD_1")], _event_decision(is_event=False))
+
+        assert bot_api.posts == [_MAIN]
+        assert stats.errors == 1
+        assert stats.stop_signal is StopSignal.CONTINUE
+        record = storage.get_record("BAD_1")
+        assert record is not None
+        assert record.decision == Decision.ERROR
+        assert record.error_attempts == 1
+        assert "TelegramRejectedError" in (stats.article_log[0].error_msg or "")
+
+    async def test_attempts_continue_from_before_the_run_until_settled(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        article = _article("BAD_2")
+        await storage.save_decision(article, Decision.ERROR)
+        bot_api.failing[_MAIN] = 400
+
+        await _run(storage, [article], _event_decision(is_event=False))
+
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.error_attempts == 2
+        assert await storage.filter_new_ids([article.id]) == [article.id]
+
+        await _run(storage, [article], _event_decision(is_event=False))
+
+        record = storage.get_record(article.id)
+        assert record is not None
+        assert record.error_attempts == 3
+        # Default budget is 3 attempts: the Article is now Settled.
+        assert await storage.filter_new_ids([article.id]) == []

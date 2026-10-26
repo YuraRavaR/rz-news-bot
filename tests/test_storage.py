@@ -611,3 +611,14 @@ class TestPublishingContract:
 
         assert await _outcome(any_storage, article.id) == (Decision.ERROR, 2)
         assert await any_storage.filter_new_ids([article.id]) == [article.id]
+
+    async def test_error_over_publishing_increments_preserved_attempts(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("ERR_OVER_PUB_1234")
+        await any_storage.save_decision(article, Decision.ERROR)
+        await any_storage.mark_publishing(article)
+
+        await any_storage.save_decision(article, Decision.ERROR, _make_ai_decision())
+
+        assert await _outcome(any_storage, article.id) == (Decision.ERROR, 2)

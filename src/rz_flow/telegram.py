@@ -12,6 +12,7 @@ Handles:
       - 429: wait once for Telegram's retry_after (≤ 60 s), retry once
       - connection could not be set up: a few retries with exponential backoff
       - timeout after sending, or 5xx: delivery unknown, never retried
+      - any other 4xx: rejected, never retried (the Article becomes an Error)
 """
 
 import asyncio
@@ -108,6 +109,13 @@ def _retry_after_seconds(response: httpx.Response) -> float:
         return float(response.headers["Retry-After"])
     except (KeyError, ValueError):
         return _DEFAULT_RATE_LIMIT_WAIT_S
+
+
+class TelegramRejectedError(Exception):
+    """Telegram refused the Post as invalid (a 4xx other than 429).
+
+    Retrying cannot help, so it is raised at once and the Article becomes an Error.
+    """
 
 
 class TelegramDeliveryUnknownError(Exception):
@@ -538,7 +546,7 @@ class TelegramPublisher:
                 after waiting once (Deferred).
             TelegramUnreachableError: no connection after a few attempts (Deferred).
             TelegramDeliveryUnknownError: the Post may have gone out; never retried.
-            httpx.HTTPStatusError: any other failure.
+            TelegramRejectedError: any other 4xx; never retried.
         """
         try:
             return await self._publish_reaching_telegram(article, decision)
@@ -568,7 +576,7 @@ class TelegramPublisher:
         Used directly for the events channel, whose Post is never retried.
         Raises TelegramRateLimitedError on a 429, TelegramUnreachableError when no
         request was sent, TelegramDeliveryUnknownError when the Post may have gone
-        out, and httpx.HTTPStatusError on any other failure.
+        out, and TelegramRejectedError on any other 4xx.
         """
         text = _build_message(
             article,
@@ -624,7 +632,7 @@ class TelegramPublisher:
                     raise TelegramDeliveryUnknownError(
                         f"HTTP {response.status_code}: {tg_error}"
                     )
-                response.raise_for_status()
+                raise TelegramRejectedError(f"HTTP {response.status_code}: {tg_error}")
 
         data = response.json()
         message_id: int = data["result"]["message_id"]

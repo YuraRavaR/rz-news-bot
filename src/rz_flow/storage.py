@@ -10,7 +10,6 @@ is as simple as writing a new class that implements StorageProtocol.
 
 from __future__ import annotations
 
-import contextlib
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
@@ -43,16 +42,16 @@ _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_posts_seen_at ON posts(seen_at DESC);
 """
 
-# Schema migrations — ALTER TABLE statements.
-# SQLite does not support "ADD COLUMN IF NOT EXISTS", so errors are silently suppressed:
-# a "duplicate column name" error means the column already exists and we can move on.
-_SCHEMA_MIGRATIONS = [
-    "ALTER TABLE posts ADD COLUMN ua_title TEXT",
-    "ALTER TABLE posts ADD COLUMN ua_summary TEXT",
-    "ALTER TABLE posts ADD COLUMN category_tag TEXT",
-    "ALTER TABLE posts ADD COLUMN is_event INTEGER",
-    "ALTER TABLE posts ADD COLUMN tg_events_message_id INTEGER",
-    "ALTER TABLE posts ADD COLUMN error_attempts INTEGER NOT NULL DEFAULT 0",
+# Schema migrations: columns added after the first release, as (name, definition).
+# At init the current columns are read with PRAGMA table_info and only the missing
+# ones are added. No error is suppressed: a failing ALTER TABLE stops the Run.
+_COLUMN_MIGRATIONS: list[tuple[str, str]] = [
+    ("ua_title", "TEXT"),
+    ("ua_summary", "TEXT"),
+    ("category_tag", "TEXT"),
+    ("is_event", "INTEGER"),
+    ("tg_events_message_id", "INTEGER"),
+    ("error_attempts", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Data migrations — one-time UPDATE statements that backfill existing rows.
@@ -175,10 +174,12 @@ class TursoStorage:
         await self._migrate(client)
 
     async def _migrate(self, client: libsql_client.Client) -> None:
-        """Apply schema and data migrations for existing databases."""
-        for sql in _SCHEMA_MIGRATIONS:
-            with contextlib.suppress(Exception):  # column already exists — ignore
-                await client.execute(sql)
+        """Add missing columns, then apply data migrations, for existing databases."""
+        result = await client.execute("PRAGMA table_info(posts)")
+        existing = {row[1] for row in result.rows}
+        for name, definition in _COLUMN_MIGRATIONS:
+            if name not in existing:
+                await client.execute(f"ALTER TABLE posts ADD COLUMN {name} {definition}")
         for sql in _DATA_MIGRATIONS:
             await client.execute(sql)  # must succeed — no suppression
 

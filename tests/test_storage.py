@@ -12,8 +12,24 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from rz_flow import storage as storage_module
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.storage import InMemoryStorage, TursoStorage, create_storage
+
+# The original May 2026 schema, before ua_*/is_event/error_attempts existed.
+_LEGACY_POSTS_TABLE = """
+CREATE TABLE posts (
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL,
+    category      TEXT NOT NULL,
+    title_pl      TEXT NOT NULL,
+    seen_at       TEXT NOT NULL,
+    decision      TEXT NOT NULL,
+    ai_score      REAL,
+    ai_reason     TEXT,
+    tg_message_id INTEGER
+)
+"""
 
 
 def _make_article(article_id: str = "TESTID123456789") -> Article:
@@ -398,23 +414,7 @@ class TestTursoStorageMigrations:
     async def test_adds_columns_to_legacy_table(self, tmp_path: pathlib.Path) -> None:
         db_path = f"file:{tmp_path / 'legacy.db'}"
         storage = TursoStorage(database_url=db_path, auth_token="")
-        client = storage._get_client()
-        # The original May 2026 schema, before ua_*/is_event/error_attempts existed.
-        await client.execute(
-            """
-            CREATE TABLE posts (
-                id            TEXT PRIMARY KEY,
-                url           TEXT NOT NULL,
-                category      TEXT NOT NULL,
-                title_pl      TEXT NOT NULL,
-                seen_at       TEXT NOT NULL,
-                decision      TEXT NOT NULL,
-                ai_score      REAL,
-                ai_reason     TEXT,
-                tg_message_id INTEGER
-            )
-            """
-        )
+        await storage._get_client().execute(_LEGACY_POSTS_TABLE)
 
         await storage.init()
 
@@ -425,6 +425,87 @@ class TestTursoStorageMigrations:
         row = await _fetch_row(storage, "MIGRATED_12345678")
         assert row["ua_title"] is not None
         assert row["error_attempts"] == 0
+        await storage.close()
+
+    async def test_legacy_rows_survive_the_upgrade(self, tmp_path: pathlib.Path) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'legacy.db'}", auth_token="")
+        client = storage._get_client()
+        await client.execute(_LEGACY_POSTS_TABLE)
+        await client.execute(
+            "INSERT INTO posts (id, url, category, title_pl, seen_at, decision) "
+            "VALUES ('rz24/OLD', 'https://rzeszow24.info/x/OLD', 'wiadomosci', 'Stary', "
+            "'2026-05-01T00:00:00+00:00', 'posted')"
+        )
+
+        await storage.init()
+
+        row = await _fetch_row(storage, "rz24/OLD")
+        assert row["title_pl"] == "Stary"
+        assert row["decision"] == "posted"
+        assert row["error_attempts"] == 0
+        assert await storage.filter_new_ids(["rz24/OLD"]) == []
+        await storage.close()
+
+    async def test_second_init_runs_no_alter_table(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'current.db'}", auth_token="")
+        await storage.init()
+        client = storage._get_client()
+        executed: list[str] = []
+        real_execute = client.execute
+
+        async def _spy(sql: str, *args: object) -> object:
+            executed.append(sql)
+            return await real_execute(sql, *args)
+
+        monkeypatch.setattr(client, "execute", _spy)
+
+        await storage.init()
+
+        assert not [sql for sql in executed if "ALTER TABLE" in sql.upper()]
+        await storage.close()
+
+    async def test_a_failing_migration_raises(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'broken.db'}", auth_token="")
+        await storage.init()
+        # SQLite never lets ALTER TABLE add a PRIMARY KEY column.
+        monkeypatch.setattr(
+            storage_module,
+            "_COLUMN_MIGRATIONS",
+            [*storage_module._COLUMN_MIGRATIONS, ("broken", "INTEGER PRIMARY KEY")],
+        )
+
+        with pytest.raises(Exception, match="PRIMARY KEY"):
+            await storage.init()
+        await storage.close()
+
+    async def test_fresh_database_gets_the_full_schema(self, tmp_path: pathlib.Path) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'fresh.db'}", auth_token="")
+        await storage.init()
+
+        result = await storage._get_client().execute("PRAGMA table_info(posts)")
+        columns = {row[1] for row in result.rows}
+
+        assert columns == {
+            "id",
+            "url",
+            "category",
+            "title_pl",
+            "seen_at",
+            "decision",
+            "ai_score",
+            "ai_reason",
+            "is_event",
+            "tg_message_id",
+            "tg_events_message_id",
+            "ua_title",
+            "ua_summary",
+            "category_tag",
+            "error_attempts",
+        }
         await storage.close()
 
     async def test_backfills_source_prefix_on_legacy_ids(self, tmp_path: pathlib.Path) -> None:

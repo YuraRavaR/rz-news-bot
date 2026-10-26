@@ -7,6 +7,7 @@ import pytest
 
 from rz_flow.flow_config import (
     FlowConfig,
+    PipelineConfig,
     SourceConfig,
     load_flow_config,
 )
@@ -25,6 +26,43 @@ def test_repo_root_config_yaml_loads() -> None:
     config = load_flow_config(str(cfg_path))
     assert len(config.sources) >= 1
     assert config.pipeline.max_posts_per_run >= 1
+    assert config.pipeline.gemini_model
+
+
+def _write_config(tmp_path: pathlib.Path, pipeline_yaml: str) -> str:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "sources:\n"
+        "  - scraper: NajnowszeScraper\n"
+        "    base_url: https://rzeszow24.info/najnowsze\n" + pipeline_yaml,
+        encoding="utf-8",
+    )
+    return str(cfg_file)
+
+
+def test_gemini_model_is_read_from_config(tmp_path: pathlib.Path) -> None:
+    path = _write_config(tmp_path, "pipeline:\n  gemini_model: gemini-test-model\n")
+
+    assert load_flow_config(path).pipeline.gemini_model == "gemini-test-model"
+
+
+@pytest.mark.parametrize(
+    "pipeline_yaml",
+    [
+        "",
+        "pipeline:\n  max_posts_per_run: 3\n",
+        "pipeline:\n  gemini_model: ''\n",
+        "pipeline:\n  gemini_model: '   '\n",
+    ],
+    ids=["no_pipeline_section", "model_missing", "model_empty", "model_blank"],
+)
+def test_config_without_a_gemini_model_fails_to_load(
+    tmp_path: pathlib.Path, pipeline_yaml: str
+) -> None:
+    path = _write_config(tmp_path, pipeline_yaml)
+
+    with pytest.raises(ValueError, match="gemini_model"):
+        load_flow_config(path)
 
 
 def test_load_flow_config_reads_yaml(tmp_path) -> None:
@@ -38,6 +76,7 @@ def test_load_flow_config_reads_yaml(tmp_path) -> None:
             max_articles: 7
             enabled: true
         pipeline:
+          gemini_model: gemini-test-model
           inter_ai_delay_seconds: 3.0
           inter_post_delay_seconds: 1.5
         """)
@@ -60,6 +99,8 @@ def test_load_flow_config_uses_env_var(tmp_path, monkeypatch) -> None:
           - scraper: RzeszowNewsScraper
             base_url: https://rzeszow-news.pl/
             max_articles: 10
+        pipeline:
+          gemini_model: gemini-test-model
         """)
     )
     monkeypatch.setenv("FLOW_CONFIG_PATH", str(cfg_file))
@@ -74,13 +115,15 @@ def test_load_flow_config_missing_file_raises(tmp_path) -> None:
 
 
 def test_load_flow_config_pipeline_defaults(tmp_path) -> None:
-    """pipeline section is optional; defaults are applied when omitted."""
+    """Every pipeline option except the model has a default."""
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text(
         textwrap.dedent("""\
         sources:
           - scraper: NajnowszeScraper
             base_url: https://rzeszow24.info/najnowsze
+        pipeline:
+          gemini_model: gemini-test-model
         """)
     )
     config = load_flow_config(str(cfg_file))
@@ -97,6 +140,7 @@ def test_pipeline_report_display_timezone_accepts_valid_iana(tmp_path) -> None:
           - scraper: NajnowszeScraper
             base_url: https://rzeszow24.info/najnowsze
         pipeline:
+          gemini_model: gemini-test-model
           report_display_timezone: Europe/Warsaw
         """)
     )
@@ -112,6 +156,7 @@ def test_pipeline_report_display_timezone_rejects_invalid(tmp_path) -> None:
           - scraper: NajnowszeScraper
             base_url: https://rzeszow24.info/najnowsze
         pipeline:
+          gemini_model: gemini-test-model
           report_display_timezone: Not/AZone
         """)
     )
@@ -135,7 +180,8 @@ def test_enabled_sources_filters_disabled() -> None:
         sources=[
             SourceConfig(scraper="NajnowszeScraper", base_url="https://a.com", enabled=True),
             SourceConfig(scraper="RzeszowNewsScraper", base_url="https://b.com", enabled=False),
-        ]
+        ],
+        pipeline=PipelineConfig(gemini_model="gemini-test-model"),
     )
     assert len(config.enabled_sources) == 1
     assert config.enabled_sources[0].scraper == "NajnowszeScraper"
@@ -149,7 +195,8 @@ def test_get_active_sources_returns_correct_instances() -> None:
         sources=[
             SourceConfig(scraper="NajnowszeScraper", base_url="https://rzeszow24.info/najnowsze"),
             SourceConfig(scraper="RzeszowNewsScraper", base_url="https://rzeszow-news.pl/"),
-        ]
+        ],
+        pipeline=PipelineConfig(gemini_model="gemini-test-model"),
     )
     sources = get_active_sources(config)
     assert len(sources) == 2
@@ -162,7 +209,8 @@ def test_get_active_sources_uses_base_url() -> None:
     config = FlowConfig(
         sources=[
             SourceConfig(scraper="NajnowszeScraper", base_url="https://custom.example.com/feed"),
-        ]
+        ],
+        pipeline=PipelineConfig(gemini_model="gemini-test-model"),
     )
     sources = get_active_sources(config)
     assert sources[0].url == "https://custom.example.com/feed"
@@ -172,7 +220,8 @@ def test_get_active_sources_unknown_scraper_raises() -> None:
     config = FlowConfig(
         sources=[
             SourceConfig(scraper="NonExistentScraper", base_url="https://example.com"),
-        ]
+        ],
+        pipeline=PipelineConfig(gemini_model="gemini-test-model"),
     )
     with pytest.raises(ValueError, match="NonExistentScraper"):
         get_active_sources(config)

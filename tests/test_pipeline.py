@@ -79,6 +79,7 @@ def _make_flow_config(max_posts_per_run: int = 10) -> FlowConfig:
             )
         ],
         pipeline=PipelineConfig(
+            gemini_model="gemini-test-model",
             max_posts_per_run=max_posts_per_run,
             # Zero delays so tests run at full speed (production uses 5s/2s for rate limiting)
             inter_ai_delay_seconds=0.0,
@@ -942,7 +943,11 @@ class TestSourceHealthAlerts:
                         max_articles=5,
                     ),
                 ],
-                pipeline=PipelineConfig(inter_ai_delay_seconds=0.0, inter_post_delay_seconds=0.0),
+                pipeline=PipelineConfig(
+                    gemini_model="gemini-test-model",
+                    inter_ai_delay_seconds=0.0,
+                    inter_post_delay_seconds=0.0,
+                ),
             ),
         )
         stats = await pipeline.run()

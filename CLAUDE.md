@@ -57,7 +57,7 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 ### Configuration split
 
 - `config.py` (`Settings`, pydantic-settings): secrets and env vars (`AI_MIN_SCORE`, `SCRAPER_TIMEOUT`, `APP_ENV`, …).
-- `flow_config.py`: loads `config.yaml`, which defines the sources list (scraper class name, URL, `max_articles`, `enabled`) and pipeline pacing and caps. The same committed file is used in CI.
+- `flow_config.py`: loads `config.yaml`, which defines the sources list (scraper class name, URL, `max_articles`, `enabled`), the Gemini model (`pipeline.gemini_model`, required; there is no env override) and pipeline pacing and caps. The same committed file is used in CI.
 
 ### Adding a news source
 

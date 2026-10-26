@@ -25,7 +25,6 @@ def _make_settings(**overrides: object) -> Settings:
         "telegram_events_channel_id": None,
         "telegram_staging_events_channel_id": None,
         # Optional fields — set explicitly to avoid .env overriding them
-        "gemini_model": "gemini-3.5-flash-lite",
         "ai_min_score": 7.0,
         "app_env": "production",
     }
@@ -51,14 +50,22 @@ class TestSettingsDefaults:
         s = _make_settings()
         assert s.app_env == "production"
 
-    def test_gemini_model_can_be_overridden(self) -> None:
-        s = _make_settings(gemini_model="gemini-test-model")
-        assert s.gemini_model == "gemini-test-model"
+    def test_gemini_model_env_has_no_effect(self, tmp_path, monkeypatch) -> None:
+        """The model lives in config.yaml; a leftover env var or .env line is ignored."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("GEMINI_MODEL=gemini-from-dotenv\n", encoding="utf-8")
+        monkeypatch.setenv("GEMINI_MODEL", "gemini-from-env")
 
-    def test_gemini_model_field_default_in_schema(self) -> None:
-        """The schema-level default is gemini-3.5-flash-lite (can be overridden by env)."""
-        field_info = Settings.model_fields["gemini_model"]
-        assert field_info.default == "gemini-3.5-flash-lite"
+        s = Settings(
+            _env_file=env_file,  # type: ignore[call-arg]
+            telegram_bot_token="fake:token",
+            telegram_channel_id="-100123",
+            gemini_api_key="fake-key",
+            turso_database_url="libsql://fake.turso.io",
+            turso_auth_token="fake-token",
+        )
+
+        assert "gemini_model" not in s.model_dump()
 
     def test_default_ai_min_score(self) -> None:
         """ai_min_score defaults to 7.0 when not overridden."""

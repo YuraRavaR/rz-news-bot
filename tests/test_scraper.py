@@ -46,7 +46,7 @@ def _make_flow_config(max_articles: int = 10) -> FlowConfig:
                 max_articles=max_articles,
             ),
         ],
-        pipeline=PipelineConfig(),
+        pipeline=PipelineConfig(gemini_model="gemini-test-model"),
     )
 
 

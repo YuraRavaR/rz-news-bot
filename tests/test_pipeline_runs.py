@@ -55,6 +55,7 @@ def _flow_config() -> FlowConfig:
             )
         ],
         pipeline=PipelineConfig(
+            gemini_model="gemini-test-model",
             max_posts_per_run=10,
             inter_ai_delay_seconds=0.0,
             inter_post_delay_seconds=0.0,
@@ -445,3 +446,23 @@ class TestStorageFailuresNeverDuplicate:
         assert record is not None
         assert record.decision == Decision.UNCONFIRMED
         assert len([a for a in run2.alerts if article.url in a]) == 1
+
+
+class TestGeminiModelFromConfig:
+    async def test_evaluation_and_run_report_use_the_configured_model(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GEMINI_MODEL", "gemini-from-env")
+        with (
+            patch("rz_flow.pipeline.fetch_articles", new_callable=AsyncMock) as fetch,
+            patch("rz_flow.pipeline.GeminiAIFilter") as ai_cls,
+        ):
+            fetch.return_value = ([_article("MODEL_1")], {"rzeszow24/najnowsze": 1})
+            ai_cls.return_value.evaluate = AsyncMock(return_value=_event_decision())
+            pipeline = Pipeline(settings=_settings(), storage=storage, flow_config=_flow_config())
+            stats = await pipeline.run()
+
+        assert ai_cls.call_args.kwargs["model"] == "gemini-test-model"
+        report = _build_run_report(stats, dry_run=False)
+        assert "gemini-test-model" in report
+        assert "gemini-from-env" not in report

@@ -11,6 +11,9 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        # Unknown keys are ignored, so a leftover GEMINI_MODEL line in a local .env
+        # (the model now lives in config.yaml) neither fails nor overrides anything.
+        extra="ignore",
     )
 
     # ── Telegram ──────────────────────────────────────────────────────────────
@@ -39,7 +42,6 @@ class Settings(BaseSettings):
 
     # ── Gemini AI ─────────────────────────────────────────────────────────────
     gemini_api_key: str = Field(..., description="Google AI Studio API key")
-    gemini_model: str = Field(default="gemini-3.5-flash-lite", description="Gemini model name")
 
     # ── Turso (libsql) ────────────────────────────────────────────────────────
     turso_database_url: str = Field(..., description="libsql:// URL from turso db show")

@@ -178,7 +178,7 @@ class Pipeline:
     def __post_init__(self) -> None:
         self.ai_filter = GeminiAIFilter(
             api_key=self.settings.gemini_api_key,
-            model=self.settings.gemini_model,
+            model=self.flow_config.pipeline.gemini_model,
             min_score=self.settings.ai_min_score,
         )
         publish_id = self.settings.publish_telegram_chat_id(staging=self.use_staging_channel)
@@ -211,7 +211,7 @@ class Pipeline:
                 staging Turso for ``filter_new_ids`` reads only.
         """
         stats = PipelineStats(dry_run=dry_run)
-        stats.report_gemini_model = self.settings.gemini_model
+        stats.report_gemini_model = self.flow_config.pipeline.gemini_model
         stats.report_ai_min_score = self.settings.ai_min_score
         _start = time.monotonic()
 
@@ -232,7 +232,7 @@ class Pipeline:
                 {"name": s.name, "base_url": src.base_url, "max_articles": src.max_articles}
                 for s, src in source_pairs
             ],
-            model=self.settings.gemini_model,
+            model=self.flow_config.pipeline.gemini_model,
             min_score=self.settings.ai_min_score,
         )
         # Before scraping, so a Publishing Article is resolved even after it has

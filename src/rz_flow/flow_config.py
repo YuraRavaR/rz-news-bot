@@ -2,8 +2,8 @@
 
 Loads config.yaml (or the path in FLOW_CONFIG_PATH env var) and validates it
 with Pydantic.  Contains source definitions (which scrapers run, with which
-URLs and per-source article limits), pipeline timing, and optional report clock
-timezone.
+URLs and per-source article limits), the Gemini model, pipeline timing, and
+optional report clock timezone.
 """
 
 from __future__ import annotations
@@ -37,8 +37,14 @@ class SourceConfig(BaseModel):
 
 
 class PipelineConfig(BaseModel):
-    """Timing and admin-report display settings for the processing pipeline."""
+    """Model, pacing, caps and admin-report display settings for the pipeline."""
 
+    gemini_model: str = Field(
+        description=(
+            "Gemini model used for every evaluation. It decides the daily free-tier "
+            "quota (ADR 0002), so it is committed here rather than set per environment."
+        ),
+    )
     inter_ai_delay_seconds: float = 5.0
     inter_post_delay_seconds: float = 2.0
     max_posts_per_run: int = 5
@@ -57,6 +63,14 @@ class PipelineConfig(BaseModel):
             "Omit or null for UTC."
         ),
     )
+
+    @field_validator("gemini_model")
+    @classmethod
+    def _non_empty_model(cls, v: str) -> str:
+        name = v.strip()
+        if not name:
+            raise ValueError("gemini_model must name a Gemini model")
+        return name
 
     @field_validator("report_display_timezone")
     @classmethod
@@ -77,7 +91,9 @@ class FlowConfig(BaseModel):
     """Top-level flow configuration loaded from config.yaml."""
 
     sources: list[SourceConfig]
-    pipeline: PipelineConfig = PipelineConfig()
+    # Validated even when the section is missing, so the error names the required
+    # pipeline.gemini_model instead of just the absent section.
+    pipeline: PipelineConfig = Field(default_factory=dict, validate_default=True)
 
     @property
     def enabled_sources(self) -> list[SourceConfig]:

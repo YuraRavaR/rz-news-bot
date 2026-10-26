@@ -32,6 +32,13 @@ on:
           - "false"
           - "true"
 
+# Two production Runs must never overlap: both would see the same new Articles
+# and post them twice. Scheduled Runs have no inputs, so the staging input is
+# normalised to prod/staging to put them in the same group as manual prod Runs.
+concurrency:
+  group: publish-${{ github.event.inputs.staging == 'true' && 'staging' || 'prod' }}
+  cancel-in-progress: false
+
 jobs:
   # ── Publish (runs on cron and manual dispatch) ───────────────────────────
   publish:

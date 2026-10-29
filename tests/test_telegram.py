@@ -14,6 +14,7 @@ import httpx
 import pytest
 import respx
 from httpx import Response
+from structlog.testing import capture_logs
 
 from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
 from rz_flow.telegram import (
@@ -891,3 +892,81 @@ class TestSendRunReportRespx:
         )
         publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100channel")
         await publisher.send_alert("oops")
+
+
+_ADMIN_SEND_FAILURES = [
+    pytest.param(Response(500, text="Error"), id="non-2xx"),
+    pytest.param(Response(200, json={"ok": False, "description": "chat not found"}), id="ok-false"),
+    pytest.param(httpx.ConnectError("Connection refused"), id="connect-error"),
+    pytest.param(httpx.ReadTimeout("timed out"), id="read-timeout"),
+]
+
+
+def _mock_send_failure(failure: Response | Exception) -> None:
+    if isinstance(failure, Response):
+        respx.post(_tg_url("sendMessage")).mock(return_value=failure)
+    else:
+        respx.post(_tg_url("sendMessage")).mock(side_effect=failure)
+
+
+class TestAdminSendFailuresAreLogged:
+    """Alerts and run reports never raise, but every failed send leaves a log line."""
+
+    @respx.mock
+    @pytest.mark.parametrize("failure", _ADMIN_SEND_FAILURES)
+    async def test_alert_logs_failure(self, failure: Response | Exception) -> None:
+        _mock_send_failure(failure)
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100channel")
+
+        with capture_logs() as logs:
+            await publisher.send_alert("oops")
+
+        events = [entry["event"] for entry in logs]
+        assert "alert_send_failed" in events
+        assert "admin_alert_sent" not in events
+
+    @respx.mock
+    @pytest.mark.parametrize("failure", _ADMIN_SEND_FAILURES)
+    async def test_run_report_logs_failure(self, failure: Response | Exception) -> None:
+        from rz_flow.pipeline import PipelineStats
+
+        _mock_send_failure(failure)
+        publisher = TelegramPublisher(
+            bot_token="fake-token", channel_id="-100channel", admin_chat_id="777admin"
+        )
+
+        with capture_logs() as logs:
+            await publisher.send_run_report(PipelineStats())
+
+        events = [entry["event"] for entry in logs]
+        assert "run_report_send_failed" in events
+        assert "run_report_sent" not in events
+
+    @respx.mock
+    async def test_alert_logs_telegram_description(self) -> None:
+        respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(
+                403, json={"ok": False, "description": "Forbidden: bot was blocked"}
+            )
+        )
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100channel")
+
+        with capture_logs() as logs:
+            await publisher.send_alert("oops")
+
+        descriptions = [entry.get("tg_description") for entry in logs]
+        assert "Forbidden: bot was blocked" in descriptions
+
+
+class TestPostOkFalse:
+    """Telegram can answer 2xx with ``ok: false``: the Post was not sent."""
+
+    @respx.mock
+    async def test_2xx_with_ok_false_is_rejected_with_telegram_description(self) -> None:
+        respx.post(_tg_url("sendMessage")).mock(
+            return_value=Response(200, json={"ok": False, "description": "chat not found"})
+        )
+        publisher = TelegramPublisher(bot_token="fake-token", channel_id="-100123")
+
+        with pytest.raises(TelegramRejectedError, match="chat not found"):
+            await publisher.publish_once(_make_article(), _make_decision())

@@ -4,10 +4,17 @@ These models act as the contracts between pipeline stages.
 They are intentionally simple for MVP — extend via subclassing, not editing.
 """
 
-from datetime import UTC, datetime
+import re
+from datetime import UTC, date, datetime
 from enum import StrEnum
+from typing import Self
 
-from pydantic import BaseModel, Field
+import structlog
+from pydantic import BaseModel, Field, model_validator
+
+logger = structlog.get_logger(__name__)
+
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 class Category(StrEnum):
@@ -54,6 +61,62 @@ class AIDecision(BaseModel):
     ua_title: str = Field(..., description="Ukrainian translation of the title")
     ua_summary: str = Field(..., description="2–3 sentence Ukrainian summary")
     reason: str = Field(..., description="Short explanation for the decision (used in logs)")
+    # The Event date: first and last day of an event; a single-day event has no end.
+    # A bad date from the AI becomes "no date" and never makes the Article an Error.
+    event_start: date | None = None
+    event_end: date | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _parse_event_dates(cls, data: object) -> object:
+        """Both dates or neither: one bad value makes the whole Event date unknown."""
+        if not isinstance(data, dict):
+            return data
+        raw = {name: data.get(name) for name in ("event_start", "event_end")}
+        parsed = {name: _parse_iso_date(value) for name, value in raw.items()}
+        if any(value is not None and parsed[name] is None for name, value in raw.items()):
+            logger.warning(
+                "event_date_dropped",
+                reason="unparseable",
+                **{name: repr(value) for name, value in raw.items()},
+            )
+            parsed = {"event_start": None, "event_end": None}
+        return {**data, **parsed}
+
+    @model_validator(mode="after")
+    def _check_event_dates(self) -> Self:
+        if self.event_start is None and self.event_end is None:
+            return self
+        reason = None
+        if not self.is_event:
+            reason = "not_an_event"
+        elif self.event_start is None:
+            reason = "end_without_start"
+        elif self.event_end is not None and self.event_end < self.event_start:
+            reason = "end_before_start"
+        if reason is not None:
+            logger.warning(
+                "event_date_dropped",
+                reason=reason,
+                event_start=str(self.event_start),
+                event_end=str(self.event_end),
+            )
+            self.event_start = self.event_end = None
+        elif self.event_end == self.event_start:
+            self.event_end = None
+        return self
+
+
+def _parse_iso_date(value: object) -> date | None:
+    """A ``YYYY-MM-DD`` string (or a date) as a date; None for anything else."""
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and _ISO_DATE.fullmatch(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 class Decision(StrEnum):
@@ -108,6 +171,8 @@ class PostRecord(BaseModel):
         default=None,
         description="For a Repeat, the ID of the original Article",
     )
+    event_start: date | None = None
+    event_end: date | None = None
 
 
 class UnconfirmedArticle(BaseModel):

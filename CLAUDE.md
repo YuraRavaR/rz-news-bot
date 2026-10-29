@@ -68,7 +68,7 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 
 ### Gemini (`ai.py`)
 
-Uses the response schema to get structured output (score 0–10, `ua_title`, `ua_summary`, `is_event`, `category_tag`). Errors are sorted into transient (exponential backoff), per-minute 429 (waits for Gemini's own `retryDelay`), daily quota (raised and stops the run) and truncated output. Publishing requires `is_interesting` and `score >= AI_MIN_SCORE`.
+Uses the response schema to get structured output (score 0–10, `ua_title`, `ua_summary`, `is_event`, `category_tag`, and the Event date as nullable `event_start`/`event_end`). The user prompt carries the Run date in Europe/Warsaw so relative dates resolve; `AIDecision` turns a bad Event date into none instead of failing. Errors are sorted into transient (exponential backoff), per-minute 429 (waits for Gemini's own `retryDelay`), daily quota (raised and stops the run) and truncated output. Publishing requires `is_interesting` and `score >= AI_MIN_SCORE`.
 
 ### Telegram (`telegram.py`)
 

@@ -7,18 +7,21 @@ Uses httpx directly (no python-telegram-bot library) because:
 
 Handles:
   - HTML parse mode (bold titles, links)
+  - one send path (``TelegramPublisher._send_message``) for channel Posts, admin
+    alerts and run reports; alerts and run reports log its failures and never raise
   - Channel Post failures, sorted by one question: could the Post already be in
     the channel? Only failures where it could not are retried:
       - 429: wait once for Telegram's retry_after (≤ 60 s), retry once
       - connection could not be set up: a few retries with exponential backoff
       - timeout after sending, or 5xx: delivery unknown, never retried
-      - any other 4xx: rejected, never retried (the Article becomes an Error)
+      - any other 4xx, or a 2xx without ``ok: true``: rejected, never retried
+        (the Article becomes an Error)
 """
 
 import asyncio
 import re
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -136,7 +139,7 @@ def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
 
 # Template for a channel post — {hashtag} is empty string when category is "inne"
 _POST_TEMPLATE = """\
-<b>{title}</b>
+<b>{title}</b>{event_date}
 
 {summary}
 
@@ -159,8 +162,27 @@ _STAGING_POST_BANNER = (
 )
 
 
-def _build_message(article: Article, decision: AIDecision, *, staging: bool = False) -> str:
-    """Render the Telegram HTML message from article + AI decision."""
+def format_event_date(start: date, end: date | None) -> str:
+    """Event date as readers see it: 31.10, 24–26.10, 30.10–2.11."""
+    if end is None or end == start:
+        return f"{start.day}.{start.month:02d}"
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start.day}–{end.day}.{end.month:02d}"
+    return f"{start.day}.{start.month:02d}–{end.day}.{end.month:02d}"
+
+
+def _build_message(
+    article: Article,
+    decision: AIDecision,
+    *,
+    staging: bool = False,
+    show_event_date: bool = False,
+) -> str:
+    """Render the Telegram HTML message from article + AI decision.
+
+    ``show_event_date`` adds the Event date line under the title when the date is
+    known; only Events channel Posts carry it.
+    """
     # HTML-escape any stray < > & " in user content (titles from the site)
     title = _html_escape(decision.ua_title)
     summary = _html_escape(decision.ua_summary)
@@ -171,8 +193,13 @@ def _build_message(article: Article, decision: AIDecision, *, staging: bool = Fa
     raw_hashtag = _CATEGORY_HASHTAGS.get(decision.category_tag.value, "")
     hashtag = f"\n\n{raw_hashtag}" if raw_hashtag else ""
 
+    event_date = ""
+    if show_event_date and decision.event_start is not None:
+        event_date = f"\n📅 {format_event_date(decision.event_start, decision.event_end)}"
+
     text = _POST_TEMPLATE.format(
         title=title,
+        event_date=event_date,
         summary=summary,
         url=url,
         domain=domain,
@@ -371,6 +398,10 @@ def _collect_run_report_segments(
         + f"errors {stats.errors}"
         + (f" · deferred {stats.deferred}" if stats.deferred else "")
     )
+    if stats.events_posted:
+        meta_inner.append(
+            f"📅 events {stats.events_posted} · without date {stats.events_without_date}"
+        )
     rq_n = len(stats.remaining_queued)
     if rq_n:
         meta_inner.append(f"not evaluated this run: {rq_n}")
@@ -536,7 +567,7 @@ def _tg_description(response: httpx.Response) -> str:
     """Telegram's error description; gateways in front of it may answer with HTML."""
     try:
         description = response.json().get("description")
-    except ValueError:
+    except (ValueError, AttributeError):
         description = None
     return str(description) if description else response.text[:200]
 
@@ -551,8 +582,11 @@ class TelegramPublisher:
         admin_chat_id: str | None = None,
         report_display_timezone: str | None = None,
         mark_channel_posts_staging: bool = False,
+        show_event_date: bool = False,
     ) -> None:
         self._base_url = _TG_API_BASE.format(token=bot_token)
+        # Set for the Events channel: its Posts carry the Event date line
+        self._show_event_date = show_event_date
         self._channel_id = channel_id
         # Alerts go to admin_chat_id when set, otherwise fall back to the public channel.
         self._admin_chat_configured = bool((admin_chat_id or "").strip())
@@ -570,7 +604,8 @@ class TelegramPublisher:
                 after waiting once (Deferred).
             TelegramUnreachableError: no connection after a few attempts (Deferred).
             TelegramDeliveryUnknownError: the Post may have gone out; never retried.
-            TelegramRejectedError: any other 4xx; never retried.
+            TelegramRejectedError: any other 4xx, or a 2xx without ``ok: true``;
+                never retried.
         """
         try:
             return await self._publish_reaching_telegram(article, decision)
@@ -600,72 +635,104 @@ class TelegramPublisher:
         Used directly for the events channel, whose Post is never retried.
         Raises TelegramRateLimitedError on a 429, TelegramUnreachableError when no
         request was sent, TelegramDeliveryUnknownError when the Post may have gone
-        out, and TelegramRejectedError on any other 4xx.
+        out, and TelegramRejectedError on any other 4xx or a 2xx without ``ok: true``.
         """
         text = _build_message(
             article,
             decision,
             staging=self._mark_channel_posts_staging,
+            show_event_date=self._show_event_date,
         )
 
         async with httpx.AsyncClient(timeout=20.0) as client:
-            try:
-                response = await client.post(
-                    f"{self._base_url}/sendMessage",
-                    json={
-                        "chat_id": self._channel_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                        # The Post shows the Article's card, even if the text ever
-                        # gains another link
-                        "link_preview_options": {"is_disabled": False, "url": article.url},
-                    },
-                )
-            except _CONNECT_ERRORS as exc:
-                logger.warning(
-                    "telegram_unreachable",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                    chat_id=self._channel_id,
-                )
-                raise TelegramUnreachableError(f"{type(exc).__name__}: {exc}") from exc
-            except _DELIVERY_UNKNOWN_ERRORS as exc:
-                logger.error(
-                    "telegram_delivery_unknown",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                    chat_id=self._channel_id,
-                )
-                raise TelegramDeliveryUnknownError(f"{type(exc).__name__}: {exc}") from exc
-
-            # Rate limited: nothing was posted; the caller decides whether to wait
-            if response.status_code == 429:
-                retry_after = _retry_after_seconds(response)
-                raise TelegramRateLimitedError(
-                    f"Telegram 429, retry_after={retry_after:g}s", retry_after=retry_after
-                )
-
-            if not response.is_success:
-                # Log Telegram's actual error description before raising
-                tg_error = _tg_description(response)
-                logger.error(
-                    "telegram_api_error",
-                    status_code=response.status_code,
-                    tg_description=tg_error,
-                    chat_id=self._channel_id,
-                )
-                if response.is_server_error:
-                    raise TelegramDeliveryUnknownError(f"HTTP {response.status_code}: {tg_error}")
-                raise TelegramRejectedError(f"HTTP {response.status_code}: {tg_error}")
-
-        data = response.json()
-        message_id: int = data["result"]["message_id"]
+            message_id = await self._send_message(
+                client,
+                {
+                    "chat_id": self._channel_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    # The Post shows the Article's card, even if the text ever
+                    # gains another link
+                    "link_preview_options": {"is_disabled": False, "url": article.url},
+                },
+                chat_id=self._channel_id,
+            )
 
         return PublishResult(
             article_id=article.id,
             message_id=message_id,
             chat_id=self._channel_id,
         )
+
+    async def _send_message(
+        self, client: httpx.AsyncClient, payload: dict[str, Any], **log_context: str
+    ) -> int:
+        """Post ``payload`` to ``sendMessage`` and return the new message's ID.
+
+        The only place a message reaches Telegram: channel Posts, alerts and run
+        reports all go through it. ``log_context`` is added to every failure log line.
+
+        Raises:
+            TelegramUnreachableError: the connection could not be set up; nothing was sent.
+            TelegramDeliveryUnknownError: the message may have gone out (timeout after
+                sending, or a 5xx).
+            TelegramRateLimitedError: a 429; nothing was sent.
+            TelegramRejectedError: any other 4xx, or a 2xx without ``ok: true``.
+        """
+        try:
+            response = await client.post(f"{self._base_url}/sendMessage", json=payload)
+        except _CONNECT_ERRORS as exc:
+            logger.warning(
+                "telegram_unreachable",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                **log_context,
+            )
+            raise TelegramUnreachableError(f"{type(exc).__name__}: {exc}") from exc
+        except _DELIVERY_UNKNOWN_ERRORS as exc:
+            logger.error(
+                "telegram_delivery_unknown",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                **log_context,
+            )
+            raise TelegramDeliveryUnknownError(f"{type(exc).__name__}: {exc}") from exc
+
+        # Rate limited: nothing was sent; the caller decides whether to wait
+        if response.status_code == 429:
+            retry_after = _retry_after_seconds(response)
+            logger.warning(
+                "telegram_rate_limited",
+                retry_after=retry_after,
+                tg_description=_tg_description(response),
+                **log_context,
+            )
+            raise TelegramRateLimitedError(
+                f"Telegram 429, retry_after={retry_after:g}s", retry_after=retry_after
+            )
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+        # A 2xx whose body is not ``ok: true`` (or not JSON) stays an Error, as it
+        # always was; only a timeout or a 5xx makes delivery unknown.
+        if not response.is_success or not isinstance(data, dict) or not data.get("ok"):
+            # Log Telegram's actual error description before raising
+            tg_error = _tg_description(response)
+            logger.error(
+                "telegram_api_error",
+                status_code=response.status_code,
+                tg_description=tg_error,
+                **log_context,
+            )
+            status = f"HTTP {response.status_code}" + (" ok=false" if response.is_success else "")
+            if response.is_server_error:
+                raise TelegramDeliveryUnknownError(f"{status}: {tg_error}")
+            raise TelegramRejectedError(f"{status}: {tg_error}")
+
+        message_id: int = data["result"]["message_id"]
+        return message_id
 
     def _admin_send_target(self) -> str:
         """Log label for where alerts/reports go (no chat IDs)."""
@@ -677,46 +744,21 @@ class TelegramPublisher:
         try:
             logger.info("admin_alert_sending", target=target)
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    f"{self._base_url}/sendMessage",
-                    json={
+                message_id = await self._send_message(
+                    client,
+                    {
                         "chat_id": self._alert_chat_id,
                         "text": f"⚠️ Rz-Flow alert:\n{message}",
                         "parse_mode": "HTML",
                     },
-                )
-            try:
-                data: dict[str, Any] = response.json()
-            except ValueError:
-                data = {}
-            if not response.is_success:
-                desc = (
-                    data.get("description", response.text)
-                    if isinstance(data, dict)
-                    else response.text
-                )
-                logger.error(
-                    "alert_send_failed",
                     target=target,
-                    http_status=response.status_code,
-                    tg_description=str(desc),
                 )
-                return
-            if not isinstance(data, dict) or not data.get("ok"):
-                logger.error(
-                    "alert_send_failed",
-                    target=target,
-                    tg_description=(
-                        str(data.get("description", "")) if isinstance(data, dict) else ""
-                    ),
-                )
-                return
-            result = data.get("result")
-            msg_id = result.get("message_id") if isinstance(result, dict) else None
-            logger.info("admin_alert_sent", target=target, message_id=msg_id)
+            logger.info("admin_alert_sent", target=target, message_id=message_id)
         except Exception as exc:
             # Alert failures should never crash the pipeline
-            logger.error("alert_send_failed", target=target, error=str(exc))
+            logger.error(
+                "alert_send_failed", target=target, error_type=type(exc).__name__, error=str(exc)
+            )
 
     async def send_run_report(
         self,
@@ -750,50 +792,27 @@ class TelegramPublisher:
                 for i, text in enumerate(chunks):
                     if i:
                         await asyncio.sleep(0.35)
-                    response = await client.post(
-                        f"{self._base_url}/sendMessage",
-                        json={
-                            "chat_id": self._alert_chat_id,
-                            "text": text,
-                            "parse_mode": "HTML",
-                            "link_preview_options": {"is_disabled": True},
-                        },
-                    )
                     try:
-                        data = response.json()
-                    except ValueError:
-                        data = {}
-                    if not response.is_success:
-                        desc = (
-                            data.get("description", response.text)
-                            if isinstance(data, dict)
-                            else response.text
+                        last_msg_id = await self._send_message(
+                            client,
+                            {
+                                "chat_id": self._alert_chat_id,
+                                "text": text,
+                                "parse_mode": "HTML",
+                                "link_preview_options": {"is_disabled": True},
+                            },
+                            target=target,
                         )
+                    except Exception as exc:
                         logger.error(
                             "run_report_send_failed",
                             target=target,
                             dry_run=dry_run,
                             chunk_index=i,
-                            http_status=response.status_code,
-                            tg_description=str(desc),
+                            error_type=type(exc).__name__,
+                            error=str(exc),
                         )
                         return
-                    if not isinstance(data, dict) or not data.get("ok"):
-                        logger.error(
-                            "run_report_send_failed",
-                            target=target,
-                            dry_run=dry_run,
-                            chunk_index=i,
-                            tg_description=(
-                                str(data.get("description", "")) if isinstance(data, dict) else ""
-                            ),
-                        )
-                        return
-                    last_msg_id = (
-                        data.get("result", {}).get("message_id")
-                        if isinstance(data.get("result"), dict)
-                        else None
-                    )
             logger.info(
                 "run_report_sent",
                 dry_run=dry_run,

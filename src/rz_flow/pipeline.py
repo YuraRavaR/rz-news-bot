@@ -170,6 +170,9 @@ class PipelineStats:
     article_log: list[ArticleRunEntry] = field(default_factory=list)
     # Articles left for the next Run by a failure that was not their fault
     deferred: int = 0
+    # Published Articles the AI judged events, and how many of them have no Event date
+    events_posted: int = 0
+    events_without_date: int = 0
     # Operational warnings worth pushing to the admin chat immediately, separate from
     # the run report (e.g. a source that went silent, a post that may have duplicated).
     alerts: list[str] = field(default_factory=list)
@@ -227,6 +230,7 @@ class Pipeline:
                 channel_id=events_id,
                 report_display_timezone=self.flow_config.pipeline.report_display_timezone,
                 mark_channel_posts_staging=self.use_staging_channel,
+                show_event_date=True,
             )
             logger.info("events_channel_configured", events_channel_id=events_id)
         elif self.use_staging_channel:
@@ -660,6 +664,11 @@ class Pipeline:
             stats.errors += 1
             decision = Decision.ERROR
             error_msg = f"{type(exc).__name__}: {exc}"
+
+        if decision == Decision.POSTED and ai_decision is not None and ai_decision.is_event:
+            stats.events_posted += 1
+            if ai_decision.event_start is None:
+                stats.events_without_date += 1
 
         # The AI judged it: later Articles about the same Story are Repeats. An Error
         # is never an original, so its Story is not lost if the Article failed.

@@ -10,7 +10,7 @@ is as simple as writing a new class that implements StorageProtocol.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Protocol, runtime_checkable
 
 import libsql_client
@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS posts (
     ua_summary            TEXT,
     category_tag          TEXT,
     error_attempts        INTEGER NOT NULL DEFAULT 0,
-    repeat_of             TEXT
+    repeat_of             TEXT,
+    event_start           TEXT,
+    event_end             TEXT
 );
 """
 
@@ -61,6 +63,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str]] = [
     ("tg_events_message_id", "INTEGER"),
     ("error_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("repeat_of", "TEXT"),
+    # Event date as ISO YYYY-MM-DD; rows from before it have none (not backfilled)
+    ("event_start", "TEXT"),
+    ("event_end", "TEXT"),
 ]
 
 # Data migrations — one-time UPDATE statements that backfill existing rows.
@@ -90,6 +95,10 @@ _JUDGED_OUTCOMES = (
 # (network, malformed AI JSON) must not retire an article permanently, but a genuinely
 # broken one must not be retried forever either.
 DEFAULT_MAX_ERROR_ATTEMPTS = 3
+
+
+def _iso_or_none(value: date | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 # ── Protocol (interface) ──────────────────────────────────────────────────────
@@ -262,8 +271,9 @@ class TursoStorage:
             INSERT INTO posts
               (id, url, category, title_pl, seen_at, decision,
                ai_score, ai_reason, is_event, tg_message_id, tg_events_message_id,
-               ua_title, ua_summary, category_tag, error_attempts, repeat_of)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ua_title, ua_summary, category_tag, error_attempts, repeat_of,
+               event_start, event_end)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 url                  = excluded.url,
                 category             = excluded.category,
@@ -279,6 +289,8 @@ class TursoStorage:
                 ua_summary           = excluded.ua_summary,
                 category_tag         = excluded.category_tag,
                 repeat_of            = excluded.repeat_of,
+                event_start          = excluded.event_start,
+                event_end            = excluded.event_end,
                 error_attempts       = CASE
                     WHEN excluded.decision = ?
                     THEN COALESCE(posts.error_attempts, 0) + 1
@@ -302,6 +314,8 @@ class TursoStorage:
                 ai_decision.category_tag.value if ai_decision else None,
                 1 if is_error else 0,
                 repeat_of,
+                _iso_or_none(ai_decision.event_start) if ai_decision else None,
+                _iso_or_none(ai_decision.event_end) if ai_decision else None,
                 Decision.ERROR.value,
             ],
         )
@@ -433,6 +447,8 @@ class InMemoryStorage:
             category_tag=ai_decision.category_tag.value if ai_decision else None,
             error_attempts=prior_attempts + 1 if decision == Decision.ERROR else 0,
             repeat_of=repeat_of,
+            event_start=ai_decision.event_start if ai_decision else None,
+            event_end=ai_decision.event_end if ai_decision else None,
         )
 
     async def mark_publishing(self, article: Article) -> Decision | None:

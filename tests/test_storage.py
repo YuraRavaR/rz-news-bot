@@ -9,7 +9,7 @@ Two levels:
 
 import pathlib
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -430,6 +430,23 @@ class TestTursoStorageMigrations:
         assert row["error_attempts"] == 0
         await storage.close()
 
+    async def test_event_date_columns_migrate_onto_a_legacy_file(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'legacy.db'}", auth_token="")
+        await storage._get_client().execute(_LEGACY_POSTS_TABLE)
+        await storage.init()
+
+        await storage.save_decision(
+            _make_article("DATED_LEGACY_1234"), Decision.POSTED, _dated_decision()
+        )
+
+        assert await _event_date(storage, "DATED_LEGACY_1234") == (
+            date(2026, 10, 24),
+            date(2026, 10, 26),
+        )
+        await storage.close()
+
     async def test_legacy_rows_survive_the_upgrade(self, tmp_path: pathlib.Path) -> None:
         storage = TursoStorage(database_url=f"file:{tmp_path / 'legacy.db'}", auth_token="")
         client = storage._get_client()
@@ -509,6 +526,8 @@ class TestTursoStorageMigrations:
             "category_tag",
             "error_attempts",
             "repeat_of",
+            "event_start",
+            "event_end",
         }
         await storage.close()
 
@@ -799,3 +818,62 @@ class TestExistingIdsContract:
         self, any_storage: InMemoryStorage | TursoStorage
     ) -> None:
         assert await any_storage.existing_ids([]) == set()
+
+
+def _dated_decision(
+    start: date | None = date(2026, 10, 24), end: date | None = date(2026, 10, 26)
+) -> AIDecision:
+    return _make_ai_decision().model_copy(update={"event_start": start, "event_end": end})
+
+
+async def _event_date(
+    storage: InMemoryStorage | TursoStorage, article_id: str
+) -> tuple[date | None, date | None]:
+    if isinstance(storage, InMemoryStorage):
+        record = storage.get_record(article_id)
+        assert record is not None
+        return record.event_start, record.event_end
+    result = await storage._get_client().execute(
+        "SELECT event_start, event_end FROM posts WHERE id = ?", [article_id]
+    )
+    start, end = result.rows[0]
+    return (
+        date.fromisoformat(start) if start else None,
+        date.fromisoformat(end) if end else None,
+    )
+
+
+class TestEventDateContract:
+    @pytest.mark.parametrize("decision", [Decision.POSTED, Decision.SKIPPED])
+    async def test_event_date_is_stored_with_an_ai_judged_row(
+        self, any_storage: InMemoryStorage | TursoStorage, decision: Decision
+    ) -> None:
+        article = _make_article("DATED_123456789")
+
+        await any_storage.save_decision(article, decision, _dated_decision())
+
+        assert await _event_date(any_storage, article.id) == (
+            date(2026, 10, 24),
+            date(2026, 10, 26),
+        )
+
+    async def test_single_day_event_has_no_end(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("SINGLE_DAY_12345")
+
+        await any_storage.save_decision(
+            article, Decision.POSTED, _dated_decision(date(2026, 10, 31), None)
+        )
+
+        assert await _event_date(any_storage, article.id) == (date(2026, 10, 31), None)
+
+    async def test_row_without_ai_decision_has_no_event_date(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("NO_DATE_12345678")
+        await any_storage.save_decision(article, Decision.POSTED, _dated_decision())
+
+        await any_storage.save_decision(article, Decision.ERROR)
+
+        assert await _event_date(any_storage, article.id) == (None, None)

@@ -27,6 +27,10 @@ The public channel every Published article goes to.
 **Events channel** (Канал подій):
 A secondary channel that additionally gets Articles about upcoming events. Reaching it alone does not make an Article published.
 
+**Event date** (Дата події):
+The day an event takes place, or its first and last day when it lasts several days. The AI reads it from the Article's title and lead, resolving relative dates ("w sobotę") against the day of the Run. When the text gives no date, the event has none: a date is never guessed. Events channel Posts show it; Main channel Posts do not.
+_Avoid_: deadline, publication date
+
 **Post** (Пост):
 One message in one Channel.
 _Avoid_: publication, message

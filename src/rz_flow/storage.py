@@ -23,6 +23,7 @@ from rz_flow.models import (
     DigestRecord,
     DigestStatus,
     JudgedArticle,
+    PeriodCounts,
     PostRecord,
     UnconfirmedArticle,
 )
@@ -207,6 +208,12 @@ class StorageProtocol(Protocol):
     async def delete_digest(self, weekend: date) -> None:
         """Drop the weekend's record after a Digest that definitely did not go out,
         so a manual re-run can post it.
+        """
+        ...
+
+    async def period_counts(self, start: datetime, end: datetime) -> PeriodCounts:
+        """Counts per ID prefix and outcome of the Articles whose last write is at or
+        after ``start`` and before ``end``, with the Published events among them.
         """
         ...
 
@@ -501,6 +508,35 @@ class TursoStorage:
             "DELETE FROM digests WHERE weekend = ?", [weekend.isoformat()]
         )
 
+    async def period_counts(self, start: datetime, end: datetime) -> PeriodCounts:
+        # Plain isoformat() matches how seen_at is written, so string order is time
+        # order even for a value without a fraction of a second
+        result = await self._get_client().execute(
+            """
+            SELECT CASE WHEN instr(id, '/') > 0 THEN substr(id, 1, instr(id, '/') - 1)
+                        ELSE '' END AS prefix,
+                   decision,
+                   COUNT(*),
+                   SUM(decision = ? AND is_event = 1),
+                   SUM(decision = ? AND is_event = 1 AND event_start IS NULL)
+            FROM posts
+            WHERE seen_at >= ? AND seen_at < ?
+            GROUP BY prefix, decision
+            """,
+            [
+                Decision.POSTED.value,
+                Decision.POSTED.value,
+                start.astimezone(UTC).isoformat(),
+                end.astimezone(UTC).isoformat(),
+            ],
+        )
+        counts = PeriodCounts()
+        for prefix, decision, count, events, undated in result.rows:
+            counts.by_prefix.setdefault(prefix, {})[Decision(decision)] = count
+            counts.events_posted += events or 0
+            counts.events_posted_undated += undated or 0
+        return counts
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
@@ -653,6 +689,19 @@ class InMemoryStorage:
 
     async def delete_digest(self, weekend: date) -> None:
         self._digests.pop(weekend, None)
+
+    async def period_counts(self, start: datetime, end: datetime) -> PeriodCounts:
+        counts = PeriodCounts()
+        for r in self._records.values():
+            if not start <= r.seen_at < end:
+                continue
+            prefix = r.id.split("/", 1)[0] if "/" in r.id else ""
+            by_outcome = counts.by_prefix.setdefault(prefix, {})
+            by_outcome[r.decision] = by_outcome.get(r.decision, 0) + 1
+            if r.decision == Decision.POSTED and r.is_event:
+                counts.events_posted += 1
+                counts.events_posted_undated += r.event_start is None
+        return counts
 
     async def close(self) -> None:
         pass

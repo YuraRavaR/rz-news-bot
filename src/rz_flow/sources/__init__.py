@@ -40,4 +40,10 @@ def get_active_sources(config: FlowConfig) -> list[ScraperSource]:
     return sources
 
 
-__all__ = ["ScraperSource", "get_active_sources"]
+def source_names_by_prefix() -> dict[str, str]:
+    """Source name of every registered scraper, keyed by the prefix of its Article IDs."""
+    sources: list[ScraperSource] = [cls() for cls in _SCRAPER_REGISTRY.values()]
+    return {s.ID_PREFIX: s.name for s in sources}
+
+
+__all__ = ["ScraperSource", "get_active_sources", "source_names_by_prefix"]

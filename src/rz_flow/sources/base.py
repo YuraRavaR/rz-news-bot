@@ -30,6 +30,9 @@ class ScraperSource(Protocol):
     url: str
     """Actual URL the scraper fetches."""
 
+    ID_PREFIX: str
+    """Prefix of this Source's stored Article IDs (``rz24/…``): the dedup key's namespace."""
+
     def slug(self, url: str) -> str | None:
         """The slug of one of this Source's Article URLs, or None for any other URL.
 

@@ -239,3 +239,13 @@ class DigestRecord(BaseModel):
     tg_message_id: int | None = None
     item_count: int
     written_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class PeriodCounts(BaseModel):
+    """Articles whose last write falls in a period: the Weekly report's numbers."""
+
+    # ID prefix ("rz24") → outcome → Articles; outcomes with none are left out
+    by_prefix: dict[str, dict[Decision, int]] = Field(default_factory=dict)
+    events_posted: int = 0
+    # Published events with no Event date, which includes all written before Event dates
+    events_posted_undated: int = 0

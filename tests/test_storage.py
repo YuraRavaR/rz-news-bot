@@ -1036,3 +1036,87 @@ class TestDigestRecordContract:
         await any_storage.start_digest(self._WEEKEND, item_count=5)
 
         assert await any_storage.get_digest(date(2026, 11, 6)) is None
+
+
+class TestPeriodCountsContract:
+    """Counts of Articles last written in a period, per Source: the Weekly report's numbers."""
+
+    _START = datetime(2026, 10, 18, 22, 0, tzinfo=UTC)  # Monday 19.10, 00:00 in Warsaw
+    _END = datetime(2026, 10, 25, 23, 0, tzinfo=UTC)  # Monday 26.10, 00:00 in Warsaw
+
+    async def _save_at(
+        self,
+        storage: InMemoryStorage | TursoStorage,
+        article_id: str,
+        decision: Decision,
+        when: datetime,
+    ) -> None:
+        await storage.save_decision(_make_article(article_id), decision)
+        await _set_last_write(storage, article_id, when)
+
+    async def test_counts_each_outcome_per_id_prefix(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        inside = self._START + _HOUR
+        for article_id, decision in [
+            ("rz24/1", Decision.POSTED),
+            ("rz24/2", Decision.POSTED),
+            ("rz24/3", Decision.SKIPPED),
+            ("rz24/4", Decision.REPEAT),
+            ("rz24/5", Decision.ERROR),
+            ("rzn/1", Decision.POSTED),
+            ("rzn/2", Decision.UNCONFIRMED),
+        ]:
+            await self._save_at(any_storage, article_id, decision, inside)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert counts.by_prefix == {
+            "rz24": {
+                Decision.POSTED: 2,
+                Decision.SKIPPED: 1,
+                Decision.REPEAT: 1,
+                Decision.ERROR: 1,
+            },
+            "rzn": {Decision.POSTED: 1, Decision.UNCONFIRMED: 1},
+        }
+
+    async def test_period_includes_its_start_and_excludes_its_end(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        for article_id, when in [
+            ("rz24/AT_START", self._START),
+            ("rz24/BEFORE", self._START - timedelta(microseconds=1)),
+            ("rz24/LAST", self._END - timedelta(microseconds=1)),
+            ("rz24/AT_END", self._END),
+        ]:
+            await self._save_at(any_storage, article_id, Decision.POSTED, when)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert counts.by_prefix == {"rz24": {Decision.POSTED: 2}}
+
+    async def test_counts_posted_events_and_those_without_an_event_date(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await _save_event(any_storage, "rz24/DATED", date(2026, 10, 24))
+        await _save_event(any_storage, "rz24/UNDATED", None)
+        await _save_event(any_storage, "rzn/UNDATED", None)
+        await _save_event(any_storage, "rz24/SKIPPED_EVENT", None, decision=Decision.SKIPPED)
+        await _save_event(any_storage, "rz24/NEWS", None, is_event=False)
+        for article_id in ("rz24/DATED", "rz24/UNDATED", "rzn/UNDATED", "rz24/SKIPPED_EVENT"):
+            await _set_last_write(any_storage, article_id, self._START + _HOUR)
+        await _set_last_write(any_storage, "rz24/NEWS", self._START + _HOUR)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert (counts.events_posted, counts.events_posted_undated) == (3, 2)
+
+    async def test_empty_period_counts_nothing(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await self._save_at(any_storage, "rz24/OLD", Decision.POSTED, self._START - _HOUR)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert (counts.by_prefix, counts.events_posted, counts.events_posted_undated) == ({}, 0, 0)

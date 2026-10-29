@@ -49,8 +49,9 @@ src/rz_flow/
 ├── telegram.py        — Telegram Bot API publisher
 ├── pipeline.py        — pipeline orchestrator: scrape → filter → AI → publish → save
 ├── digest.py          — the weekend Digest for the Events channel (--digest)
+├── weekly_report.py   — last week's report to the admin chat (--weekly-report)
 ├── logging_config.py  — pretty TTY renderer locally, JSON for CI
-└── main.py            — CLI entry point (--dry-run, --staging, --init-db, --digest)
+└── main.py            — CLI entry point (--dry-run, --staging, --init-db, --digest, --weekly-report)
 ```
 
 ---
@@ -138,6 +139,15 @@ Posts one Digest of the coming weekend's (Friday–Sunday, Europe/Warsaw) Publis
 ```bash
 uv run rz-flow --digest --dry-run
 uv run rz-flow --digest
+```
+
+### 8. Weekly report
+
+Sends a report about the previous Monday–Sunday (Europe/Warsaw) to the admin chat and exits: per Source, how many Articles were new, Published, Skipped, Repeats, Errors and Unconfirmed; events posted and how many had no Event date; an estimate of Gemini requests on the busiest day against the free-tier 500; whether that week's Digest went out; and a ⚠️ when Published fell by more than half against the week before. It only reads storage (no Gemini, no scraping). `--dry-run` adds a banner; `--staging` reads the staging DB.
+
+```bash
+uv run rz-flow --weekly-report --dry-run
+uv run rz-flow --weekly-report
 ```
 
 ---

@@ -8,6 +8,7 @@ Usage:
     uv run rz-flow --init-db     # create DB tables and exit
     uv run rz-flow --init-db --staging   # init staging DB only
     uv run rz-flow --digest [--dry-run] [--staging]   # post the weekend's Digest and exit
+    uv run rz-flow --weekly-report [--dry-run] [--staging]   # last week's report to the admin
 """
 
 import argparse
@@ -25,6 +26,7 @@ from rz_flow.logging_config import configure_logging
 from rz_flow.pipeline import Pipeline
 from rz_flow.storage import create_storage
 from rz_flow.telegram import TelegramPublisher
+from rz_flow.weekly_report import run_weekly_report
 
 
 async def _async_main(
@@ -32,9 +34,12 @@ async def _async_main(
     init_db_only: bool = False,
     staging: bool = False,
     digest: bool = False,
+    weekly_report: bool = False,
     today: date | None = None,
 ) -> int:
-    """Run one CLI mode; ``today`` (Warsaw) is injectable for the Digest's tests."""
+    """Run one CLI mode; ``today`` (Warsaw) is injectable for the Digest's and the
+    Weekly report's tests.
+    """
     settings = get_settings()
     flow_config = load_flow_config()
     log = structlog.get_logger("main")
@@ -64,6 +69,10 @@ async def _async_main(
 
         if digest:
             return await run_digest(
+                settings, storage, today=today, dry_run=dry_run, staging=staging
+            )
+        if weekly_report:
+            return await run_weekly_report(
                 settings, storage, today=today, dry_run=dry_run, staging=staging
             )
 
@@ -177,6 +186,14 @@ def main() -> None:
             "weekend) and exit; no scraping, no Run"
         ),
     )
+    parser.add_argument(
+        "--weekly-report",
+        action="store_true",
+        help=(
+            "Send the previous Monday–Sunday's report to the admin chat and exit; "
+            "reads storage only (no Gemini, no scraping)"
+        ),
+    )
     args = parser.parse_args()
 
     # Set up logging before anything else
@@ -189,6 +206,7 @@ def main() -> None:
             init_db_only=args.init_db,
             staging=args.staging,
             digest=args.digest,
+            weekly_report=args.weekly_report,
         )
     )
     sys.exit(exit_code)

@@ -43,6 +43,10 @@ _Avoid_: source, feed, schedule
 One event listed in the Calendar, with a Polish title, a start day, an optional last day and a link. It is not an Article. The Digest considers an entry that lasts at most three days and overlaps the weekend, or a longer one only in the weekend it starts, so a months-long exhibition appears once.
 _Avoid_: article, event (on its own)
 
+**Weekly report** (Тижневий звіт):
+A report to the admin chat about the previous Monday–Sunday (Europe/Warsaw), built from storage alone: per Source, how many Articles were new, Published, Skipped, Repeats, Errors and Unconfirmed; events posted and how many had no Event date; an estimate of Gemini requests on the busiest day against the free-tier limit; whether that weekend's Digest went out; and a warning when Published fell by more than half against the week before. An Article counts in the week of its last write. It costs no Gemini requests.
+_Avoid_: digest (that is the Events channel Post), run report (that covers one Run)
+
 **Post** (Пост):
 One message in one Channel.
 _Avoid_: publication, message

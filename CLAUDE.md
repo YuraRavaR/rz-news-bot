@@ -22,6 +22,7 @@ uv run rz-flow --dry-run                        # evaluate with Gemini, no Teleg
 uv run rz-flow --staging [--dry-run]            # staging channel + staging Turso DB
 uv run rz-flow --init-db [--staging]            # create/migrate tables and exit
 uv run rz-flow --digest [--dry-run] [--staging] # post the weekend Digest (digest.py) and exit
+uv run rz-flow --weekly-report [--dry-run] [--staging] # last week's report to the admin chat
 ```
 
 Running the CLI needs a filled `.env` (see `.env.example`); set `APP_ENV=development` locally to suppress crash/quota alerts. Coverage must stay ≥ 70% (`fail_under`). Ruff enforces `ANN` (type annotations) in `src/` but not in `tests/`.
@@ -47,6 +48,8 @@ Flow: `main.py` → `Pipeline.run()` in `pipeline.py`, which goes through these 
 
 `--digest` skips all of this: `digest.run_digest` reads `storage.published_events_between` for the coming Friday–Sunday (Europe/Warsaw) and posts one Digest to the Events channel. It is at most once per weekend through the `digests` table (`start_digest` writes `publishing` before sending; definite non-delivery deletes the row, uncertain delivery keeps it).
 
+`--weekly-report` also skips the Run: `weekly_report.run_weekly_report` reads `storage.period_counts` (per ID prefix and outcome, by `seen_at`) for the previous Monday–Sunday in Europe/Warsaw, the week before it and each of its days, plus that weekend's Digest record, and sends the Weekly report to the admin chat only (never a channel fallback), packed like the run report. The busiest-day Gemini figure is AI-judged rows, an estimate.
+
 The Calendar (`city_calendar.py`, deliberately not `calendar.py`) is the city's events calendar, read only for the Digest and never a Source. `read_weekend_calendar` makes one day-picker request per weekend day (`parser.parse_calendar_day`), merges entries by URL ID, keeps the ones `in_weekend` allows, and never raises: a failure comes back as `CalendarReading.failure`, an admin-alert text. `config.yaml` `digest.enabled: false` skips it without a request. It is not yet wired into `run_digest`.
 
 After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMIN_CHAT_ID` and writes a GitHub step summary.
@@ -66,7 +69,7 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 
 ### Adding a news source
 
-1. Create `sources/<site>.py` with a class that satisfies the `ScraperSource` protocol (`name`, `url`, `slug(url)`, `async fetch(client, max_articles)`), with the HTML parsing in `parser.py`.
+1. Create `sources/<site>.py` with a class that satisfies the `ScraperSource` protocol (`name`, `url`, `ID_PREFIX`, `slug(url)`, `async fetch(client, max_articles)`), with the HTML parsing in `parser.py`.
 2. Give it a unique `ID_PREFIX`. Article IDs are stored as `<prefix>/<id>` (`rz24/…`, `rzn/…`) and serve as the dedup key, so changing a prefix re-posts everything from that source.
 3. Register it in `_SCRAPER_REGISTRY` in `sources/__init__.py`.
 4. Add an entry to `config.yaml`.

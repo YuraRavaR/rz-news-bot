@@ -10,6 +10,7 @@ to patch the client. This ensures:
 
 import json
 from concurrent.futures import Future
+from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -484,3 +485,119 @@ class TestPromptThreshold:
 
         config = mock_client.aio.models.generate_content.call_args.kwargs["config"]
         assert "score 9–10" in config.system_instruction
+
+
+class TestEventDates:
+    """Event dates come from the same answer that scores the Article (ADR 0002)."""
+
+    def test_schema_has_nullable_event_dates_that_are_not_required(self) -> None:
+        schema = _build_response_schema(7.0)
+        properties = schema["properties"]
+        assert isinstance(properties, dict)
+        for name in ("event_start", "event_end"):
+            assert properties[name]["type"] == "string"
+            assert properties[name]["nullable"] is True
+            assert "YYYY-MM-DD" in properties[name]["description"]
+        required = schema["required"]
+        assert isinstance(required, list)
+        assert "event_start" not in required
+        assert "event_end" not in required
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_prompt_carries_the_run_date_in_warsaw_with_its_weekday(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=_make_gemini_response(VALID_AI_RESPONSE)
+        )
+        # 23:30 UTC on Thursday is already Friday in Warsaw (CET, UTC+1)
+        ai = GeminiAIFilter(
+            api_key="fake-key", now=lambda: datetime(2026, 10, 29, 23, 30, tzinfo=UTC)
+        )
+
+        await ai.evaluate(_make_article())
+
+        contents = mock_client.aio.models.generate_content.call_args.kwargs["contents"]
+        assert "2026-10-30 (пʼятниця)" in contents
+        assert mock_client.aio.models.generate_content.call_count == 1
+
+    @patch("rz_flow.ai.genai.Client")
+    @pytest.mark.parametrize(
+        ("start", "end", "expected"),
+        [
+            ("2026-10-31", None, (date(2026, 10, 31), None)),
+            ("2026-10-24", "2026-10-26", (date(2026, 10, 24), date(2026, 10, 26))),
+            # A single day sent as a range is still a single day
+            ("2026-10-31", "2026-10-31", (date(2026, 10, 31), None)),
+            (None, None, (None, None)),
+            ("sobota", None, (None, None)),
+            ("2026-02-30", None, (None, None)),
+            ("2026-10-31", "wkrótce", (None, None)),
+            ("2026-10-26", "2026-10-24", (None, None)),
+            # An end without a start is no date rather than a guessed one
+            (None, "2026-10-26", (None, None)),
+        ],
+        ids=[
+            "single-day",
+            "range",
+            "start-equals-end",
+            "no-date",
+            "unparseable-start",
+            "impossible-start",
+            "unparseable-end",
+            "end-before-start",
+            "end-without-start",
+        ],
+    )
+    async def test_event_dates_parse_or_become_no_date(
+        self,
+        mock_client_cls: MagicMock,
+        start: str | None,
+        end: str | None,
+        expected: tuple[date | None, date | None],
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        payload = {**VALID_AI_RESPONSE, "event_start": start, "event_end": end}
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=_make_gemini_response(payload)
+        )
+
+        decision = await GeminiAIFilter(api_key="fake-key").evaluate(_make_article())
+
+        assert (decision.event_start, decision.event_end) == expected
+        assert decision.is_interesting is True
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_dates_on_a_non_event_are_dropped(self, mock_client_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        payload = {
+            **VALID_AI_RESPONSE,
+            "is_event": False,
+            "event_start": "2026-10-31",
+            "event_end": "2026-11-02",
+        }
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=_make_gemini_response(payload)
+        )
+
+        decision = await GeminiAIFilter(api_key="fake-key").evaluate(_make_article())
+
+        assert (decision.event_start, decision.event_end) == (None, None)
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_answer_without_the_date_fields_still_parses(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=_make_gemini_response(VALID_AI_RESPONSE)
+        )
+
+        decision = await GeminiAIFilter(api_key="fake-key").evaluate(_make_article())
+
+        assert (decision.event_start, decision.event_end) == (None, None)

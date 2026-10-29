@@ -18,7 +18,7 @@ Handles:
 import asyncio
 import re
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -136,7 +136,7 @@ def _admin_snippet(text: str, max_len: int = _MAX_ADMIN_AI_SNIPPET) -> str:
 
 # Template for a channel post — {hashtag} is empty string when category is "inne"
 _POST_TEMPLATE = """\
-<b>{title}</b>
+<b>{title}</b>{event_date}
 
 {summary}
 
@@ -159,8 +159,27 @@ _STAGING_POST_BANNER = (
 )
 
 
-def _build_message(article: Article, decision: AIDecision, *, staging: bool = False) -> str:
-    """Render the Telegram HTML message from article + AI decision."""
+def format_event_date(start: date, end: date | None) -> str:
+    """Event date as readers see it: 31.10, 24–26.10, 30.10–2.11."""
+    if end is None or end == start:
+        return f"{start.day}.{start.month:02d}"
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start.day}–{end.day}.{end.month:02d}"
+    return f"{start.day}.{start.month:02d}–{end.day}.{end.month:02d}"
+
+
+def _build_message(
+    article: Article,
+    decision: AIDecision,
+    *,
+    staging: bool = False,
+    show_event_date: bool = False,
+) -> str:
+    """Render the Telegram HTML message from article + AI decision.
+
+    ``show_event_date`` adds the Event date line under the title when the date is
+    known; only Events channel Posts carry it.
+    """
     # HTML-escape any stray < > & " in user content (titles from the site)
     title = _html_escape(decision.ua_title)
     summary = _html_escape(decision.ua_summary)
@@ -171,8 +190,13 @@ def _build_message(article: Article, decision: AIDecision, *, staging: bool = Fa
     raw_hashtag = _CATEGORY_HASHTAGS.get(decision.category_tag.value, "")
     hashtag = f"\n\n{raw_hashtag}" if raw_hashtag else ""
 
+    event_date = ""
+    if show_event_date and decision.event_start is not None:
+        event_date = f"\n📅 {format_event_date(decision.event_start, decision.event_end)}"
+
     text = _POST_TEMPLATE.format(
         title=title,
+        event_date=event_date,
         summary=summary,
         url=url,
         domain=domain,
@@ -371,6 +395,10 @@ def _collect_run_report_segments(
         + f"errors {stats.errors}"
         + (f" · deferred {stats.deferred}" if stats.deferred else "")
     )
+    if stats.events_posted:
+        meta_inner.append(
+            f"📅 events {stats.events_posted} · without date {stats.events_without_date}"
+        )
     rq_n = len(stats.remaining_queued)
     if rq_n:
         meta_inner.append(f"not evaluated this run: {rq_n}")
@@ -551,8 +579,11 @@ class TelegramPublisher:
         admin_chat_id: str | None = None,
         report_display_timezone: str | None = None,
         mark_channel_posts_staging: bool = False,
+        show_event_date: bool = False,
     ) -> None:
         self._base_url = _TG_API_BASE.format(token=bot_token)
+        # Set for the Events channel: its Posts carry the Event date line
+        self._show_event_date = show_event_date
         self._channel_id = channel_id
         # Alerts go to admin_chat_id when set, otherwise fall back to the public channel.
         self._admin_chat_configured = bool((admin_chat_id or "").strip())
@@ -606,6 +637,7 @@ class TelegramPublisher:
             article,
             decision,
             staging=self._mark_channel_posts_staging,
+            show_event_date=self._show_event_date,
         )
 
         async with httpx.AsyncClient(timeout=20.0) as client:

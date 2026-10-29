@@ -20,6 +20,9 @@ DeferralErrors: the Article is Deferred rather than recorded as an Error.
 
 import json
 import re
+from collections.abc import Callable
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import structlog
 from google import genai
@@ -224,13 +227,32 @@ is_event = False для:
 
 НЕЙТРАЛЬНИЙ КОНТЕНТ (score 5–6): якщо сумніваєшся.
 
+ПОЛЯ event_start / event_end — лише коли is_event = True, інакше null:
+  • event_start — перший день події, event_end — останній, формат YYYY-MM-DD
+  • одноденна подія: event_end = null
+  • відносні дати ("w sobotę", "w najbliższy weekend", "jutro") рахуй від дати запуску
+  • якщо в тексті немає дати, обидва поля null. Не вгадуй дату.
+
 Відповідай ЛИШЕ валідним JSON згідно із заданою схемою. Без пояснень поза JSON."""
 
-_USER_PROMPT_TEMPLATE = """Категорія: {category}
+_USER_PROMPT_TEMPLATE = """Дата запуску: {run_date}
+Категорія: {category}
 Заголовок (польською): {title}
 Лід-абзац (польською): {summary}
 
 Оціни та переклади українською."""
+
+
+# Relative dates in Polish Articles ("w sobotę") are meant from the city's point of view
+_RUN_DATE_TIMEZONE = ZoneInfo("Europe/Warsaw")
+
+_UA_WEEKDAYS = ("понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя")
+
+
+def _format_run_date(now: datetime) -> str:
+    """The Run's day in Warsaw with its Ukrainian weekday: '2026-10-30 (пʼятниця)'."""
+    local = now.astimezone(_RUN_DATE_TIMEZONE)
+    return f"{local.date().isoformat()} ({_UA_WEEKDAYS[local.weekday()]})"
 
 
 def _build_system_prompt(min_score: float) -> str:
@@ -287,6 +309,21 @@ def _build_response_schema(min_score: float) -> dict[str, object]:
                 "type": "string",
                 "description": "One-sentence explanation of the decision (for logs)",
             },
+            "event_start": {
+                "type": "string",
+                "nullable": True,
+                "description": (
+                    "First day of the event as YYYY-MM-DD; null if not an event "
+                    "or the text gives no date"
+                ),
+            },
+            "event_end": {
+                "type": "string",
+                "nullable": True,
+                "description": (
+                    "Last day of a multi-day event as YYYY-MM-DD; null for a single-day event"
+                ),
+            },
         },
         "required": [
             "is_interesting",
@@ -308,8 +345,10 @@ class GeminiAIFilter:
         api_key: str,
         model: str = "gemini-3.5-flash-lite",
         min_score: float = 7.0,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._client = genai.Client(api_key=api_key)
+        self._now = now
         self._model = model
         self._system_prompt = _build_system_prompt(min_score)
         self._schema = _build_response_schema(min_score)
@@ -333,6 +372,7 @@ class GeminiAIFilter:
             ValueError: empty or unparseable Gemini response.
         """
         user_content = _USER_PROMPT_TEMPLATE.format(
+            run_date=_format_run_date(self._now()),
             category=article.category.value,
             title=article.title_pl,
             summary=article.summary_pl or "(немає)",
@@ -378,4 +418,6 @@ class GeminiAIFilter:
             raise ValueError(f"Empty Gemini response for article {article.id}")
 
         data = json.loads(raw_text)
-        return AIDecision(**data)
+        # So a dropped Event date is logged against its Article
+        with structlog.contextvars.bound_contextvars(article_id=article.id):
+            return AIDecision(**data)

@@ -11,7 +11,7 @@ import json
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -124,6 +124,7 @@ class FakeBotApi:
     """respx-backed Bot API: records Posts per channel and fails channels on demand."""
 
     posts: list[str] = field(default_factory=list)  # chat_id of every sendMessage, in order
+    texts: dict[str, list[str]] = field(default_factory=dict)  # chat_id → texts sent
     # chat_id → HTTP status to answer with, or a transport exception to raise
     failing: dict[str, int | Exception] = field(default_factory=dict)
     # chat_id → responses served first, one per request, before ``failing`` applies
@@ -131,8 +132,10 @@ class FakeBotApi:
     _next_id: int = 1
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        chat_id = json.loads(request.content)["chat_id"]
+        body = json.loads(request.content)
+        chat_id = body["chat_id"]
         self.posts.append(chat_id)
+        self.texts.setdefault(chat_id, []).append(body["text"])
         if self.scripted.get(chat_id):
             return self.scripted[chat_id].pop(0)
         failure = self.failing.get(chat_id)
@@ -235,6 +238,118 @@ class TestMainChannelFirstEventsAfter:
         # The Article is Settled: the second Run posts it to neither channel.
         assert bot_api.posts == [_MAIN, _EVENTS]
         assert run2.new_articles == 0
+
+
+def _dated_decision(start: str | None, end: str | None = None) -> AIDecision:
+    """An event judged with the Event date as Gemini sends it."""
+    return AIDecision(
+        **{
+            **_event_decision().model_dump(exclude={"event_start", "event_end"}),
+            "event_start": start,
+            "event_end": end,
+        }
+    )
+
+
+class TestEventDate:
+    @pytest.mark.parametrize(
+        ("start", "end", "line"),
+        [
+            ("2026-10-31", None, "📅 31.10"),
+            ("2026-10-24", "2026-10-26", "📅 24–26.10"),
+            ("2026-10-30", "2026-11-02", "📅 30.10–2.11"),
+        ],
+        ids=["single-day", "range-in-a-month", "range-across-months"],
+    )
+    async def test_events_post_shows_the_date_and_main_post_does_not(
+        self,
+        bot_api: FakeBotApi,
+        storage: InMemoryStorage,
+        start: str,
+        end: str | None,
+        line: str,
+    ) -> None:
+        evaluate = AsyncMock(return_value=_dated_decision(start, end))
+
+        await _run(storage, [_article("DATED_1")], evaluate=evaluate)
+
+        [events_post] = bot_api.texts[_EVENTS]
+        [main_post] = bot_api.texts[_MAIN]
+        assert line in events_post.splitlines()
+        assert "📅" not in main_post
+        assert evaluate.await_count == 1
+
+    async def test_event_date_is_stored(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        await _run(storage, [_article("DATED_1")], _dated_decision("2026-10-24", "2026-10-26"))
+
+        record = storage.get_record("DATED_1")
+        assert record is not None
+        assert (record.event_start, record.event_end) == (date(2026, 10, 24), date(2026, 10, 26))
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [("w sobotę", None), ("2026-10-26", "2026-10-24")],
+        ids=["unparseable", "end-before-start"],
+    )
+    async def test_bad_date_is_stored_as_none_and_still_published(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage, start: str, end: str | None
+    ) -> None:
+        stats = await _run(storage, [_article("BAD_DATE")], _dated_decision(start, end))
+
+        record = storage.get_record("BAD_DATE")
+        assert record is not None
+        assert record.decision == Decision.POSTED
+        assert (record.event_start, record.event_end) == (None, None)
+        assert stats.posted == 1
+        assert bot_api.posts == [_MAIN, _EVENTS]
+        assert "📅" not in bot_api.texts[_EVENTS][0]
+
+    async def test_dates_on_published_news_are_not_stored(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        news = AIDecision(
+            **{
+                **_event_decision(is_event=False).model_dump(),
+                "event_start": "2026-10-31",
+            }
+        )
+
+        stats = await _run(storage, [_article("NEWS_DATED")], news)
+
+        record = storage.get_record("NEWS_DATED")
+        assert record is not None
+        assert record.decision == Decision.POSTED
+        assert (record.event_start, record.event_end) == (None, None)
+        assert stats.posted == 1
+        assert bot_api.posts == [_MAIN]
+
+    async def test_run_report_counts_published_events_without_a_date(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        evaluate = AsyncMock(
+            side_effect=[
+                _dated_decision("2026-10-31"),
+                _dated_decision(None),
+                _dated_decision("w sobotę"),
+                _event_decision(is_event=False),
+            ]
+        )
+        articles = [_article(f"EVT_{n}") for n in range(4)]
+
+        stats = await _run(storage, articles, evaluate=evaluate)
+
+        assert stats.posted == 4
+        report = _build_run_report(stats, dry_run=False)
+        assert "events 3 · without date 2" in report
+
+    async def test_run_report_has_no_event_line_without_published_events(
+        self, bot_api: FakeBotApi, storage: InMemoryStorage
+    ) -> None:
+        stats = await _run(storage, [_article("NEWS_1")], _event_decision(is_event=False))
+
+        assert "without date" not in _build_run_report(stats, dry_run=False)
 
 
 class TestUncertainDeliveryIsNeverReposted:

@@ -33,7 +33,15 @@ from rz_flow.ai import (
     _parse_retry_after,
 )
 from rz_flow.errors import DeferralError
-from rz_flow.models import Article, Category, CategoryTag, StopSignal
+from rz_flow.models import (
+    Article,
+    CalendarEntry,
+    CalendarVerdict,
+    Category,
+    CategoryTag,
+    DatedEvent,
+    StopSignal,
+)
 
 
 def _make_article(
@@ -601,3 +609,167 @@ class TestEventDates:
         decision = await GeminiAIFilter(api_key="fake-key").evaluate(_make_article())
 
         assert (decision.event_start, decision.event_end) == (None, None)
+
+
+def _calendar_entry(
+    entry_id: int, title: str, start: date, end: date | None = None
+) -> CalendarEntry:
+    return CalendarEntry(
+        id=entry_id,
+        url=f"https://erzeszow.pl/41-miasto-rzeszow/6241-kalendarz-imprez/{entry_id}-e.html",
+        title_pl=title,
+        start=start,
+        end=end,
+    )
+
+
+def _news_event(event_id: str, ua_title: str, start: date, end: date | None = None) -> DatedEvent:
+    return DatedEvent(
+        id=event_id,
+        url=f"https://rzeszow24.info/imprezy/{event_id}",
+        title_pl="Wydarzenie",
+        ua_title=ua_title,
+        event_start=start,
+        event_end=end,
+        tg_events_message_id=10,
+    )
+
+
+_ENTRIES = [
+    _calendar_entry(101, "Koncert jesienny w Filharmonii", date(2026, 10, 31)),
+    _calendar_entry(102, "Spotkanie klubu seniora", date(2026, 10, 30)),
+    _calendar_entry(103, "Festiwal Światła", date(2026, 10, 30), date(2026, 11, 1)),
+]
+_NEWS = [_news_event("rz24/abc", "Фестиваль світла", date(2026, 10, 30), date(2026, 11, 1))]
+
+
+class TestJudgeCalendar:
+    """The Digest's one request: every Calendar entry translated, filtered, matched."""
+
+    def _client(self, mock_client_cls: MagicMock, payload: dict[str, object]) -> MagicMock:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=_make_gemini_response(payload)
+        )
+        return mock_client
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_one_request_with_every_entry_and_news_event_returns_a_verdict_each(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        mock_client = self._client(
+            mock_client_cls,
+            {
+                "entries": [
+                    {
+                        "id": 101,
+                        "ua_title": "Осінній концерт",
+                        "is_interesting": True,
+                        "same_as": None,
+                    },
+                    {
+                        "id": 102,
+                        "ua_title": "Зустріч клубу",
+                        "is_interesting": False,
+                        "same_as": None,
+                    },
+                    {
+                        "id": 103,
+                        "ua_title": "Фестиваль",
+                        "is_interesting": True,
+                        "same_as": "rz24/abc",
+                    },
+                ]
+            },
+        )
+
+        verdicts = await GeminiAIFilter(api_key="fake-key").judge_calendar(_ENTRIES, _NEWS)
+
+        assert verdicts == [
+            CalendarVerdict(id=101, ua_title="Осінній концерт", is_interesting=True),
+            CalendarVerdict(id=102, ua_title="Зустріч клубу", is_interesting=False),
+            CalendarVerdict(id=103, ua_title="Фестиваль", is_interesting=True, same_as="rz24/abc"),
+        ]
+        assert mock_client.aio.models.generate_content.call_count == 1
+        contents = mock_client.aio.models.generate_content.call_args.kwargs["contents"]
+        for text in ("101", "Koncert jesienny w Filharmonii", "2026-10-31", "2026-11-01"):
+            assert text in contents
+        for text in ("rz24/abc", "Фестиваль світла"):
+            assert text in contents
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_same_as_naming_no_given_news_event_is_none_and_unasked_ids_ignored(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        self._client(
+            mock_client_cls,
+            {
+                "entries": [
+                    {
+                        "id": 101,
+                        "ua_title": "Концерт",
+                        "is_interesting": True,
+                        "same_as": "rz24/xyz",
+                    },
+                    {"id": 999, "ua_title": "Вигадка", "is_interesting": True, "same_as": None},
+                    {"id": 101, "ua_title": "Ще раз", "is_interesting": False, "same_as": None},
+                ]
+            },
+        )
+
+        verdicts = await GeminiAIFilter(api_key="fake-key").judge_calendar(_ENTRIES, _NEWS)
+
+        assert verdicts == [CalendarVerdict(id=101, ua_title="Концерт", is_interesting=True)]
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_per_minute_rate_limit_is_retried(self, mock_client_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        fake_429 = genai_errors.ClientError(
+            429, {"error": {"code": 429, "details": [{"retryDelay": "10s"}]}}
+        )
+        answer = {"entries": [{"id": 101, "ua_title": "Концерт", "is_interesting": True}]}
+        mock_client.aio.models.generate_content = AsyncMock(
+            side_effect=[fake_429, _make_gemini_response(answer)]
+        )
+
+        verdicts = await GeminiAIFilter(api_key="fake-key").judge_calendar(_ENTRIES, [])
+
+        assert [v.id for v in verdicts] == [101]
+        assert mock_client.aio.models.generate_content.call_count == 2
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_daily_quota_raises_without_a_retry(self, mock_client_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.aio.models.generate_content = AsyncMock(
+            side_effect=genai_errors.ClientError(
+                429,
+                {
+                    "error": {
+                        "code": 429,
+                        "details": [{"violations": [{"quotaId": "GenerateRequestsPerDay"}]}],
+                    }
+                },
+            )
+        )
+
+        with pytest.raises(GeminiQuotaExhaustedError):
+            await GeminiAIFilter(api_key="fake-key").judge_calendar(_ENTRIES, _NEWS)
+
+        assert mock_client.aio.models.generate_content.call_count == 1
+
+    @patch("rz_flow.ai.genai.Client")
+    async def test_request_uses_the_calendar_schema(self, mock_client_cls: MagicMock) -> None:
+        mock_client = self._client(mock_client_cls, {"entries": []})
+
+        await GeminiAIFilter(api_key="fake-key").judge_calendar(_ENTRIES, _NEWS)
+
+        config = mock_client.aio.models.generate_content.call_args.kwargs["config"]
+        assert config.response_mime_type == "application/json"
+        item = config.response_schema["properties"]["entries"]["items"]
+        assert item["properties"]["id"]["type"] == "integer"
+        same_as = item["properties"]["same_as"]
+        assert (same_as["type"], same_as["nullable"]) == ("string", True)
+        assert set(item["required"]) == {"id", "ua_title", "is_interesting"}

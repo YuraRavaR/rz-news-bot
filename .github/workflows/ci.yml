@@ -32,7 +32,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          # Must match publish.yml — the bot runs on 3.12 in production
+          # Must match publish.yml and digest-and-report.yml — the bot runs on 3.12 in production
           python-version: "3.12"
 
       - name: Install dependencies

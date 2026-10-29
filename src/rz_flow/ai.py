@@ -21,7 +21,7 @@ DeferralErrors: the Article is Deferred rather than recorded as an Error.
 import json
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -38,7 +38,15 @@ from tenacity import (
 )
 
 from rz_flow.errors import DeferralError
-from rz_flow.models import AIDecision, Article, CategoryTag, StopSignal
+from rz_flow.models import (
+    AIDecision,
+    Article,
+    CalendarEntry,
+    CalendarVerdict,
+    CategoryTag,
+    DatedEvent,
+    StopSignal,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -337,6 +345,86 @@ def _build_response_schema(min_score: float) -> dict[str, object]:
     }
 
 
+# ── The Digest's Calendar request ─────────────────────────────────────────────
+_CALENDAR_SYSTEM_PROMPT = """\
+Ти — редактор Telegram-каналу "Rzeszów — події" для україномовних мешканців міста
+Жешув (Польща). Готуєш Дайджест подій на вихідні.
+
+Отримуєш два списки:
+  • calendar_entries — записи міського календаря подій (польською): id, title_pl, дати
+  • news_events — події з новин, які вже є в Дайджесті (українською): id, ua_title, дати
+
+Для КОЖНОГО запису calendar_entries поверни:
+  • id — той самий id запису
+  • ua_title — стислий переклад назви українською
+  • is_interesting — True, якщо це публічна подія, цікава широкій громаді:
+    ✅ концерт, фестиваль, ярмарок, вистава, кіно, відкриття виставки, свято,
+       сімейний або спортивний захід, відкритий для всіх
+    ❌ засідання, наради, закриті зустрічі, гуртки й заняття для вузького кола,
+       курси, конкурси для шкіл, богослужіння, події без публічної частини
+  • same_as — id події з news_events про ту саму подію (та сама подія, дати
+    збігаються або перетинаються), інакше null. Схожа тема — це ще не та сама подія.
+
+Відповідай ЛИШЕ валідним JSON згідно із заданою схемою. Без пояснень поза JSON."""
+
+_CALENDAR_USER_PROMPT_TEMPLATE = """calendar_entries:
+{entries}
+
+news_events:
+{news_events}
+
+Поверни вердикт для кожного запису calendar_entries."""
+
+_CALENDAR_RESPONSE_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The Calendar entry's id"},
+                    "ua_title": {
+                        "type": "string",
+                        "description": "Ukrainian translation of the entry's title (concise)",
+                    },
+                    "is_interesting": {
+                        "type": "boolean",
+                        "description": "True for a public event the community would care about",
+                    },
+                    "same_as": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": (
+                            "id of the news event about the same event; null when none is"
+                        ),
+                    },
+                },
+                "required": ["id", "ua_title", "is_interesting"],
+            },
+        },
+    },
+    "required": ["entries"],
+}
+
+# One short Ukrainian title per entry; a weekend lists a few dozen at most
+_MAX_CALENDAR_OUTPUT_TOKENS = 4096
+
+
+def _date_fields(start: date, end: date | None) -> dict[str, str | None]:
+    return {"start": start.isoformat(), "end": end.isoformat() if end else None}
+
+
+# Transient failures and per-minute rate limits are retried; the daily quota and a
+# truncated answer are not, since asking again cannot help
+_gemini_retry = retry(
+    retry=retry_if_exception_type((GeminiRateLimitError, GeminiUnavailableError)),
+    wait=_gemini_retry_wait,
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+
+
 class GeminiAIFilter:
     """Wraps the Gemini API client with retry and structured output."""
 
@@ -353,14 +441,7 @@ class GeminiAIFilter:
         self._system_prompt = _build_system_prompt(min_score)
         self._schema = _build_response_schema(min_score)
 
-    @retry(
-        # Retry per-minute rate limits AND server-side 5xx (e.g. 503 high demand).
-        # GeminiQuotaExhaustedError is NOT retried — it propagates up immediately.
-        retry=retry_if_exception_type((GeminiRateLimitError, GeminiUnavailableError)),
-        wait=_gemini_retry_wait,
-        stop=stop_after_attempt(3),
-        reraise=True,
-    )
+    @_gemini_retry
     async def evaluate(self, article: Article) -> AIDecision:
         """Send article to Gemini for evaluation and translation.
 
@@ -377,47 +458,130 @@ class GeminiAIFilter:
             title=article.title_pl,
             summary=article.summary_pl or "(немає)",
         )
+        raw_text = await self._generate(
+            user_content,
+            system_prompt=self._system_prompt,
+            schema=self._schema,
+            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            subject=f"article {article.id}",
+            article_id=article.id,
+        )
+        data = json.loads(raw_text)
+        # So a dropped Event date is logged against its Article
+        with structlog.contextvars.bound_contextvars(article_id=article.id):
+            return AIDecision(**data)
 
+    @_gemini_retry
+    async def judge_calendar(
+        self, entries: list[CalendarEntry], news_events: list[DatedEvent]
+    ) -> list[CalendarVerdict]:
+        """The Digest's one request: a verdict for every Calendar entry.
+
+        Each verdict carries the entry's Ukrainian title, whether it interests the
+        community, and ``same_as``, the ID of a news event about the same event. An
+        answer for an entry that was not asked about is ignored, and a ``same_as`` that
+        names no given news event becomes None.
+
+        Raises the same errors as ``evaluate``, with the same retries.
+        """
+        user_content = _CALENDAR_USER_PROMPT_TEMPLATE.format(
+            entries=json.dumps(
+                [
+                    {"id": e.id, "title_pl": e.title_pl, **_date_fields(e.start, e.end)}
+                    for e in entries
+                ],
+                ensure_ascii=False,
+            ),
+            news_events=json.dumps(
+                [
+                    {
+                        "id": e.id,
+                        "ua_title": e.ua_title or e.title_pl,
+                        **_date_fields(e.event_start, e.event_end),
+                    }
+                    for e in news_events
+                ],
+                ensure_ascii=False,
+            ),
+        )
+        raw_text = await self._generate(
+            user_content,
+            system_prompt=_CALENDAR_SYSTEM_PROMPT,
+            schema=_CALENDAR_RESPONSE_SCHEMA,
+            max_output_tokens=_MAX_CALENDAR_OUTPUT_TOKENS,
+            subject=f"the Digest's {len(entries)} Calendar entries",
+            calendar_entries=len(entries),
+        )
+        asked = {e.id for e in entries}
+        news_ids = {e.id for e in news_events}
+        verdicts: list[CalendarVerdict] = []
+        judged: set[int] = set()
+        for item in json.loads(raw_text)["entries"]:
+            verdict = CalendarVerdict(**item)
+            if verdict.id not in asked or verdict.id in judged:
+                logger.warning("calendar_verdict_ignored", entry_id=verdict.id)
+                continue
+            if verdict.same_as is not None and verdict.same_as not in news_ids:
+                logger.warning(
+                    "calendar_same_as_dropped", entry_id=verdict.id, same_as=verdict.same_as
+                )
+                verdict = verdict.model_copy(update={"same_as": None})
+            judged.add(verdict.id)
+            verdicts.append(verdict)
+        return verdicts
+
+    async def _generate(
+        self,
+        contents: str,
+        *,
+        system_prompt: str,
+        schema: dict[str, object],
+        max_output_tokens: int,
+        subject: str,
+        **log_fields: object,
+    ) -> str:
+        """One structured-output request; the answer's JSON text.
+
+        Raises:
+            GeminiQuotaExhaustedError: daily quota is 0.
+            GeminiRateLimitError: per-minute limit hit.
+            GeminiUnavailableError: 5xx.
+            GeminiResponseIncompleteError: output truncated.
+            ValueError: empty Gemini response.
+        """
+        log = logger.bind(**log_fields)
         try:
             response = await self._client.aio.models.generate_content(
                 model=self._model,
-                contents=user_content,
+                contents=contents,
                 config=types.GenerateContentConfig(
-                    system_instruction=self._system_prompt,
+                    system_instruction=system_prompt,
                     response_mime_type="application/json",
-                    response_schema=self._schema,
+                    response_schema=schema,
                     temperature=0.3,
-                    max_output_tokens=_MAX_OUTPUT_TOKENS,
+                    max_output_tokens=max_output_tokens,
                 ),
             )
         except genai_errors.ClientError as exc:
             classified = _classify_gemini_error(exc)
             if isinstance(classified, GeminiRateLimitError):
-                logger.warning(
-                    "gemini_rate_limited",
-                    article_id=article.id,
-                    retry_after=classified.retry_after,
-                )
+                log.warning("gemini_rate_limited", retry_after=classified.retry_after)
                 raise classified from exc
             if isinstance(classified, GeminiQuotaExhaustedError):
-                logger.error("gemini_quota_exhausted", article_id=article.id)
+                log.error("gemini_quota_exhausted")
                 raise classified from exc
             raise  # other 4xx — re-raise original
         except GeminiServerError as exc:
             raise GeminiUnavailableError(str(exc)) from exc
 
         if _is_truncated(response):
-            logger.warning("gemini_response_truncated", article_id=article.id)
+            log.warning("gemini_response_truncated")
             raise GeminiResponseIncompleteError(
-                f"Gemini hit max_output_tokens ({_MAX_OUTPUT_TOKENS}) on article "
-                f"{article.id} — response JSON is incomplete, retrying next run"
+                f"Gemini hit max_output_tokens ({max_output_tokens}) on {subject} — "
+                "response JSON is incomplete"
             )
 
         raw_text = response.text
         if not raw_text:
-            raise ValueError(f"Empty Gemini response for article {article.id}")
-
-        data = json.loads(raw_text)
-        # So a dropped Event date is logged against its Article
-        with structlog.contextvars.bound_contextvars(article_id=article.id):
-            return AIDecision(**data)
+            raise ValueError(f"Empty Gemini response for {subject}")
+        return raw_text

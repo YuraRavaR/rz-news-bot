@@ -118,7 +118,13 @@ class TelegramRejectedError(Exception):
     """Telegram refused the Post as invalid (a 4xx other than 429).
 
     Retrying cannot help, so it is raised at once and the Article becomes an Error.
+    Also raised for a 2xx without ``ok: true``, which does not prove that nothing
+    was sent; ``status_code`` tells the two apart.
     """
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class TelegramDeliveryUnknownError(Exception):
@@ -664,6 +670,24 @@ class TelegramPublisher:
             chat_id=self._channel_id,
         )
 
+    async def send_digest(self, text: str) -> int:
+        """Send a ready Digest (HTML) to the channel with a single attempt.
+
+        Returns the message ID. Raises what ``_send_message`` raises; the caller
+        decides from it whether the Digest may have gone out.
+        """
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            return await self._send_message(
+                client,
+                {
+                    "chat_id": self._channel_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "link_preview_options": {"is_disabled": True},
+                },
+                chat_id=self._channel_id,
+            )
+
     async def _send_message(
         self, client: httpx.AsyncClient, payload: dict[str, Any], **log_context: str
     ) -> int:
@@ -729,7 +753,7 @@ class TelegramPublisher:
             status = f"HTTP {response.status_code}" + (" ok=false" if response.is_success else "")
             if response.is_server_error:
                 raise TelegramDeliveryUnknownError(f"{status}: {tg_error}")
-            raise TelegramRejectedError(f"{status}: {tg_error}")
+            raise TelegramRejectedError(f"{status}: {tg_error}", status_code=response.status_code)
 
         message_id: int = data["result"]["message_id"]
         return message_id
@@ -787,32 +811,11 @@ class TelegramPublisher:
                 target=target,
                 report_chunks=len(chunks),
             )
-            last_msg_id: int | None = None
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                for i, text in enumerate(chunks):
-                    if i:
-                        await asyncio.sleep(0.35)
-                    try:
-                        last_msg_id = await self._send_message(
-                            client,
-                            {
-                                "chat_id": self._alert_chat_id,
-                                "text": text,
-                                "parse_mode": "HTML",
-                                "link_preview_options": {"is_disabled": True},
-                            },
-                            target=target,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "run_report_send_failed",
-                            target=target,
-                            dry_run=dry_run,
-                            chunk_index=i,
-                            error_type=type(exc).__name__,
-                            error=str(exc),
-                        )
-                        return
+            last_msg_id = await self._send_admin_chunks(
+                chunks, failed_event="run_report_send_failed", dry_run=dry_run
+            )
+            if last_msg_id is None:
+                return
             logger.info(
                 "run_report_sent",
                 dry_run=dry_run,
@@ -822,3 +825,58 @@ class TelegramPublisher:
             )
         except Exception as exc:
             logger.error("run_report_send_failed", target=target, dry_run=dry_run, error=str(exc))
+
+    async def send_weekly_report(self, segments: list[str]) -> bool:
+        """Send the Weekly report to the admin chat, split like the run report when long.
+
+        Returns whether every part went out. Failures are logged, never raised.
+        """
+        target = self._admin_send_target()
+        chunks = _pack_run_report_segments_for_telegram(segments)
+        logger.info("weekly_report_sending", target=target, report_chunks=len(chunks))
+        last_msg_id = await self._send_admin_chunks(
+            chunks, failed_event="weekly_report_send_failed"
+        )
+        if last_msg_id is None:
+            return False
+        logger.info(
+            "weekly_report_sent", target=target, message_id=last_msg_id, report_chunks=len(chunks)
+        )
+        return True
+
+    async def _send_admin_chunks(
+        self, chunks: list[str], *, failed_event: str, **log_context: object
+    ) -> int | None:
+        """Send packed HTML chunks to the admin chat in order, pausing between them.
+
+        Returns the last message ID, or None after logging ``failed_event``
+        for the first chunk that failed; the chunks after it are not sent.
+        """
+        target = self._admin_send_target()
+        last_msg_id: int | None = None
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for i, text in enumerate(chunks):
+                if i:
+                    await asyncio.sleep(0.35)
+                try:
+                    last_msg_id = await self._send_message(
+                        client,
+                        {
+                            "chat_id": self._alert_chat_id,
+                            "text": text,
+                            "parse_mode": "HTML",
+                            "link_preview_options": {"is_disabled": True},
+                        },
+                        target=target,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        failed_event,
+                        target=target,
+                        chunk_index=i,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        **log_context,
+                    )
+                    return None
+        return last_msg_id

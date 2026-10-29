@@ -14,7 +14,14 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from rz_flow import storage as storage_module
-from rz_flow.models import AIDecision, Article, Category, CategoryTag, Decision
+from rz_flow.models import (
+    AIDecision,
+    Article,
+    Category,
+    CategoryTag,
+    Decision,
+    DigestStatus,
+)
 from rz_flow.storage import InMemoryStorage, TursoStorage, create_storage
 
 _HOUR = timedelta(hours=1)
@@ -447,6 +454,15 @@ class TestTursoStorageMigrations:
         )
         await storage.close()
 
+    async def test_digests_table_is_created_on_a_legacy_file(self, tmp_path: pathlib.Path) -> None:
+        storage = TursoStorage(database_url=f"file:{tmp_path / 'legacy.db'}", auth_token="")
+        await storage._get_client().execute(_LEGACY_POSTS_TABLE)
+        await storage.init()
+
+        assert await storage.start_digest(date(2026, 10, 30), item_count=3) is True
+        assert await storage.get_digest(date(2026, 10, 30)) is not None
+        await storage.close()
+
     async def test_legacy_rows_survive_the_upgrade(self, tmp_path: pathlib.Path) -> None:
         storage = TursoStorage(database_url=f"file:{tmp_path / 'legacy.db'}", auth_token="")
         client = storage._get_client()
@@ -877,3 +893,230 @@ class TestEventDateContract:
         await any_storage.save_decision(article, Decision.ERROR)
 
         assert await _event_date(any_storage, article.id) == (None, None)
+
+
+async def _save_event(
+    storage: InMemoryStorage | TursoStorage,
+    article_id: str,
+    start: date | None,
+    end: date | None = None,
+    decision: Decision = Decision.POSTED,
+    is_event: bool = True,
+    tg_events_message_id: int | None = None,
+) -> None:
+    ai = _make_ai_decision(is_event=is_event).model_copy(
+        update={"event_start": start, "event_end": end}
+    )
+    await storage.save_decision(
+        _make_article(article_id),
+        decision,
+        ai,
+        tg_message_id=1,
+        tg_events_message_id=tg_events_message_id,
+    )
+
+
+class TestPublishedEventsContract:
+    """Published events whose Event date overlaps a range: what a Digest lists."""
+
+    _FRI = date(2026, 10, 30)
+    _SUN = date(2026, 11, 1)
+
+    async def test_returns_events_overlapping_the_range(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await _save_event(any_storage, "E_SAT", date(2026, 10, 31))
+        await _save_event(any_storage, "E_ACROSS_START", date(2026, 10, 28), date(2026, 10, 30))
+        await _save_event(any_storage, "E_ACROSS_END", date(2026, 11, 1), date(2026, 11, 3))
+        await _save_event(any_storage, "E_SPANS_ALL", date(2026, 10, 1), date(2026, 11, 30))
+        await _save_event(any_storage, "E_BEFORE", date(2026, 10, 27), date(2026, 10, 29))
+        await _save_event(any_storage, "E_AFTER", date(2026, 11, 2))
+        await _save_event(any_storage, "E_THURSDAY", date(2026, 10, 29))
+
+        events = await any_storage.published_events_between(self._FRI, self._SUN)
+
+        assert [e.id for e in events] == ["E_SPANS_ALL", "E_ACROSS_START", "E_SAT", "E_ACROSS_END"]
+
+    async def test_returns_only_published_dated_events(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await _save_event(any_storage, "E_POSTED", date(2026, 10, 31))
+        await _save_event(any_storage, "E_SKIPPED", date(2026, 10, 31), decision=Decision.SKIPPED)
+        await _save_event(any_storage, "E_NO_DATE", None)
+        await any_storage.mark_publishing(_make_article("E_PUBLISHING"))
+
+        events = await any_storage.published_events_between(self._FRI, self._SUN)
+
+        assert [e.id for e in events] == ["E_POSTED"]
+
+    async def test_event_carries_what_a_digest_item_needs(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await _save_event(
+            any_storage, "E_FULL", date(2026, 10, 30), date(2026, 11, 1), tg_events_message_id=77
+        )
+        await _save_event(any_storage, "E_NO_EVENTS_POST", date(2026, 10, 31))
+
+        full, no_post = await any_storage.published_events_between(self._FRI, self._SUN)
+
+        assert (full.url, full.ua_title, full.event_start, full.event_end) == (
+            _make_article("E_FULL").url,
+            "Тестова Стаття",
+            date(2026, 10, 30),
+            date(2026, 11, 1),
+        )
+        assert full.tg_events_message_id == 77
+        assert (no_post.event_end, no_post.tg_events_message_id) == (None, None)
+
+
+class TestDigestRecordContract:
+    """One record per weekend, so a Digest is posted at most once (ADR 0001)."""
+
+    _WEEKEND = date(2026, 10, 30)
+
+    async def test_no_record_for_a_new_weekend(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        assert await any_storage.get_digest(self._WEEKEND) is None
+
+    async def test_started_record_is_publishing_with_its_item_count(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        started = await any_storage.start_digest(self._WEEKEND, item_count=5)
+
+        record = await any_storage.get_digest(self._WEEKEND)
+        assert started is True
+        assert record is not None
+        assert (record.weekend, record.status, record.item_count, record.tg_message_id) == (
+            self._WEEKEND,
+            DigestStatus.PUBLISHING,
+            5,
+            None,
+        )
+        assert datetime.now(UTC) - record.written_at < _HOUR
+
+    async def test_second_start_for_the_same_weekend_is_refused(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.start_digest(self._WEEKEND, item_count=5)
+
+        assert await any_storage.start_digest(self._WEEKEND, item_count=9) is False
+        record = await any_storage.get_digest(self._WEEKEND)
+        assert record is not None
+        assert record.item_count == 5
+
+    async def test_mark_published_keeps_the_message_id(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.start_digest(self._WEEKEND, item_count=5)
+
+        await any_storage.mark_digest_published(self._WEEKEND, message_id=321)
+
+        record = await any_storage.get_digest(self._WEEKEND)
+        assert record is not None
+        assert (record.status, record.tg_message_id, record.item_count) == (
+            DigestStatus.PUBLISHED,
+            321,
+            5,
+        )
+
+    async def test_deleted_record_lets_the_weekend_start_again(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.start_digest(self._WEEKEND, item_count=5)
+
+        await any_storage.delete_digest(self._WEEKEND)
+
+        assert await any_storage.get_digest(self._WEEKEND) is None
+        assert await any_storage.start_digest(self._WEEKEND, item_count=4) is True
+
+    async def test_weekends_are_independent(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await any_storage.start_digest(self._WEEKEND, item_count=5)
+
+        assert await any_storage.get_digest(date(2026, 11, 6)) is None
+
+
+class TestPeriodCountsContract:
+    """Counts of Articles last written in a period, per Source: the Weekly report's numbers."""
+
+    _START = datetime(2026, 10, 18, 22, 0, tzinfo=UTC)  # Monday 19.10, 00:00 in Warsaw
+    _END = datetime(2026, 10, 25, 23, 0, tzinfo=UTC)  # Monday 26.10, 00:00 in Warsaw
+
+    async def _save_at(
+        self,
+        storage: InMemoryStorage | TursoStorage,
+        article_id: str,
+        decision: Decision,
+        when: datetime,
+    ) -> None:
+        await storage.save_decision(_make_article(article_id), decision)
+        await _set_last_write(storage, article_id, when)
+
+    async def test_counts_each_outcome_per_id_prefix(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        inside = self._START + _HOUR
+        for article_id, decision in [
+            ("rz24/1", Decision.POSTED),
+            ("rz24/2", Decision.POSTED),
+            ("rz24/3", Decision.SKIPPED),
+            ("rz24/4", Decision.REPEAT),
+            ("rz24/5", Decision.ERROR),
+            ("rzn/1", Decision.POSTED),
+            ("rzn/2", Decision.UNCONFIRMED),
+        ]:
+            await self._save_at(any_storage, article_id, decision, inside)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert counts.by_prefix == {
+            "rz24": {
+                Decision.POSTED: 2,
+                Decision.SKIPPED: 1,
+                Decision.REPEAT: 1,
+                Decision.ERROR: 1,
+            },
+            "rzn": {Decision.POSTED: 1, Decision.UNCONFIRMED: 1},
+        }
+
+    async def test_period_includes_its_start_and_excludes_its_end(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        for article_id, when in [
+            ("rz24/AT_START", self._START),
+            ("rz24/BEFORE", self._START - timedelta(microseconds=1)),
+            ("rz24/LAST", self._END - timedelta(microseconds=1)),
+            ("rz24/AT_END", self._END),
+        ]:
+            await self._save_at(any_storage, article_id, Decision.POSTED, when)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert counts.by_prefix == {"rz24": {Decision.POSTED: 2}}
+
+    async def test_counts_posted_events_and_those_without_an_event_date(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await _save_event(any_storage, "rz24/DATED", date(2026, 10, 24))
+        await _save_event(any_storage, "rz24/UNDATED", None)
+        await _save_event(any_storage, "rzn/UNDATED", None)
+        await _save_event(any_storage, "rz24/SKIPPED_EVENT", None, decision=Decision.SKIPPED)
+        await _save_event(any_storage, "rz24/NEWS", None, is_event=False)
+        for article_id in ("rz24/DATED", "rz24/UNDATED", "rzn/UNDATED", "rz24/SKIPPED_EVENT"):
+            await _set_last_write(any_storage, article_id, self._START + _HOUR)
+        await _set_last_write(any_storage, "rz24/NEWS", self._START + _HOUR)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert (counts.events_posted, counts.events_posted_undated) == (3, 2)
+
+    async def test_empty_period_counts_nothing(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        await self._save_at(any_storage, "rz24/OLD", Decision.POSTED, self._START - _HOUR)
+
+        counts = await any_storage.period_counts(self._START, self._END)
+
+        assert (counts.by_prefix, counts.events_posted, counts.events_posted_undated) == ({}, 0, 0)

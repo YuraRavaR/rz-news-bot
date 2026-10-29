@@ -7,14 +7,21 @@ rzeszow24.info
 rzeszow-news.pl
 ---------------
   parse_rzeszow_news_page(html)   — homepage td_module_10 cards
+
+erzeszow.pl (the Calendar, read only for the Digest)
+----------------------------------------------------
+  parse_calendar_day(body, base_url) — one day's JSON response from the day picker
 """
 
+import json
 import re
+from datetime import date
 from typing import Final
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
-from rz_flow.models import Article, Category
+from rz_flow.models import Article, CalendarEntry, Category
 
 # Regex to extract the unique article ID from the URL tail
 # URL pattern: https://rzeszow24.info/{category}/{slug}/{ID}
@@ -215,3 +222,69 @@ def parse_rzeszow_news_page(html: str) -> list[Article]:
         )
 
     return list(articles.values())
+
+
+# ── erzeszow.pl Calendar ──────────────────────────────────────────────────────
+
+# URL pattern: /41-miasto-rzeszow/6241-kalendarz-imprez/{ID}-{slug}.html
+_CALENDAR_ID_RE: Final = re.compile(r"/(\d+)-[^/]*\.html$")
+_CALENDAR_DATE_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+class CalendarParseError(ValueError):
+    """A Calendar response that does not have the expected shape."""
+
+
+def _calendar_entry(article: Tag, base_url: str) -> CalendarEntry | None:
+    link = article.select_one("h2 a[href]")
+    dates_el = article.select_one(".modal__event--data")
+    if link is None or dates_el is None:
+        return None
+    url = urljoin(base_url, str(link["href"]))
+    id_match = _CALENDAR_ID_RE.search(url)
+    title = link.get_text(strip=True)
+    dates = _CALENDAR_DATE_RE.findall(dates_el.get_text(" ", strip=True))
+    if id_match is None or not title or not dates:
+        return None
+    try:
+        start = date.fromisoformat(dates[0])
+        end = date.fromisoformat(dates[1]) if len(dates) > 1 else None
+    except ValueError:
+        return None
+    return CalendarEntry(
+        id=int(id_match.group(1)),
+        url=url,
+        title_pl=title,
+        start=start,
+        end=end if end != start else None,
+    )
+
+
+def parse_calendar_day(body: str, base_url: str) -> list[CalendarEntry]:
+    """Parse one day of the Calendar: the JSON its day picker gets, holding the list's HTML.
+
+    The list has two tabs, one-day and multi-day entries; both are returned, each entry
+    once. An entry without a title, a date or a numeric ID in its URL is skipped.
+
+    Raises:
+        CalendarParseError: the body is not that JSON, or the HTML has neither tab.
+    """
+    try:
+        html = json.loads(body)["html"]
+    except (ValueError, TypeError, KeyError) as exc:
+        raise CalendarParseError(f"not a Calendar day response: {exc}") from exc
+    if not isinstance(html, str):
+        raise CalendarParseError("not a Calendar day response: html is not a string")
+
+    soup = BeautifulSoup(html, "lxml")
+    panes = soup.select("#events-oneday, #events-multidays")
+    if not panes:
+        raise CalendarParseError("no event list in the Calendar day response")
+
+    entries: dict[int, CalendarEntry] = {}
+    for pane in panes:
+        for article in pane.find_all("article"):
+            entry = _calendar_entry(article, base_url)
+            if entry is not None and entry.id not in entries:
+                entries[entry.id] = entry
+    return list(entries.values())

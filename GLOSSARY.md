@@ -31,6 +31,22 @@ A secondary channel that additionally gets Articles about upcoming events. Reach
 The day an event takes place, or its first and last day when it lasts several days. The AI reads it from the Article's title and lead, resolving relative dates ("w sobotę") against the day of the Run. When the text gives no date, the event has none: a date is never guessed. Events channel Posts show it; Main channel Posts do not.
 _Avoid_: deadline, publication date
 
+**Digest** (Дайджест):
+One Events channel Post listing the coming weekend's events (Friday to Sunday, Europe/Warsaw), grouped by day, each linking to its Events channel Post (or to its Article when it has none). It lists Published events whose Event date overlaps the weekend (events without one are left out) and the weekend's Calendar entries, translated into Ukrainian, that the AI finds interesting and not the same event as a listed news event; those link to their Calendar page. It is posted at most once per weekend, and not at all with fewer than three items.
+_Avoid_: summary, newsletter, roundup
+
+**Calendar** (Календар подій):
+The city hall's events calendar on erzeszow.pl, listing events of city institutions (libraries, culture houses, galleries). It is read only for the Digest, one request per weekend day, and is not a Source: it never goes through a Run, the Repeat check or storage.
+_Avoid_: source, feed, schedule
+
+**Calendar entry** (Запис календаря):
+One event listed in the Calendar, with a Polish title, a start day, an optional last day and a link. It is not an Article. The Digest considers an entry that lasts at most three days and overlaps the weekend, or a longer one only in the weekend it starts, so a months-long exhibition appears once.
+_Avoid_: article, event (on its own)
+
+**Weekly report** (Тижневий звіт):
+A report to the admin chat about the previous Monday–Sunday (Europe/Warsaw), built from storage alone: per Source, how many Articles were new, Published, Skipped, Repeats, Errors and Unconfirmed; events posted and how many had no Event date; an estimate of Gemini requests on the busiest day against the free-tier limit; whether that weekend's Digest went out; and a warning when Published fell by more than half against the week before. An Article counts in the week of its last write. It costs no Gemini requests.
+_Avoid_: digest (that is the Events channel Post), run report (that covers one Run)
+
 **Post** (Пост):
 One message in one Channel.
 _Avoid_: publication, message

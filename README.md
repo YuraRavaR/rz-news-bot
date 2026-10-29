@@ -48,8 +48,10 @@ src/rz_flow/
 ├── storage.py         — TursoStorage (production) + InMemoryStorage (tests)
 ├── telegram.py        — Telegram Bot API publisher
 ├── pipeline.py        — pipeline orchestrator: scrape → filter → AI → publish → save
+├── digest.py          — the weekend Digest for the Events channel (--digest)
+├── weekly_report.py   — last week's report to the admin chat (--weekly-report)
 ├── logging_config.py  — pretty TTY renderer locally, JSON for CI
-└── main.py            — CLI entry point (--dry-run, --staging, --init-db)
+└── main.py            — CLI entry point (--dry-run, --staging, --init-db, --digest, --weekly-report)
 ```
 
 ---
@@ -128,6 +130,24 @@ uv run rz-flow --staging --dry-run
 
 ```bash
 uv run rz-flow
+```
+
+### 7. Weekend Digest
+
+Posts one Digest of the coming weekend's (Friday–Sunday, Europe/Warsaw) Published events with an Event date to the Events channel, at most once per weekend, and exits. With fewer than three events nothing is posted and the admin gets an alert. `--dry-run` sends the text to the admin chat and writes nothing; `--staging` uses the staging DB and staging Events channel.
+
+```bash
+uv run rz-flow --digest --dry-run
+uv run rz-flow --digest
+```
+
+### 8. Weekly report
+
+Sends a report about the previous Monday–Sunday (Europe/Warsaw) to the admin chat and exits: per Source, how many Articles were new, Published, Skipped, Repeats, Errors and Unconfirmed; events posted and how many had no Event date; an estimate of Gemini requests on the busiest day against the free-tier 500; whether that week's Digest went out; and a ⚠️ when Published fell by more than half against the week before. It only reads storage (no Gemini, no scraping). `--dry-run` adds a banner; `--staging` reads the staging DB.
+
+```bash
+uv run rz-flow --weekly-report --dry-run
+uv run rz-flow --weekly-report
 ```
 
 ---
@@ -210,9 +230,10 @@ A failure means the parser needs updating — refresh the fixtures in `tests/fix
 |---|---|---|
 | `ci.yml` | push (non-`main`), PR | ruff check, ruff format --check, mypy, pytest on Python 3.12 |
 | `publish.yml` | schedule + manual | The actual bot run |
+| `digest-and-report.yml` | Friday + Monday 08:23 UTC + manual | `--digest` on Friday, `--weekly-report` on Monday |
 | `canary.yml` | daily + manual | Live scrape of both sources |
 
-`publish.yml` can be triggered manually with optional `dry_run` and `staging` flags (`workflow_dispatch` inputs).
+`publish.yml` can be triggered manually with optional `dry_run` and `staging` flags (`workflow_dispatch` inputs). `digest-and-report.yml` takes the same two flags plus `mode` (`digest` or `weekly-report`); it shares `publish.yml`'s concurrency group, so it never overlaps a Run.
 
 **Required GitHub Secrets** (`Settings → Secrets and variables → Actions`):
 

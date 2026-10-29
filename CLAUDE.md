@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Rz-Flow: a scheduled batch job (not a long-running bot) that scrapes Rzeszów local news, has Gemini score/translate each article into Ukrainian, and posts the good ones to a Telegram channel. Runs on GitHub Actions cron (`publish.yml`); state lives in Turso (cloud SQLite). Python 3.12 (pinned in `.python-version`), managed with `uv` (pinned to 0.11.8 in every workflow). Dependabot opens weekly grouped update PRs against `stage`.
+Rz-Flow: a scheduled batch job (not a long-running bot) that scrapes Rzeszów local news, has Gemini score/translate each article into Ukrainian, and posts the good ones to a Telegram channel. Runs on GitHub Actions cron (`publish.yml`; `digest-and-report.yml` runs `--digest` on Fridays and `--weekly-report` on Mondays in the same concurrency group); state lives in Turso (cloud SQLite). Python 3.12 (pinned in `.python-version`), managed with `uv` (pinned to 0.11.8 in every workflow). Dependabot opens weekly grouped update PRs against `stage`.
 
 ## Commands
 
@@ -21,6 +21,8 @@ uv run mypy                                     # strict mode, configured in pyp
 uv run rz-flow --dry-run                        # evaluate with Gemini, no Telegram posts, no DB writes
 uv run rz-flow --staging [--dry-run]            # staging channel + staging Turso DB
 uv run rz-flow --init-db [--staging]            # create/migrate tables and exit
+uv run rz-flow --digest [--dry-run] [--staging] # post the weekend Digest (digest.py) and exit
+uv run rz-flow --weekly-report [--dry-run] [--staging] # last week's report to the admin chat
 ```
 
 Running the CLI needs a filled `.env` (see `.env.example`); set `APP_ENV=development` locally to suppress crash/quota alerts. Coverage must stay ≥ 70% (`fail_under`). Ruff enforces `ANN` (type annotations) in `src/` but not in `tests/`.
@@ -44,6 +46,12 @@ Flow: `main.py` → `Pipeline.run()` in `pipeline.py`, which goes through these 
 3. **Repeat check + evaluate + publish**, one article at a time. First `StoryIndex.find_original` (`dedup.py`) looks for an original: an Article the AI judged earlier in this Run (Published, Skipped or Publishing; never Error or Deferred) or a stored AI-judged row whose last write is within 72 hours (`storage.recent_judged_articles`, read once per Run and only when there are new Articles: Published, Skipped, Publishing, Unconfirmed) with the same normalised title (any Source) or the same slug from the same Source (`ScraperSource.slug`). A match is a Repeat: no Gemini call, no Post, saved as `REPEAT` with `repeat_of` = the original's ID, listed in the run report next to its original. Without a match, a title with token Jaccard ≥ 0.5 (`NEAR_MATCH_THRESHOLD`) against the same pool still goes to Gemini but gets a near-match hint in the run report (never stored). Otherwise `GeminiAIFilter.evaluate` (structured output → `AIDecision`), then `mark_publishing` and `TelegramPublisher.publish` to the main channel (that failure is fatal for the article). Event articles then go to the events channel with a single attempt (`publish_once`); that failure is non-fatal, shown in the run report and never retried. If `mark_publishing` fails, nothing is sent and the Run stops. Any `StopSignal` other than `CONTINUE` (post cap, Gemini quota, publishing blocked, Telegram rate limited) stops the loop through `Pipeline._stop_early`.
 4. **Persist**: `save_decision` with in-process retries. If a post is published but never saved, the row stays Publishing (the next Run makes it Unconfirmed) and an admin alert says no Duplicate will follow.
 
+`--digest` skips all of this: `digest.run_digest` reads `storage.published_events_between` for the coming Friday–Sunday (Europe/Warsaw) plus the weekend's Calendar entries, and posts one Digest to the Events channel. The Calendar entries go to Gemini in one request (`GeminiAIFilter.judge_calendar`, none without entries) with the window's news events, which returns per entry a Ukrainian title, `is_interesting` and `same_as` (a news event's ID); uninteresting and `same_as` entries are dropped. A Calendar or AI failure gives a news-only Digest plus an admin alert. Past 4096 characters Calendar entries are dropped first, then news events from the end. It is at most once per weekend through the `digests` table (`start_digest` writes `publishing` before sending; definite non-delivery deletes the row, uncertain delivery keeps it).
+
+`--weekly-report` also skips the Run: `weekly_report.run_weekly_report` reads `storage.period_counts` (per ID prefix and outcome, by `seen_at`) for the previous Monday–Sunday in Europe/Warsaw, the week before it and each of its days, plus that weekend's Digest record, and sends the Weekly report to the admin chat only (never a channel fallback), packed like the run report. The busiest-day Gemini figure is AI-judged rows, an estimate.
+
+The Calendar (`city_calendar.py`, deliberately not `calendar.py`) is the city's events calendar, read only for the Digest and never a Source. `read_weekend_calendar` makes one day-picker request per weekend day (`parser.parse_calendar_day`), merges entries by URL ID, keeps the ones `in_weekend` allows, and never raises: a failure comes back as `CalendarReading.failure`, an admin-alert text. `config.yaml` `digest.enabled: false` skips it without a request.
+
 After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMIN_CHAT_ID` and writes a GitHub step summary.
 
 ### Retry/persistence semantics (the subtle part)
@@ -57,11 +65,11 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 ### Configuration split
 
 - `config.py` (`Settings`, pydantic-settings): secrets and env vars (`AI_MIN_SCORE`, `SCRAPER_TIMEOUT`, `APP_ENV`, …).
-- `flow_config.py`: loads `config.yaml`, which defines the sources list (scraper class name, URL, `max_articles`, `enabled`), the Gemini model (`pipeline.gemini_model`, required; there is no env override) and pipeline pacing and caps. The same committed file is used in CI.
+- `flow_config.py`: loads `config.yaml`, which defines the sources list (scraper class name, URL, `max_articles`, `enabled`), the Gemini model (`pipeline.gemini_model`, required; there is no env override), pipeline pacing and caps, and the Digest's Calendar (`digest.calendar_url`, `digest.enabled`). The same committed file is used in CI.
 
 ### Adding a news source
 
-1. Create `sources/<site>.py` with a class that satisfies the `ScraperSource` protocol (`name`, `url`, `slug(url)`, `async fetch(client, max_articles)`), with the HTML parsing in `parser.py`.
+1. Create `sources/<site>.py` with a class that satisfies the `ScraperSource` protocol (`name`, `url`, `ID_PREFIX`, `slug(url)`, `async fetch(client, max_articles)`), with the HTML parsing in `parser.py`.
 2. Give it a unique `ID_PREFIX`. Article IDs are stored as `<prefix>/<id>` (`rz24/…`, `rzn/…`) and serve as the dedup key, so changing a prefix re-posts everything from that source.
 3. Register it in `_SCRAPER_REGISTRY` in `sources/__init__.py`.
 4. Add an entry to `config.yaml`.
@@ -77,8 +85,8 @@ Talks to the Bot API directly through httpx, with no bot library. Messages use H
 ## Testing notes
 
 - HTTP is mocked with `respx`. `asyncio_mode = "auto"`, so async tests need no decorator.
-- `conftest.py` has an autouse fixture that sets tenacity's wait to zero on `GeminiAIFilter.evaluate`, `TelegramPublisher._publish_reaching_telegram` and `scraper._fetch_one`. A new `@retry`-decorated function needs adding to that list, or its tests will sleep.
-- Parser tests run against frozen HTML in `tests/fixtures/`. When the daily canary workflow (`canary.yml`, `-m live`) fails, the site's markup changed: update the parser and refresh the fixtures from the live page.
+- `conftest.py` has an autouse fixture that sets tenacity's wait to zero on `GeminiAIFilter.evaluate`, `GeminiAIFilter.judge_calendar`, `TelegramPublisher._publish_reaching_telegram`, `scraper._fetch_one` and `city_calendar._fetch_day`. A new `@retry`-decorated function needs adding to that list, or its tests will sleep.
+- Parser tests run against frozen HTML in `tests/fixtures/`. When the daily canary workflow (`canary.yml`, `-m live`) fails, the site's markup changed: update the parser and refresh the fixtures from the live page (`tests/fixtures/calendar/` holds the Calendar's per-day JSON responses).
 - User-facing strings (posts, admin alerts) are in Ukrainian; logs and code are in English. Logging goes through structlog (`logger.bind(...)`, snake_case event names), with JSON output in CI and pretty output in a TTY.
 
 ## Agent skills

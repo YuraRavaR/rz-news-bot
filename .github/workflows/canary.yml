@@ -1,8 +1,8 @@
 name: Canary
 
 # Fixtures are frozen snapshots, so the normal suite stays green even after a source
-# site changes its markup — the failure only shows up in production as an empty feed.
-# These tests hit the real sites to catch that drift.
+# site (or the city events Calendar) changes its markup — the failure only shows up in
+# production as an empty feed. These tests hit the real sites to catch that drift.
 
 on:
   schedule:
@@ -36,5 +36,5 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Scrape live sources
+      - name: Scrape live sources and the Calendar
         run: uv run pytest -q -m live --no-cov

@@ -1,0 +1,111 @@
+name: Rz-Flow Digest and Weekly report
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# The bot only reads its own source and talks to external APIs.
+permissions:
+  contents: read
+
+on:
+  # Both at 08:23 UTC (09:23 Warsaw in winter, 10:23 in summer), between the 07:23 and
+  # 10:23 publish Runs. The mode comes from which schedule fired, so these two strings
+  # must match the ones in the mode expression below.
+  schedule:
+    - cron: "23 8 * * 5" # Friday → Digest
+    - cron: "23 8 * * 1" # Monday → Weekly report
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Digest (Events channel) or Weekly report (admin chat)"
+        required: true
+        default: "digest"
+        type: choice
+        options:
+          - "digest"
+          - "weekly-report"
+      dry_run:
+        description: "Dry run (send to the admin chat only, write nothing)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      staging:
+        description: "Staging (staging Events channel + staging Turso DB; the Weekly report reads the staging DB)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# Same group as publish.yml: a Digest writes its record to the same Turso DB a Run
+# uses, so neither may start while the other is in progress. Accepted risk: a group
+# holds one running and one pending job, so if a Run is still going when the Digest
+# queues and another Run queues behind it, the pending Digest is cancelled.
+concurrency:
+  group: publish-${{ github.event.inputs.staging == 'true' && 'staging' || 'prod' }}
+  cancel-in-progress: false
+
+jobs:
+  digest-and-report:
+    name: Digest or Weekly report
+    runs-on: ubuntu-latest
+    # Reads storage, the Calendar (a few requests) and one Gemini request at most.
+    timeout-minutes: 10
+    env:
+      MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '23 8 * * 5' && 'digest' || 'weekly-report') || github.event.inputs.mode }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.8"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --no-dev --frozen
+
+      # Storage init runs inside every mode, so there is no separate --init-db step.
+      - name: Run ${{ env.MODE }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TELEGRAM_EVENTS_CHANNEL_ID: ${{ secrets.TELEGRAM_EVENTS_CHANNEL_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          TELEGRAM_STAGING_CHANNEL_ID: ${{ secrets.TELEGRAM_STAGING_CHANNEL_ID }}
+          TELEGRAM_STAGING_EVENTS_CHANNEL_ID: ${{ secrets.TELEGRAM_STAGING_EVENTS_CHANNEL_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_STAGING_DATABASE_URL: ${{ secrets.TURSO_STAGING_DATABASE_URL }}
+          TURSO_STAGING_AUTH_TOKEN: ${{ secrets.TURSO_STAGING_AUTH_TOKEN }}
+        run: |
+          FLAGS="--$MODE"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS="$FLAGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.staging }}" = "true" ]; then
+            FLAGS="$FLAGS --staging"
+          fi
+          uv run --no-dev rz-flow $FLAGS
+
+      - name: Save run summary
+        if: always()
+        run: |
+          echo "## Rz-Flow Digest and Weekly report Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode**: $MODE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry run**: ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Staging**: ${{ github.event.inputs.staging || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

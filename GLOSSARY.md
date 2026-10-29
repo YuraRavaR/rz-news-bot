@@ -32,7 +32,7 @@ The day an event takes place, or its first and last day when it lasts several da
 _Avoid_: deadline, publication date
 
 **Digest** (Дайджест):
-One Events channel Post listing the coming weekend's events (Friday to Sunday, Europe/Warsaw), grouped by day, each linking to its Events channel Post (or to its Article when it has none). It lists Published events whose Event date overlaps the weekend; events without one are left out. It is posted at most once per weekend, and not at all with fewer than three events.
+One Events channel Post listing the coming weekend's events (Friday to Sunday, Europe/Warsaw), grouped by day, each linking to its Events channel Post (or to its Article when it has none). It lists Published events whose Event date overlaps the weekend (events without one are left out) and the weekend's Calendar entries, translated into Ukrainian, that the AI finds interesting and not the same event as a listed news event; those link to their Calendar page. It is posted at most once per weekend, and not at all with fewer than three items.
 _Avoid_: summary, newsletter, roundup
 
 **Calendar** (Календар подій):

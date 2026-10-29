@@ -1,8 +1,14 @@
 """The Digest: one Events channel Post listing the coming weekend's events.
 
 Built from stored Published events with an Event date in the weekend (Friday to
-Sunday, Europe/Warsaw) and posted at most once per weekend (ADR 0001): a record is
-written as Publishing before sending and becomes Published on success.
+Sunday, Europe/Warsaw) and the weekend's Calendar entries, and posted at most once per
+weekend (ADR 0001): a record is written as Publishing before sending and becomes
+Published on success.
+
+Calendar entries are translated, filtered and matched against the news events in one
+Gemini request per Digest (none without entries), about one a week (ADR 0002). When
+the Calendar cannot be read or that request fails, the Digest goes out with news events
+only and the admin is alerted.
 """
 
 from dataclasses import dataclass
@@ -11,8 +17,11 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from rz_flow.ai import GeminiAIFilter
+from rz_flow.city_calendar import read_weekend_calendar
 from rz_flow.config import Settings
-from rz_flow.models import DatedEvent
+from rz_flow.flow_config import FlowConfig
+from rz_flow.models import CalendarEntry, DatedEvent
 from rz_flow.storage import StorageProtocol
 from rz_flow.telegram import (
     _MAX_MESSAGE_LEN,
@@ -71,6 +80,8 @@ class DigestItem:
     url: str
     start: date
     end: date | None
+    # Calendar entries are the first to go when the Digest is too long
+    from_calendar: bool = False
 
 
 def _events_post_url(channel_id: str, message_id: int) -> str | None:
@@ -91,6 +102,12 @@ def _digest_item(event: DatedEvent, events_channel_id: str) -> DigestItem:
         url=url or event.url,
         start=event.event_start,
         end=event.event_end,
+    )
+
+
+def _calendar_item(entry: CalendarEntry, ua_title: str) -> DigestItem:
+    return DigestItem(
+        title=ua_title, url=entry.url, start=entry.start, end=entry.end, from_calendar=True
     )
 
 
@@ -125,19 +142,24 @@ def build_digest(friday: date, items: list[DigestItem], banner: str = "") -> tup
 
     A header, then each weekend day that has items. Each item is listed once, under
     the first weekend day it covers; a multi-day event shows its range. The text is
-    always one message: past Telegram's limit, items are dropped from the end and a
-    last line counts them.
+    always one message: past Telegram's limit, Calendar entries are dropped first, then
+    news events from the end, and a last line counts them.
     """
-    ordered = sorted(items, key=lambda i: _first_day(i, friday))  # stable: keeps storage order
-    for shown in range(len(ordered), 0, -1):
-        text = _render(friday, ordered[:shown], len(ordered) - shown, banner)
+    ordered = sorted(items, key=lambda i: _first_day(i, friday))  # stable: keeps input order
+    # Positions in the order they are dropped: Calendar entries, then news, each from the end
+    drop_order = sorted(range(len(ordered)), key=lambda n: (not ordered[n].from_calendar, -n))
+    for dropped in range(len(ordered)):
+        gone = set(drop_order[:dropped])
+        shown = [item for n, item in enumerate(ordered) if n not in gone]
+        text = _render(friday, shown, dropped, banner)
         if len(text) <= _MAX_MESSAGE_LEN:
-            return text, shown
+            return text, len(shown)
     return _render(friday, [], len(ordered), banner), 0
 
 
 async def run_digest(
     settings: Settings,
+    flow_config: FlowConfig,
     storage: StorageProtocol,
     *,
     today: date | None = None,
@@ -147,7 +169,7 @@ async def run_digest(
     """Build and post the coming weekend's Digest; returns the CLI exit code."""
     friday, sunday = digest_weekend(today or today_in_warsaw())
     try:
-        return await _run_digest(settings, storage, friday, sunday, dry_run, staging)
+        return await _run_digest(settings, flow_config, storage, friday, sunday, dry_run, staging)
     except Exception as exc:
         # An unexpected failure, storage above all; a Publishing record left behind
         # still blocks a second Digest
@@ -163,6 +185,7 @@ async def run_digest(
 
 async def _run_digest(
     settings: Settings,
+    flow_config: FlowConfig,
     storage: StorageProtocol,
     friday: date,
     sunday: date,
@@ -183,13 +206,14 @@ async def _run_digest(
 
     events = await storage.published_events_between(friday, sunday)
     items = [_digest_item(e, events_channel_id) for e in events]
+    items += await _calendar_items(settings, flow_config, friday, sunday, events)
     weekend = format_event_date(friday, sunday)
     if len(items) < MIN_DIGEST_ITEMS:
         log.info("digest_skipped", reason="too_few_items", items=len(items))
         await _alert(
             settings,
-            f"Дайджест на вихідні {weekend} не опубліковано: подій з датою лише "
-            f"{len(items)}, а потрібно щонайменше {MIN_DIGEST_ITEMS}.",
+            f"Дайджест на вихідні {weekend} не опубліковано: подій з датою і записів "
+            f"календаря лише {len(items)}, а потрібно щонайменше {MIN_DIGEST_ITEMS}.",
         )
         return 0
     if dry_run:
@@ -241,6 +265,57 @@ async def _run_digest(
         return 1
     log.info("digest_published", message_id=message_id, items=shown, dropped=len(items) - shown)
     return 0
+
+
+async def _calendar_items(
+    settings: Settings,
+    flow_config: FlowConfig,
+    friday: date,
+    sunday: date,
+    events: list[DatedEvent],
+) -> list[DigestItem]:
+    """The weekend's Calendar entries the AI kept: interesting, and not the same event as
+    a news event. None, with an admin alert, when the Calendar or the AI request fails.
+    """
+    log = logger.bind(weekend=friday.isoformat())
+    news_only = "Дайджест вийде лише з подіями з новин."
+    reading = await read_weekend_calendar(
+        flow_config.digest, friday, timeout=settings.scraper_timeout
+    )
+    if reading.failure is not None:
+        await _alert(settings, f"{reading.failure} {news_only}")
+        return []
+    if not reading.entries:
+        return []
+
+    try:
+        ai = GeminiAIFilter(
+            api_key=settings.gemini_api_key, model=flow_config.pipeline.gemini_model
+        )
+        verdicts = {v.id: v for v in await ai.judge_calendar(reading.entries, events)}
+    except Exception as exc:
+        log.error("digest_calendar_not_judged", error_type=type(exc).__name__, error=str(exc))
+        weekend = format_event_date(friday, sunday)
+        await _alert(
+            settings,
+            f"Записи календаря подій на вихідні {weekend} не оцінено "
+            f"({type(exc).__name__}: {exc}). {news_only}",
+        )
+        return []
+
+    unjudged = [e.id for e in reading.entries if e.id not in verdicts]
+    if unjudged:
+        # Without a Ukrainian title an entry cannot be listed
+        log.warning("digest_calendar_entries_unjudged", entry_ids=unjudged)
+    kept = [
+        _calendar_item(entry, verdict.ua_title)
+        for entry in reading.entries
+        if (verdict := verdicts.get(entry.id)) is not None
+        and verdict.is_interesting
+        and verdict.same_as is None
+    ]
+    log.info("digest_calendar_judged", entries=len(reading.entries), kept=len(kept))
+    return kept
 
 
 async def _send_dry_run(

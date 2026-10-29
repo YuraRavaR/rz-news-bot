@@ -225,6 +225,17 @@ class CalendarEntry(BaseModel):
     end: date | None
 
 
+class CalendarVerdict(BaseModel):
+    """The AI's answer for one Calendar entry in the Digest's request."""
+
+    # The CalendarEntry's ID
+    id: int
+    ua_title: str
+    is_interesting: bool
+    # ID of a news event in the same Digest about the same event; None when there is none
+    same_as: str | None = None
+
+
 class DigestStatus(StrEnum):
     # Written before the Digest is sent; stays when delivery is uncertain
     PUBLISHING = "publishing"

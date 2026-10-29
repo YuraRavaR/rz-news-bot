@@ -69,7 +69,7 @@ async def _async_main(
 
         if digest:
             return await run_digest(
-                settings, storage, today=today, dry_run=dry_run, staging=staging
+                settings, flow_config, storage, today=today, dry_run=dry_run, staging=staging
             )
         if weekly_report:
             return await run_weekly_report(

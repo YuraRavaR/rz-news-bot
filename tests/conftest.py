@@ -24,6 +24,7 @@ def no_retry_backoff() -> Iterator[None]:
 
     retryables = [
         GeminiAIFilter.evaluate,
+        GeminiAIFilter.judge_calendar,
         TelegramPublisher._publish_reaching_telegram,
         _fetch_one,
         _fetch_day,

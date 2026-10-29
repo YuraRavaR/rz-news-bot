@@ -118,7 +118,13 @@ class TelegramRejectedError(Exception):
     """Telegram refused the Post as invalid (a 4xx other than 429).
 
     Retrying cannot help, so it is raised at once and the Article becomes an Error.
+    Also raised for a 2xx without ``ok: true``, which does not prove that nothing
+    was sent; ``status_code`` tells the two apart.
     """
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class TelegramDeliveryUnknownError(Exception):
@@ -664,6 +670,24 @@ class TelegramPublisher:
             chat_id=self._channel_id,
         )
 
+    async def send_digest(self, text: str) -> int:
+        """Send a ready Digest (HTML) to the channel with a single attempt.
+
+        Returns the message ID. Raises what ``_send_message`` raises; the caller
+        decides from it whether the Digest may have gone out.
+        """
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            return await self._send_message(
+                client,
+                {
+                    "chat_id": self._channel_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "link_preview_options": {"is_disabled": True},
+                },
+                chat_id=self._channel_id,
+            )
+
     async def _send_message(
         self, client: httpx.AsyncClient, payload: dict[str, Any], **log_context: str
     ) -> int:
@@ -729,7 +753,7 @@ class TelegramPublisher:
             status = f"HTTP {response.status_code}" + (" ok=false" if response.is_success else "")
             if response.is_server_error:
                 raise TelegramDeliveryUnknownError(f"{status}: {tg_error}")
-            raise TelegramRejectedError(f"{status}: {tg_error}")
+            raise TelegramRejectedError(f"{status}: {tg_error}", status_code=response.status_code)
 
         message_id: int = data["result"]["message_id"]
         return message_id

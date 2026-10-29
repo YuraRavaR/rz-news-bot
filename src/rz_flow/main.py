@@ -7,16 +7,19 @@ Usage:
     uv run rz-flow --staging --dry-run   # staging DB reads only, no writes / no posts
     uv run rz-flow --init-db     # create DB tables and exit
     uv run rz-flow --init-db --staging   # init staging DB only
+    uv run rz-flow --digest [--dry-run] [--staging]   # post the weekend's Digest and exit
 """
 
 import argparse
 import asyncio
 import os
 import sys
+from datetime import date
 
 import structlog
 
 from rz_flow.config import get_settings
+from rz_flow.digest import run_digest
 from rz_flow.flow_config import load_flow_config
 from rz_flow.logging_config import configure_logging
 from rz_flow.pipeline import Pipeline
@@ -28,7 +31,10 @@ async def _async_main(
     dry_run: bool = False,
     init_db_only: bool = False,
     staging: bool = False,
+    digest: bool = False,
+    today: date | None = None,
 ) -> int:
+    """Run one CLI mode; ``today`` (Warsaw) is injectable for the Digest's tests."""
     settings = get_settings()
     flow_config = load_flow_config()
     log = structlog.get_logger("main")
@@ -55,6 +61,11 @@ async def _async_main(
         if init_db_only:
             log.info("db_initialized", staging=staging)
             return 0
+
+        if digest:
+            return await run_digest(
+                settings, storage, today=today, dry_run=dry_run, staging=staging
+            )
 
         pipeline = Pipeline(
             settings=settings,
@@ -158,6 +169,14 @@ def main() -> None:
         action="store_true",
         help="Create DB tables and exit (use with --staging to init staging DB)",
     )
+    parser.add_argument(
+        "--digest",
+        action="store_true",
+        help=(
+            "Post the coming weekend's Digest to the Events channel (at most once per "
+            "weekend) and exit; no scraping, no Run"
+        ),
+    )
     args = parser.parse_args()
 
     # Set up logging before anything else
@@ -169,6 +188,7 @@ def main() -> None:
             dry_run=args.dry_run,
             init_db_only=args.init_db,
             staging=args.staging,
+            digest=args.digest,
         )
     )
     sys.exit(exit_code)

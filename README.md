@@ -48,8 +48,9 @@ src/rz_flow/
 ├── storage.py         — TursoStorage (production) + InMemoryStorage (tests)
 ├── telegram.py        — Telegram Bot API publisher
 ├── pipeline.py        — pipeline orchestrator: scrape → filter → AI → publish → save
+├── digest.py          — the weekend Digest for the Events channel (--digest)
 ├── logging_config.py  — pretty TTY renderer locally, JSON for CI
-└── main.py            — CLI entry point (--dry-run, --staging, --init-db)
+└── main.py            — CLI entry point (--dry-run, --staging, --init-db, --digest)
 ```
 
 ---
@@ -128,6 +129,15 @@ uv run rz-flow --staging --dry-run
 
 ```bash
 uv run rz-flow
+```
+
+### 7. Weekend Digest
+
+Posts one Digest of the coming weekend's (Friday–Sunday, Europe/Warsaw) Published events with an Event date to the Events channel, at most once per weekend, and exits. With fewer than three events nothing is posted and the admin gets an alert. `--dry-run` sends the text to the admin chat and writes nothing; `--staging` uses the staging DB and staging Events channel.
+
+```bash
+uv run rz-flow --digest --dry-run
+uv run rz-flow --digest
 ```
 
 ---

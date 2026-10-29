@@ -197,3 +197,33 @@ class PublishResult(BaseModel):
     article_id: str
     message_id: int
     chat_id: str
+
+
+class DatedEvent(BaseModel):
+    """A Published event with an Event date: one possible Digest item."""
+
+    id: str
+    url: str
+    title_pl: str
+    ua_title: str | None
+    event_start: date
+    # None for a single-day event
+    event_end: date | None
+    # None when the Events channel Post failed or was never sent
+    tg_events_message_id: int | None
+
+
+class DigestStatus(StrEnum):
+    # Written before the Digest is sent; stays when delivery is uncertain
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+
+
+class DigestRecord(BaseModel):
+    """The one Digest of a weekend, keyed by its Friday."""
+
+    weekend: date
+    status: DigestStatus
+    tg_message_id: int | None = None
+    item_count: int
+    written_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

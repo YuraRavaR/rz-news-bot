@@ -21,6 +21,7 @@ uv run mypy                                     # strict mode, configured in pyp
 uv run rz-flow --dry-run                        # evaluate with Gemini, no Telegram posts, no DB writes
 uv run rz-flow --staging [--dry-run]            # staging channel + staging Turso DB
 uv run rz-flow --init-db [--staging]            # create/migrate tables and exit
+uv run rz-flow --digest [--dry-run] [--staging] # post the weekend Digest (digest.py) and exit
 ```
 
 Running the CLI needs a filled `.env` (see `.env.example`); set `APP_ENV=development` locally to suppress crash/quota alerts. Coverage must stay ≥ 70% (`fail_under`). Ruff enforces `ANN` (type annotations) in `src/` but not in `tests/`.
@@ -43,6 +44,8 @@ Flow: `main.py` → `Pipeline.run()` in `pipeline.py`, which goes through these 
 2. **Dedup**: `storage.filter_new_ids` returns IDs not yet settled. Articles are then reordered round-robin across sources, oldest first. `Pipeline._check_source_windows` flags (in the run report) every Source that returned its full `max_articles` window with none of it already in storage (retryable Errors count as stored; `storage.existing_ids` is read only when some window looks all new).
 3. **Repeat check + evaluate + publish**, one article at a time. First `StoryIndex.find_original` (`dedup.py`) looks for an original: an Article the AI judged earlier in this Run (Published, Skipped or Publishing; never Error or Deferred) or a stored AI-judged row whose last write is within 72 hours (`storage.recent_judged_articles`, read once per Run and only when there are new Articles: Published, Skipped, Publishing, Unconfirmed) with the same normalised title (any Source) or the same slug from the same Source (`ScraperSource.slug`). A match is a Repeat: no Gemini call, no Post, saved as `REPEAT` with `repeat_of` = the original's ID, listed in the run report next to its original. Without a match, a title with token Jaccard ≥ 0.5 (`NEAR_MATCH_THRESHOLD`) against the same pool still goes to Gemini but gets a near-match hint in the run report (never stored). Otherwise `GeminiAIFilter.evaluate` (structured output → `AIDecision`), then `mark_publishing` and `TelegramPublisher.publish` to the main channel (that failure is fatal for the article). Event articles then go to the events channel with a single attempt (`publish_once`); that failure is non-fatal, shown in the run report and never retried. If `mark_publishing` fails, nothing is sent and the Run stops. Any `StopSignal` other than `CONTINUE` (post cap, Gemini quota, publishing blocked, Telegram rate limited) stops the loop through `Pipeline._stop_early`.
 4. **Persist**: `save_decision` with in-process retries. If a post is published but never saved, the row stays Publishing (the next Run makes it Unconfirmed) and an admin alert says no Duplicate will follow.
+
+`--digest` skips all of this: `digest.run_digest` reads `storage.published_events_between` for the coming Friday–Sunday (Europe/Warsaw) and posts one Digest to the Events channel. It is at most once per weekend through the `digests` table (`start_digest` writes `publishing` before sending; definite non-delivery deletes the row, uncertain delivery keeps it).
 
 After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMIN_CHAT_ID` and writes a GitHub step summary.
 

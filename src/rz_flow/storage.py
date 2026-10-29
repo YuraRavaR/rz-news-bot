@@ -18,7 +18,10 @@ import libsql_client
 from rz_flow.models import (
     AIDecision,
     Article,
+    DatedEvent,
     Decision,
+    DigestRecord,
+    DigestStatus,
     JudgedArticle,
     PostRecord,
     UnconfirmedArticle,
@@ -45,6 +48,17 @@ CREATE TABLE IF NOT EXISTS posts (
     repeat_of             TEXT,
     event_start           TEXT,
     event_end             TEXT
+);
+"""
+
+# One row per weekend (keyed by its Friday): the Digest is posted at most once
+_CREATE_DIGESTS_TABLE = """
+CREATE TABLE IF NOT EXISTS digests (
+    weekend        TEXT PRIMARY KEY,
+    status         TEXT NOT NULL,
+    tg_message_id  INTEGER,
+    item_count     INTEGER NOT NULL,
+    written_at     TEXT NOT NULL
 );
 """
 
@@ -168,6 +182,34 @@ class StorageProtocol(Protocol):
         """
         ...
 
+    async def published_events_between(self, start: date, end: date) -> list[DatedEvent]:
+        """Published events whose Event date overlaps ``start..end`` (both included),
+        by first day then ID. A missing end means a single day; undated events are
+        left out.
+        """
+        ...
+
+    async def get_digest(self, weekend: date) -> DigestRecord | None:
+        """The Digest record of the weekend starting on Friday ``weekend``, if any."""
+        ...
+
+    async def start_digest(self, weekend: date, item_count: int) -> bool:
+        """Record the weekend's Digest as Publishing before it is sent.
+
+        Returns False, writing nothing, when the weekend already has a record.
+        """
+        ...
+
+    async def mark_digest_published(self, weekend: date, message_id: int) -> None:
+        """The Digest went out: record it Published with its message ID."""
+        ...
+
+    async def delete_digest(self, weekend: date) -> None:
+        """Drop the weekend's record after a Digest that definitely did not go out,
+        so a manual re-run can post it.
+        """
+        ...
+
     async def close(self) -> None:
         """Release resources (connection pool, etc.)."""
         ...
@@ -212,6 +254,7 @@ class TursoStorage:
         client = self._get_client()
         await client.execute(_CREATE_TABLE)
         await client.execute(_CREATE_INDEX)
+        await client.execute(_CREATE_DIGESTS_TABLE)
         await self._migrate(client)
 
     async def _migrate(self, client: libsql_client.Client) -> None:
@@ -386,6 +429,78 @@ class TursoStorage:
         )
         return [JudgedArticle(id=r[0], url=r[1], title_pl=r[2]) for r in result.rows]
 
+    async def published_events_between(self, start: date, end: date) -> list[DatedEvent]:
+        result = await self._get_client().execute(
+            """
+            SELECT id, url, title_pl, ua_title, event_start, event_end, tg_events_message_id
+            FROM posts
+            WHERE decision = ? AND is_event = 1 AND event_start IS NOT NULL
+              AND event_start <= ? AND COALESCE(event_end, event_start) >= ?
+            ORDER BY event_start, id
+            """,
+            [Decision.POSTED.value, end.isoformat(), start.isoformat()],
+        )
+        return [
+            DatedEvent(
+                id=r[0],
+                url=r[1],
+                title_pl=r[2],
+                ua_title=r[3],
+                event_start=date.fromisoformat(r[4]),
+                event_end=date.fromisoformat(r[5]) if r[5] else None,
+                tg_events_message_id=r[6],
+            )
+            for r in result.rows
+        ]
+
+    async def get_digest(self, weekend: date) -> DigestRecord | None:
+        result = await self._get_client().execute(
+            "SELECT status, tg_message_id, item_count, written_at FROM digests WHERE weekend = ?",
+            [weekend.isoformat()],
+        )
+        if not result.rows:
+            return None
+        status, message_id, item_count, written_at = result.rows[0]
+        return DigestRecord(
+            weekend=weekend,
+            status=DigestStatus(status),
+            tg_message_id=message_id,
+            item_count=item_count,
+            written_at=datetime.fromisoformat(written_at),
+        )
+
+    async def start_digest(self, weekend: date, item_count: int) -> bool:
+        result = await self._get_client().execute(
+            """
+            INSERT INTO digests (weekend, status, item_count, written_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(weekend) DO NOTHING
+            """,
+            [
+                weekend.isoformat(),
+                DigestStatus.PUBLISHING.value,
+                item_count,
+                datetime.now(UTC).isoformat(),
+            ],
+        )
+        return bool(result.rows_affected == 1)
+
+    async def mark_digest_published(self, weekend: date, message_id: int) -> None:
+        await self._get_client().execute(
+            "UPDATE digests SET status = ?, tg_message_id = ?, written_at = ? WHERE weekend = ?",
+            [
+                DigestStatus.PUBLISHED.value,
+                message_id,
+                datetime.now(UTC).isoformat(),
+                weekend.isoformat(),
+            ],
+        )
+
+    async def delete_digest(self, weekend: date) -> None:
+        await self._get_client().execute(
+            "DELETE FROM digests WHERE weekend = ?", [weekend.isoformat()]
+        )
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
@@ -401,6 +516,7 @@ class InMemoryStorage:
 
     def __init__(self, max_error_attempts: int = DEFAULT_MAX_ERROR_ATTEMPTS) -> None:
         self._records: dict[str, PostRecord] = {}
+        self._digests: dict[date, DigestRecord] = {}
         self._max_error_attempts = max_error_attempts
 
     async def init(self) -> None:
@@ -491,6 +607,52 @@ class InMemoryStorage:
         ]
         judged.sort(key=lambda r: r.seen_at)
         return [JudgedArticle(id=r.id, url=r.url, title_pl=r.title_pl) for r in judged]
+
+    async def published_events_between(self, start: date, end: date) -> list[DatedEvent]:
+        events = [
+            DatedEvent(
+                id=r.id,
+                url=r.url,
+                title_pl=r.title_pl,
+                ua_title=r.ua_title,
+                event_start=r.event_start,
+                event_end=r.event_end,
+                tg_events_message_id=r.tg_events_message_id,
+            )
+            for r in self._records.values()
+            if r.decision == Decision.POSTED
+            and r.is_event
+            and r.event_start is not None
+            and r.event_start <= end
+            and (r.event_end or r.event_start) >= start
+        ]
+        events.sort(key=lambda e: (e.event_start, e.id))
+        return events
+
+    async def get_digest(self, weekend: date) -> DigestRecord | None:
+        return self._digests.get(weekend)
+
+    async def start_digest(self, weekend: date, item_count: int) -> bool:
+        if weekend in self._digests:
+            return False
+        self._digests[weekend] = DigestRecord(
+            weekend=weekend, status=DigestStatus.PUBLISHING, item_count=item_count
+        )
+        return True
+
+    async def mark_digest_published(self, weekend: date, message_id: int) -> None:
+        record = self._digests.get(weekend)
+        if record is not None:
+            self._digests[weekend] = record.model_copy(
+                update={
+                    "status": DigestStatus.PUBLISHED,
+                    "tg_message_id": message_id,
+                    "written_at": datetime.now(UTC),
+                }
+            )
+
+    async def delete_digest(self, weekend: date) -> None:
+        self._digests.pop(weekend, None)
 
     async def close(self) -> None:
         pass

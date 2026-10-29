@@ -31,6 +31,10 @@ A secondary channel that additionally gets Articles about upcoming events. Reach
 The day an event takes place, or its first and last day when it lasts several days. The AI reads it from the Article's title and lead, resolving relative dates ("w sobotę") against the day of the Run. When the text gives no date, the event has none: a date is never guessed. Events channel Posts show it; Main channel Posts do not.
 _Avoid_: deadline, publication date
 
+**Digest** (Дайджест):
+One Events channel Post listing the coming weekend's events (Friday to Sunday, Europe/Warsaw), grouped by day, each linking to its Events channel Post (or to its Article when it has none). It lists Published events whose Event date overlaps the weekend; events without one are left out. It is posted at most once per weekend, and not at all with fewer than three events.
+_Avoid_: summary, newsletter, roundup
+
 **Post** (Пост):
 One message in one Channel.
 _Avoid_: publication, message

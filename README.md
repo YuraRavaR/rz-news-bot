@@ -230,9 +230,10 @@ A failure means the parser needs updating — refresh the fixtures in `tests/fix
 |---|---|---|
 | `ci.yml` | push (non-`main`), PR | ruff check, ruff format --check, mypy, pytest on Python 3.12 |
 | `publish.yml` | schedule + manual | The actual bot run |
+| `digest-and-report.yml` | Friday + Monday 08:23 UTC + manual | `--digest` on Friday, `--weekly-report` on Monday |
 | `canary.yml` | daily + manual | Live scrape of both sources |
 
-`publish.yml` can be triggered manually with optional `dry_run` and `staging` flags (`workflow_dispatch` inputs).
+`publish.yml` can be triggered manually with optional `dry_run` and `staging` flags (`workflow_dispatch` inputs). `digest-and-report.yml` takes the same two flags plus `mode` (`digest` or `weekly-report`); it shares `publish.yml`'s concurrency group, so it never overlaps a Run.
 
 **Required GitHub Secrets** (`Settings → Secrets and variables → Actions`):
 

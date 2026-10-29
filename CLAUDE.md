@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Rz-Flow: a scheduled batch job (not a long-running bot) that scrapes Rzeszów local news, has Gemini score/translate each article into Ukrainian, and posts the good ones to a Telegram channel. Runs on GitHub Actions cron (`publish.yml`); state lives in Turso (cloud SQLite). Python 3.12 (pinned in `.python-version`), managed with `uv` (pinned to 0.11.8 in every workflow). Dependabot opens weekly grouped update PRs against `stage`.
+Rz-Flow: a scheduled batch job (not a long-running bot) that scrapes Rzeszów local news, has Gemini score/translate each article into Ukrainian, and posts the good ones to a Telegram channel. Runs on GitHub Actions cron (`publish.yml`; `digest-and-report.yml` runs `--digest` on Fridays and `--weekly-report` on Mondays in the same concurrency group); state lives in Turso (cloud SQLite). Python 3.12 (pinned in `.python-version`), managed with `uv` (pinned to 0.11.8 in every workflow). Dependabot opens weekly grouped update PRs against `stage`.
 
 ## Commands
 

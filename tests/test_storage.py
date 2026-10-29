@@ -544,6 +544,7 @@ class TestTursoStorageMigrations:
             "repeat_of",
             "event_start",
             "event_end",
+            "summary_pl",
         }
         await storage.close()
 
@@ -922,6 +923,51 @@ class TestEventDateContract:
         await any_storage.save_decision(article, Decision.ERROR)
 
         assert await _event_date(any_storage, article.id) == (None, None)
+
+
+async def _lead(storage: InMemoryStorage | TursoStorage, article_id: str) -> str | None:
+    if isinstance(storage, InMemoryStorage):
+        record = storage.get_record(article_id)
+        assert record is not None
+        return record.summary_pl
+    return (await _fetch_row(storage, article_id))["summary_pl"]
+
+
+class TestLeadContract:
+    """The Polish lead is stored with every row, so the AI's input can be rebuilt later."""
+
+    @pytest.mark.parametrize(
+        "decision", [Decision.POSTED, Decision.SKIPPED, Decision.ERROR, Decision.REPEAT]
+    )
+    async def test_lead_is_stored_with_every_outcome(
+        self, any_storage: InMemoryStorage | TursoStorage, decision: Decision
+    ) -> None:
+        article = _make_article("LEAD_SAVED_123456")
+
+        await any_storage.save_decision(article, decision)
+
+        assert await _lead(any_storage, article.id) == "Test summary."
+
+    async def test_publishing_row_carries_the_lead(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("LEAD_PUB_12345678")
+
+        await any_storage.mark_publishing(article)
+
+        assert await _lead(any_storage, article.id) == "Test summary."
+
+    async def test_publishing_over_an_error_row_stores_the_lead_just_judged(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("LEAD_PUB_ERR_1234")
+        await any_storage.save_decision(
+            article.model_copy(update={"summary_pl": "Old lead."}), Decision.ERROR
+        )
+
+        await any_storage.mark_publishing(article)
+
+        assert await _lead(any_storage, article.id) == "Test summary."
 
 
 async def _save_event(

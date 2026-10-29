@@ -153,6 +153,8 @@ class PostRecord(BaseModel):
     url: str
     category: Category
     title_pl: str
+    # None on rows written before the lead was stored; "" when the Source gives none
+    summary_pl: str | None = None
     seen_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     decision: Decision
     ai_score: float | None = None

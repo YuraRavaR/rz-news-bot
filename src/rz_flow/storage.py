@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS posts (
     error_attempts        INTEGER NOT NULL DEFAULT 0,
     repeat_of             TEXT,
     event_start           TEXT,
-    event_end             TEXT
+    event_end             TEXT,
+    summary_pl            TEXT
 );
 """
 
@@ -82,6 +83,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str]] = [
     # Event date as ISO YYYY-MM-DD; rows from before it have none (not backfilled)
     ("event_start", "TEXT"),
     ("event_end", "TEXT"),
+    # The Polish lead the AI saw; rows from before it have none (not backfilled)
+    ("summary_pl", "TEXT"),
 ]
 
 # Data migrations — one-time UPDATE statements that backfill existing rows.
@@ -157,9 +160,9 @@ class StorageProtocol(Protocol):
         """Record the Article as Publishing before its Main channel Post.
 
         With no row, inserts a minimal one. Over an Error row, changes only the
-        outcome and the last write (now, the time of the Post): the attempt count
-        and every other column stay untouched. Returns the row it replaced (None
-        or an Error).
+        outcome, the lead (the one just judged) and the last write (now, the time
+        of the Post): the attempt count and every other column stay untouched.
+        Returns the row it replaced (None or an Error).
         """
         ...
 
@@ -325,12 +328,13 @@ class TursoStorage:
               (id, url, category, title_pl, seen_at, decision,
                ai_score, ai_reason, is_event, tg_message_id, tg_events_message_id,
                ua_title, ua_summary, category_tag, error_attempts, repeat_of,
-               event_start, event_end)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               event_start, event_end, summary_pl)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 url                  = excluded.url,
                 category             = excluded.category,
                 title_pl             = excluded.title_pl,
+                summary_pl           = excluded.summary_pl,
                 seen_at              = excluded.seen_at,
                 decision             = excluded.decision,
                 ai_score             = excluded.ai_score,
@@ -369,6 +373,7 @@ class TursoStorage:
                 repeat_of,
                 _iso_or_none(ai_decision.event_start) if ai_decision else None,
                 _iso_or_none(ai_decision.event_end) if ai_decision else None,
+                article.summary_pl,
                 Decision.ERROR.value,
             ],
         )
@@ -388,17 +393,20 @@ class TursoStorage:
         )
         await client.execute(
             """
-            INSERT INTO posts (id, url, category, title_pl, seen_at, decision, error_attempts)
-            VALUES (?, ?, ?, ?, ?, ?, 0)
+            INSERT INTO posts
+              (id, url, category, title_pl, summary_pl, seen_at, decision, error_attempts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(id) DO UPDATE SET
-                decision = excluded.decision,
-                seen_at  = excluded.seen_at
+                decision   = excluded.decision,
+                summary_pl = excluded.summary_pl,
+                seen_at    = excluded.seen_at
             """,
             [
                 article.id,
                 article.url,
                 article.category.value,
                 article.title_pl,
+                article.summary_pl,
                 datetime.now(UTC).isoformat(),
                 Decision.PUBLISHING.value,
             ],
@@ -607,6 +615,7 @@ class InMemoryStorage:
             url=article.url,
             category=article.category,
             title_pl=article.title_pl,
+            summary_pl=article.summary_pl,
             decision=decision,
             ai_score=ai_decision.score if ai_decision else None,
             ai_reason=ai_decision.reason if ai_decision else None,
@@ -626,7 +635,11 @@ class InMemoryStorage:
         previous = self._records.get(article.id)
         if previous is not None:
             self._records[article.id] = previous.model_copy(
-                update={"decision": Decision.PUBLISHING, "seen_at": datetime.now(UTC)}
+                update={
+                    "decision": Decision.PUBLISHING,
+                    "summary_pl": article.summary_pl,
+                    "seen_at": datetime.now(UTC),
+                }
             )
             return PriorRecord(decision=previous.decision, seen_at=previous.seen_at)
         self._records[article.id] = PostRecord(
@@ -634,6 +647,7 @@ class InMemoryStorage:
             url=article.url,
             category=article.category,
             title_pl=article.title_pl,
+            summary_pl=article.summary_pl,
             decision=Decision.PUBLISHING,
         )
         return None

@@ -47,6 +47,8 @@ Flow: `main.py` → `Pipeline.run()` in `pipeline.py`, which goes through these 
 
 `--digest` skips all of this: `digest.run_digest` reads `storage.published_events_between` for the coming Friday–Sunday (Europe/Warsaw) and posts one Digest to the Events channel. It is at most once per weekend through the `digests` table (`start_digest` writes `publishing` before sending; definite non-delivery deletes the row, uncertain delivery keeps it).
 
+The Calendar (`city_calendar.py`, deliberately not `calendar.py`) is the city's events calendar, read only for the Digest and never a Source. `read_weekend_calendar` makes one day-picker request per weekend day (`parser.parse_calendar_day`), merges entries by URL ID, keeps the ones `in_weekend` allows, and never raises: a failure comes back as `CalendarReading.failure`, an admin-alert text. `config.yaml` `digest.enabled: false` skips it without a request. It is not yet wired into `run_digest`.
+
 After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMIN_CHAT_ID` and writes a GitHub step summary.
 
 ### Retry/persistence semantics (the subtle part)
@@ -60,7 +62,7 @@ After the run, `main.py` sends `stats.alerts` and a run report to `TELEGRAM_ADMI
 ### Configuration split
 
 - `config.py` (`Settings`, pydantic-settings): secrets and env vars (`AI_MIN_SCORE`, `SCRAPER_TIMEOUT`, `APP_ENV`, …).
-- `flow_config.py`: loads `config.yaml`, which defines the sources list (scraper class name, URL, `max_articles`, `enabled`), the Gemini model (`pipeline.gemini_model`, required; there is no env override) and pipeline pacing and caps. The same committed file is used in CI.
+- `flow_config.py`: loads `config.yaml`, which defines the sources list (scraper class name, URL, `max_articles`, `enabled`), the Gemini model (`pipeline.gemini_model`, required; there is no env override), pipeline pacing and caps, and the Digest's Calendar (`digest.calendar_url`, `digest.enabled`). The same committed file is used in CI.
 
 ### Adding a news source
 
@@ -80,8 +82,8 @@ Talks to the Bot API directly through httpx, with no bot library. Messages use H
 ## Testing notes
 
 - HTTP is mocked with `respx`. `asyncio_mode = "auto"`, so async tests need no decorator.
-- `conftest.py` has an autouse fixture that sets tenacity's wait to zero on `GeminiAIFilter.evaluate`, `TelegramPublisher._publish_reaching_telegram` and `scraper._fetch_one`. A new `@retry`-decorated function needs adding to that list, or its tests will sleep.
-- Parser tests run against frozen HTML in `tests/fixtures/`. When the daily canary workflow (`canary.yml`, `-m live`) fails, the site's markup changed: update the parser and refresh the fixtures from the live page.
+- `conftest.py` has an autouse fixture that sets tenacity's wait to zero on `GeminiAIFilter.evaluate`, `TelegramPublisher._publish_reaching_telegram`, `scraper._fetch_one` and `city_calendar._fetch_day`. A new `@retry`-decorated function needs adding to that list, or its tests will sleep.
+- Parser tests run against frozen HTML in `tests/fixtures/`. When the daily canary workflow (`canary.yml`, `-m live`) fails, the site's markup changed: update the parser and refresh the fixtures from the live page (`tests/fixtures/calendar/` holds the Calendar's per-day JSON responses).
 - User-facing strings (posts, admin alerts) are in Ukrainian; logs and code are in English. Logging goes through structlog (`logger.bind(...)`, snake_case event names), with JSON output in CI and pretty output in a TTY.
 
 ## Agent skills

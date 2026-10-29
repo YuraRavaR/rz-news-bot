@@ -213,6 +213,18 @@ class DatedEvent(BaseModel):
     tg_events_message_id: int | None
 
 
+class CalendarEntry(BaseModel):
+    """One entry of the city's events Calendar: a possible Digest item, not an Article."""
+
+    # The numeric ID in the entry's URL; the same entry is listed on every day it covers
+    id: int
+    url: str
+    title_pl: str
+    start: date
+    # None for a single-day entry
+    end: date | None
+
+
 class DigestStatus(StrEnum):
     # Written before the Digest is sent; stays when delivery is uncertain
     PUBLISHING = "publishing"

@@ -17,6 +17,12 @@
 #   max_error_attempts       - how many runs may fail on one article before it is
 #                              retired for good (1 = never retry)
 #   report_display_timezone  - optional IANA zone for admin run-report clock (omit = UTC)
+#
+# digest:
+#   calendar_url - the city events Calendar's day-picker endpoint (erzeszow.pl). The
+#                  Calendar is read only for the Digest; it is not a Source
+#   enabled      - set to false to stop reading the Calendar (the Digest still goes
+#                  out with news events)
 
 sources:
   - scraper: NajnowszeScraper
@@ -36,3 +42,7 @@ pipeline:
   max_posts_per_run: 10
   max_error_attempts: 3
   report_display_timezone: Europe/Warsaw
+
+digest:
+  calendar_url: https://erzeszow.pl/index.php
+  enabled: true

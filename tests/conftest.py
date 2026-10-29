@@ -18,6 +18,7 @@ def no_retry_backoff() -> Iterator[None]:
     the retry object itself rather than patched at the module level.
     """
     from rz_flow.ai import GeminiAIFilter
+    from rz_flow.city_calendar import _fetch_day
     from rz_flow.scraper import _fetch_one
     from rz_flow.telegram import TelegramPublisher
 
@@ -25,6 +26,7 @@ def no_retry_backoff() -> Iterator[None]:
         GeminiAIFilter.evaluate,
         TelegramPublisher._publish_reaching_telegram,
         _fetch_one,
+        _fetch_day,
     ]
     original = [fn.retry.wait for fn in retryables]  # type: ignore[attr-defined]
     for fn in retryables:
@@ -42,3 +44,8 @@ def najnowsze_html() -> str:
 @pytest.fixture
 def rzeszow_news_html() -> str:
     return (FIXTURES_DIR / "rzeszow_news_sample.html").read_text(encoding="utf-8")
+
+
+def calendar_day_body(day: str) -> str:
+    """A frozen Calendar per-day response (JSON), e.g. calendar_day_body("2026-10-30")."""
+    return (FIXTURES_DIR / "calendar" / f"day_{day}.json").read_text(encoding="utf-8")

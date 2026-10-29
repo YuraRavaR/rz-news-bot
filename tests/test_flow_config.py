@@ -27,6 +27,7 @@ def test_repo_root_config_yaml_loads() -> None:
     assert len(config.sources) >= 1
     assert config.pipeline.max_posts_per_run >= 1
     assert config.pipeline.gemini_model
+    assert config.digest.calendar_url.startswith("https://")
 
 
 def _write_config(tmp_path: pathlib.Path, pipeline_yaml: str) -> str:
@@ -106,6 +107,26 @@ def test_load_flow_config_uses_env_var(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FLOW_CONFIG_PATH", str(cfg_file))
     config = load_flow_config()
     assert config.sources[0].scraper == "RzeszowNewsScraper"
+
+
+def test_digest_section_is_read_from_config(tmp_path: pathlib.Path) -> None:
+    path = _write_config(
+        tmp_path,
+        "pipeline:\n  gemini_model: gemini-test-model\n"
+        "digest:\n  calendar_url: https://calendar.example/index.php\n  enabled: false\n",
+    )
+
+    digest = load_flow_config(path).digest
+    assert digest.calendar_url == "https://calendar.example/index.php"
+    assert digest.enabled is False
+
+
+def test_digest_section_defaults_to_the_city_calendar(tmp_path: pathlib.Path) -> None:
+    path = _write_config(tmp_path, "pipeline:\n  gemini_model: gemini-test-model\n")
+
+    digest = load_flow_config(path).digest
+    assert digest.calendar_url == "https://erzeszow.pl/index.php"
+    assert digest.enabled is True
 
 
 def test_load_flow_config_missing_file_raises(tmp_path) -> None:

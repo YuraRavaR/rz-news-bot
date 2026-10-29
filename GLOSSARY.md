@@ -35,6 +35,14 @@ _Avoid_: deadline, publication date
 One Events channel Post listing the coming weekend's events (Friday to Sunday, Europe/Warsaw), grouped by day, each linking to its Events channel Post (or to its Article when it has none). It lists Published events whose Event date overlaps the weekend; events without one are left out. It is posted at most once per weekend, and not at all with fewer than three events.
 _Avoid_: summary, newsletter, roundup
 
+**Calendar** (Календар подій):
+The city hall's events calendar on erzeszow.pl, listing events of city institutions (libraries, culture houses, galleries). It is read only for the Digest, one request per weekend day, and is not a Source: it never goes through a Run, the Repeat check or storage.
+_Avoid_: source, feed, schedule
+
+**Calendar entry** (Запис календаря):
+One event listed in the Calendar, with a Polish title, a start day, an optional last day and a link. It is not an Article. The Digest considers an entry that lasts at most three days and overlaps the weekend, or a longer one only in the weekend it starts, so a months-long exhibition appears once.
+_Avoid_: article, event (on its own)
+
 **Post** (Пост):
 One message in one Channel.
 _Avoid_: publication, message

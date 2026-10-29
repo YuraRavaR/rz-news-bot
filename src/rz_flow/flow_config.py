@@ -2,8 +2,8 @@
 
 Loads config.yaml (or the path in FLOW_CONFIG_PATH env var) and validates it
 with Pydantic.  Contains source definitions (which scrapers run, with which
-URLs and per-source article limits), the Gemini model, pipeline timing, and
-optional report clock timezone.
+URLs and per-source article limits), the Gemini model, pipeline timing,
+optional report clock timezone, and the Digest's Calendar.
 """
 
 from __future__ import annotations
@@ -87,6 +87,22 @@ class PipelineConfig(BaseModel):
         return name
 
 
+class DigestConfig(BaseModel):
+    """The city's events Calendar, read only for the Digest."""
+
+    calendar_url: str = Field(
+        default="https://erzeszow.pl/index.php",
+        description="Endpoint of the Calendar's day picker (one request per weekend day).",
+    )
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Read the Calendar. False turns it off with a config change, no code release: "
+            "no request is made and the Digest goes out with news events only."
+        ),
+    )
+
+
 class FlowConfig(BaseModel):
     """Top-level flow configuration loaded from config.yaml."""
 
@@ -94,6 +110,7 @@ class FlowConfig(BaseModel):
     # Validated even when the section is missing, so the error names the required
     # pipeline.gemini_model instead of just the absent section.
     pipeline: PipelineConfig = Field(default_factory=dict, validate_default=True)
+    digest: DigestConfig = Field(default_factory=DigestConfig)
 
     @property
     def enabled_sources(self) -> list[SourceConfig]:

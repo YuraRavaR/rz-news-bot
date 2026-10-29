@@ -5,13 +5,23 @@ This is a key AQA concept: separate I/O (scraper) from logic (parser),
 so the logic can be tested without network access.
 """
 
+import json
+from datetime import date
+
+import pytest
+
 from rz_flow.models import Article, Category
 from rz_flow.parser import (
+    CalendarParseError,
     _clean_title,
     _extract_id,
+    parse_calendar_day,
     parse_najnowsze_page,
     parse_rzeszow_news_page,
 )
+from tests.conftest import calendar_day_body
+
+_CALENDAR_BASE = "https://erzeszow.pl/index.php"
 
 
 class TestExtractId:
@@ -391,3 +401,116 @@ class TestParserEdgeCases:
         """
         articles = parse_rzeszow_news_page(html)
         assert len(articles) == 0
+
+
+# ── erzeszow.pl Calendar ──────────────────────────────────────────────────────
+
+
+class TestParseCalendarDay:
+    def test_single_day_entry(self) -> None:
+        entries = parse_calendar_day(calendar_day_body("2026-10-31"), _CALENDAR_BASE)
+
+        concert = next(e for e in entries if e.id == 151427)
+        assert concert.title_pl == "COSMOS - Koniec Lata | Koncert"
+        assert concert.start == date(2026, 10, 31)
+        assert concert.end is None
+        assert concert.url == (
+            "https://erzeszow.pl/41-miasto-rzeszow/6241-kalendarz-imprez/"
+            "151427-cosmos-koniec-lata-_-koncert.html"
+        )
+
+    def test_multi_day_entry_has_its_range(self) -> None:
+        entries = parse_calendar_day(calendar_day_body("2026-10-30"), _CALENDAR_BASE)
+
+        exhibition = next(e for e in entries if e.id == 146386)
+        assert exhibition.title_pl == "Wystawa czasowa: „Pejzaż w malarstwie nowożytnym”"
+        assert exhibition.start == date(2026, 6, 30)
+        assert exhibition.end == date(2026, 11, 30)
+
+    def test_reads_both_tabs(self) -> None:
+        """Friday 30.10.2026 lists 1 one-day entry and 20 multi-day ones."""
+        entries = parse_calendar_day(calendar_day_body("2026-10-30"), _CALENDAR_BASE)
+
+        assert len(entries) == 21
+        assert sum(e.end is None for e in entries) == 1
+
+    def test_entry_listed_twice_in_one_day_is_returned_once(self) -> None:
+        article = _calendar_article("/x/7-a.html", "A", "2026-10-30")
+        body = json.dumps(
+            {
+                "html": f'<div id="events-oneday">{article}</div>'
+                f'<div id="events-multidays">{article}</div>'
+            }
+        )
+
+        assert [e.id for e in parse_calendar_day(body, _CALENDAR_BASE)] == [7]
+
+    def test_entries_sharing_a_title_stay_apart(self) -> None:
+        """Two workshop series with one title have their own IDs, so two entries."""
+        entries = parse_calendar_day(calendar_day_body("2026-11-01"), _CALENDAR_BASE)
+
+        assert {151745, 151748} <= {e.id for e in entries}
+
+    def test_day_without_one_day_entries(self) -> None:
+        entries = parse_calendar_day(calendar_day_body("2026-11-01"), _CALENDAR_BASE)
+
+        assert entries
+        assert all(e.end is not None for e in entries)
+
+    def test_id_is_the_number_before_the_slug(self) -> None:
+        body = _calendar_body(
+            _calendar_article(
+                "/41-miasto-rzeszow/6241-kalendarz-imprez/153244-wystawa-2026-_-instalacja.html",
+                "Wystawa",
+                "2026-10-30",
+            )
+        )
+
+        [entry] = parse_calendar_day(body, _CALENDAR_BASE)
+        assert entry.id == 153244
+
+    def test_same_start_and_end_is_a_single_day(self) -> None:
+        body = _calendar_body(_calendar_article("/x/1-a.html", "A", "2026-10-30 - 2026-10-30"))
+
+        [entry] = parse_calendar_day(body, _CALENDAR_BASE)
+        assert entry.end is None
+
+    def test_entry_without_link_numeric_id_or_date_is_skipped(self) -> None:
+        body = _calendar_body(
+            _calendar_article("/x/no-id.html", "No ID", "2026-10-30")
+            + _calendar_article("/x/2-no-date.html", "No date", "wkrótce")
+            + _calendar_article("/x/3-bad-date.html", "Bad date", "2026-13-45")
+            + _calendar_article("/x/4-kept.html", "Kept", "2026-10-30")
+            + "<article><h2>No link</h2></article>"
+        )
+
+        assert [e.id for e in parse_calendar_day(body, _CALENDAR_BASE)] == [4]
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "<html><body>Przerwa techniczna</body></html>",
+            json.dumps({"error": "no such action"}),
+            json.dumps({"html": None}),
+            json.dumps(["html"]),
+            json.dumps({"html": "<div>Strona główna</div>"}),
+        ],
+        ids=["html_page", "no_html_key", "html_not_a_string", "not_an_object", "no_event_list"],
+    )
+    def test_unexpected_body_raises(self, body: str) -> None:
+        with pytest.raises(CalendarParseError):
+            parse_calendar_day(body, _CALENDAR_BASE)
+
+
+def _calendar_article(href: str, title: str, dates: str) -> str:
+    return f"""
+    <article>
+      <h2 class="modal__event--title"><a href="{href}">{title}</a></h2>
+      <div class="modal__event--data"><div><span>Data wydarzenia:</span>{dates}</div></div>
+    </article>
+    """
+
+
+def _calendar_body(articles: str) -> str:
+    html = f'<div id="events-oneday">{articles}</div><div id="events-multidays"></div>'
+    return json.dumps({"html": html})

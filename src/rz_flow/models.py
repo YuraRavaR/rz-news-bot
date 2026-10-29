@@ -175,6 +175,13 @@ class PostRecord(BaseModel):
     event_end: date | None = None
 
 
+class PriorRecord(BaseModel):
+    """The row ``mark_publishing`` replaced, so ``release_publishing`` can put it back."""
+
+    decision: Decision
+    seen_at: datetime
+
+
 class UnconfirmedArticle(BaseModel):
     """A Publishing Article turned Unconfirmed at Run start; the admin is told once."""
 

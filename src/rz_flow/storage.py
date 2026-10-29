@@ -25,6 +25,7 @@ from rz_flow.models import (
     JudgedArticle,
     PeriodCounts,
     PostRecord,
+    PriorRecord,
     UnconfirmedArticle,
 )
 
@@ -152,20 +153,22 @@ class StorageProtocol(Protocol):
         """
         ...
 
-    async def mark_publishing(self, article: Article) -> Decision | None:
+    async def mark_publishing(self, article: Article) -> PriorRecord | None:
         """Record the Article as Publishing before its Main channel Post.
 
         With no row, inserts a minimal one. Over an Error row, changes only the
-        outcome: the attempt count and every other column stay untouched.
-        Returns the previous outcome (None or ERROR).
+        outcome and the last write (now, the time of the Post): the attempt count
+        and every other column stay untouched. Returns the row it replaced (None
+        or an Error).
         """
         ...
 
-    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+    async def release_publishing(self, article_id: str, previous: PriorRecord | None) -> None:
         """Undo ``mark_publishing`` after a Post that definitely did not go out.
 
         ``previous`` is what ``mark_publishing`` returned: with None the row is
-        deleted, with ERROR it goes back to Error with its attempt count unchanged.
+        deleted, with an Error it goes back to Error with its attempt count and
+        last write unchanged.
         """
         ...
 
@@ -370,15 +373,26 @@ class TursoStorage:
             ],
         )
 
-    async def mark_publishing(self, article: Article) -> Decision | None:
+    async def mark_publishing(self, article: Article) -> PriorRecord | None:
         client = self._get_client()
-        result = await client.execute("SELECT decision FROM posts WHERE id = ?", [article.id])
-        previous = Decision(result.rows[0][0]) if result.rows else None
+        result = await client.execute(
+            "SELECT decision, seen_at FROM posts WHERE id = ?", [article.id]
+        )
+        previous = (
+            PriorRecord(
+                decision=Decision(result.rows[0][0]),
+                seen_at=datetime.fromisoformat(result.rows[0][1]),
+            )
+            if result.rows
+            else None
+        )
         await client.execute(
             """
             INSERT INTO posts (id, url, category, title_pl, seen_at, decision, error_attempts)
             VALUES (?, ?, ?, ?, ?, ?, 0)
-            ON CONFLICT(id) DO UPDATE SET decision = excluded.decision
+            ON CONFLICT(id) DO UPDATE SET
+                decision = excluded.decision,
+                seen_at  = excluded.seen_at
             """,
             [
                 article.id,
@@ -391,7 +405,7 @@ class TursoStorage:
         )
         return previous
 
-    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+    async def release_publishing(self, article_id: str, previous: PriorRecord | None) -> None:
         client = self._get_client()
         if previous is None:
             await client.execute(
@@ -400,8 +414,13 @@ class TursoStorage:
             )
         else:
             await client.execute(
-                "UPDATE posts SET decision = ? WHERE id = ? AND decision = ?",
-                [previous.value, article_id, Decision.PUBLISHING.value],
+                "UPDATE posts SET decision = ?, seen_at = ? WHERE id = ? AND decision = ?",
+                [
+                    previous.decision.value,
+                    previous.seen_at.isoformat(),
+                    article_id,
+                    Decision.PUBLISHING.value,
+                ],
             )
 
     async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
@@ -603,13 +622,13 @@ class InMemoryStorage:
             event_end=ai_decision.event_end if ai_decision else None,
         )
 
-    async def mark_publishing(self, article: Article) -> Decision | None:
+    async def mark_publishing(self, article: Article) -> PriorRecord | None:
         previous = self._records.get(article.id)
         if previous is not None:
             self._records[article.id] = previous.model_copy(
-                update={"decision": Decision.PUBLISHING}
+                update={"decision": Decision.PUBLISHING, "seen_at": datetime.now(UTC)}
             )
-            return previous.decision
+            return PriorRecord(decision=previous.decision, seen_at=previous.seen_at)
         self._records[article.id] = PostRecord(
             id=article.id,
             url=article.url,
@@ -619,14 +638,16 @@ class InMemoryStorage:
         )
         return None
 
-    async def release_publishing(self, article_id: str, previous: Decision | None) -> None:
+    async def release_publishing(self, article_id: str, previous: PriorRecord | None) -> None:
         record = self._records.get(article_id)
         if record is None or record.decision != Decision.PUBLISHING:
             return
         if previous is None:
             del self._records[article_id]
         else:
-            self._records[article_id] = record.model_copy(update={"decision": previous})
+            self._records[article_id] = record.model_copy(
+                update={"decision": previous.decision, "seen_at": previous.seen_at}
+            )
 
     async def resolve_stale_publishing(self) -> list[UnconfirmedArticle]:
         stale = [r for r in self._records.values() if r.decision == Decision.PUBLISHING]

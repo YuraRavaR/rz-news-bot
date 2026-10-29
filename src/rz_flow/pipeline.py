@@ -24,7 +24,7 @@ from rz_flow.config import Settings
 from rz_flow.dedup import NearMatch, Original, SlugOf, StoryIndex
 from rz_flow.errors import DeferralError, PublishingRecordError
 from rz_flow.flow_config import FlowConfig, SourceConfig
-from rz_flow.models import AIDecision, Article, Decision, StopSignal
+from rz_flow.models import AIDecision, Article, Decision, PriorRecord, StopSignal
 from rz_flow.scraper import fetch_articles
 from rz_flow.sources import ScraperSource, get_active_sources
 from rz_flow.storage import StorageProtocol
@@ -525,7 +525,7 @@ class Pipeline:
         error_msg: str | None = None
         # Set once the Publishing record is written: what to restore on a Deferral
         marked_publishing = False
-        previous_outcome: Decision | None = None
+        previous_record: PriorRecord | None = None
 
         log = logger.bind(article_id=article.id, category=article.category.value)
 
@@ -565,7 +565,7 @@ class Pipeline:
                     # Write-ahead record: if delivery turns out uncertain, it stays
                     # Publishing and the Article is never posted again (ADR 0001).
                     try:
-                        previous_outcome = await self.storage.mark_publishing(article)
+                        previous_record = await self.storage.mark_publishing(article)
                     except Exception as exc:
                         raise PublishingRecordError(f"{type(exc).__name__}: {exc}") from exc
                     marked_publishing = True
@@ -617,7 +617,7 @@ class Pipeline:
             if marked_publishing:
                 # The Post definitely did not go out: storage goes back to exactly
                 # its state before this Run, attempt count included.
-                await self._release_publishing(article, previous_outcome, log)
+                await self._release_publishing(article, previous_record, log)
             stats.deferred += 1
             stats.article_log.append(
                 ArticleRunEntry(
@@ -716,7 +716,7 @@ class Pipeline:
     async def _release_publishing(
         self,
         article: Article,
-        previous: Decision | None,
+        previous: PriorRecord | None,
         log: structlog.stdlib.BoundLogger,
     ) -> None:
         """Undo the Publishing record of a Deferred Article.

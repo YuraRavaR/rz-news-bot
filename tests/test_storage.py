@@ -653,8 +653,21 @@ class TestPublishingContract:
 
         previous = await any_storage.mark_publishing(article)
 
-        assert previous is Decision.ERROR
+        assert previous is not None
+        assert previous.decision is Decision.ERROR
         assert await _outcome(any_storage, article.id) == (Decision.PUBLISHING, 2)
+
+    async def test_mark_publishing_old_error_article_is_a_recent_original(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("PUB_OLD_ERR_12345")
+        await any_storage.save_decision(article, Decision.ERROR)
+        await _set_last_write(any_storage, article.id, datetime.now(UTC) - 96 * _HOUR)
+
+        await any_storage.mark_publishing(article)
+
+        rows = await any_storage.recent_judged_articles(since=datetime.now(UTC) - 72 * _HOUR)
+        assert [r.id for r in rows] == [article.id]
 
     async def test_publishing_is_settled(self, any_storage: InMemoryStorage | TursoStorage) -> None:
         article = _make_article("PUB_SETTLED_12345")
@@ -725,6 +738,22 @@ class TestPublishingContract:
 
         assert await _outcome(any_storage, article.id) == (Decision.ERROR, 2)
         assert await any_storage.filter_new_ids([article.id]) == [article.id]
+
+    async def test_release_publishing_error_article_restores_its_last_write(
+        self, any_storage: InMemoryStorage | TursoStorage
+    ) -> None:
+        article = _make_article("rz24/REL_OLD_ERR_1")
+        now = datetime.now(UTC)
+        await any_storage.save_decision(article, Decision.ERROR)
+        await _set_last_write(any_storage, article.id, now - 96 * _HOUR)
+        previous = await any_storage.mark_publishing(article)
+
+        await any_storage.release_publishing(article.id, previous)
+
+        last_week = await any_storage.period_counts(now - 7 * 24 * _HOUR, now - 72 * _HOUR)
+        assert last_week.by_prefix == {"rz24": {Decision.ERROR: 1}}
+        today = await any_storage.period_counts(now - _HOUR, now + _HOUR)
+        assert today.by_prefix == {}
 
     async def test_error_over_publishing_increments_preserved_attempts(
         self, any_storage: InMemoryStorage | TursoStorage
